@@ -1,0 +1,28 @@
+# dot files
+/.vscode/launch.json
+/.settings
+/.eide/log
+/.eide.usr.ctx.json
+
+# project out
+/build
+/bin
+/obj
+/out
+
+# old project location (leftover)
+/prj
+
+# eide dependency packs (generated/downloaded)
+/.pack
+/.cmsis
+
+# editor cache db
+**/VC.DB
+**/VC.DB-shm
+**/VC.DB-wal
+**/VC.2.DB
+
+# eide template
+*.ept
+*.eide-template

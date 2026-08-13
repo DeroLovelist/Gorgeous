@@ -1,0 +1,29 @@
+##########################################################################################
+#                        Append Compiler Options For Source Files
+##########################################################################################
+
+# syntax:
+#   <your pattern>: <compiler options>
+# For get pattern syntax, please refer to: https://www.npmjs.com/package/micromatch
+#
+# examples:
+#   'main.cpp':           --cpp11 -Og ...
+#   'src/*.c':            -gnu -O2 ...
+#   'src/lib/**/*.cpp':   --cpp11 -Os ...
+#   '!Application/*.c':   -O0
+#   '**/*.c':             -O2 -gnu ...
+
+version: "2.1"
+options:
+    SCServo:
+        files: {}
+        virtualPathFiles:
+            <virtual_root>/examples/FeedBack.c: ""
+            <virtual_root>/examples/Ping.c: ""
+            <virtual_root>/examples/CalibrationOfs.c: ""
+            <virtual_root>/examples/ProgramEprom.c: ""
+            <virtual_root>/examples/Broadcast.c: ""
+            <virtual_root>/examples/RegWritePos.c: ""
+            <virtual_root>/examples/SyncWritePos.c: ""
+            <virtual_root>/examples/WriteSpe.c: ""
+            <virtual_root>/examples/SyncRead.c: ""
