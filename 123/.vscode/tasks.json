@@ -1,0 +1,50 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "EIDE: 重载 + 构建",
+            "detail": "通过 EIDE MCP 自动重载工程配置并构建（移植/改 eide.yml 后用它，无需手动点 reload）",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}/tools/eide-mcp.ps1",
+                "-Action", "all"
+            ],
+            "problemMatcher": [],
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+        },
+        {
+            "label": "EIDE: 重载 + 全量重建",
+            "detail": "重载工程并执行 Rebuild（全部重新编译）",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}/tools/eide-mcp.ps1",
+                "-Action", "rebuild"
+            ],
+            "problemMatcher": [],
+            "group": "build",
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+        },
+        {
+            "label": "EIDE: 重载 + 烧录",
+            "detail": "重载工程并通过 ST-Link 烧录到板子",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}/tools/eide-mcp.ps1",
+                "-Action", "flash"
+            ],
+            "problemMatcher": [],
+            "group": "build",
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+        }
+    ]
+}

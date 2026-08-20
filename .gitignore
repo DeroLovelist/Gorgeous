@@ -1,21 +1,22 @@
-# dot files
-/.vscode/launch.json
-/.settings
-/.eide/log
-/.eide.usr.ctx.json
+# eide dependency packs (generated/downloaded)
+/.pack
+/.cmsis
 
-# project out
+# build output
 /build
 /bin
 /obj
 /out
+/123/build
 
-# old project location (leftover)
-/prj
+# Keil build output & UI state
+/123/MDK-ARM/123/
+/123/MDK-ARM/*.uvguix.*
 
-# eide dependency packs (generated/downloaded)
-/.pack
-/.cmsis
+# eide local cache
+/123/.eide/log
+/123/.eide.usr.ctx.json
+/123/.eide/env.ini
 
 # editor cache db
 **/VC.DB
