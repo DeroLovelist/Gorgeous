@@ -63,6 +63,8 @@ void Error_Handler(void);
 #define T5C1_GPIO_Port GPIOA
 #define T5C2_Pin GPIO_PIN_1
 #define T5C2_GPIO_Port GPIOA
+#define MAX485_DR_Pin GPIO_PIN_2
+#define MAX485_DR_GPIO_Port GPIOA
 #define AIN1_2_Pin GPIO_PIN_4
 #define AIN1_2_GPIO_Port GPIOA
 #define AIN1_1_Pin GPIO_PIN_6
@@ -109,6 +111,10 @@ void Error_Handler(void);
 #define AIN2_2_GPIO_Port GPIOD
 #define KEY1_Pin GPIO_PIN_3
 #define KEY1_GPIO_Port GPIOD
+#define MAX485_TX_Pin GPIO_PIN_5
+#define MAX485_TX_GPIO_Port GPIOD
+#define MAX485_RX_Pin GPIO_PIN_6
+#define MAX485_RX_GPIO_Port GPIOD
 #define T3C1_Pin GPIO_PIN_4
 #define T3C1_GPIO_Port GPIOB
 #define T3C2_Pin GPIO_PIN_5

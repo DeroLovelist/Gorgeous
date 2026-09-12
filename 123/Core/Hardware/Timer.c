@@ -1,7 +1,8 @@
-#include "main.h"
+﻿#include "main.h"
 #include "tim.h"
 #include "Timer.h"
 #include "Key.h"
+#include "Chassis.h"
 
 /*
  * 1ms 定时器: TIM9 (PSC=999, ARR=167 -> 168MHz/1000/168 = 1kHz = 1ms)
@@ -24,5 +25,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 			keyTickDiv = 0;
 			Key_Tick();		/* 10ms 按键扫描 */
 		}
+
+		Chassis_Tick();		/* 底盘控制: 内部每 20ms 执行一次 */
 	}
 }

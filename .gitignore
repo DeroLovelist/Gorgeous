@@ -27,3 +27,6 @@
 # eide template
 *.ept
 *.eide-template
+
+# 手工备份包(大文件, 不入库)
+/123.zip

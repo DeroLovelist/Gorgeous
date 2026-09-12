@@ -1,4 +1,4 @@
-#include "LASER.h"
+﻿#include "LASER.h"
 
 /**
  * @brief  激光模块初始化 (GPIO 已由 MX 配置, 这里仅安全关断)

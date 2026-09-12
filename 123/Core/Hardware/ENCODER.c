@@ -1,4 +1,4 @@
-#include "ENCODER.h"
+﻿#include "ENCODER.h"
 
 /* ==================== 内部变量(每通道一份) ==================== */
 static uint32_t Encoder_LastCount[ENC_CH_MAX] = {0}; /* 上一次读取的计数值 */
@@ -34,10 +34,10 @@ static TIM_HandleTypeDef *Enc_GetTim(uint8_t n)
 	}
 }
 
-/* 是否为 32 位计数器 (TIM1/TIM5); 否则为 16 位 (TIM3/TIM4) */
+/* 是否为 32 位计数器 (仅 TIM5); 否则为 16 位 (TIM1/TIM3/TIM4) */
 static uint8_t Enc_Is32Bit(ENC_Channel_t ch)
 {
-	return (ch == ENC_CH1 || ch == ENC_CH2);
+	return (ch == ENC_CH2);
 }
 
 /* 按计数器宽度计算有符号增量 (自动处理溢出回绕) */
@@ -118,7 +118,7 @@ void Encoder_Stop(uint8_t n)
 /**
  * @brief  读取指定电机编码器绝对计数值
  * @param  n 电机号 1~4
- * @return 当前计数值 (TIM1/TIM5 32 位, TIM3/TIM4 16 位), 溢出自动回绕
+ * @return 当前计数值 (TIM5 32 位, TIM1/TIM3/TIM4 16 位), 溢出自动回绕
  */
 uint32_t Encoder_Read(uint8_t n)
 {

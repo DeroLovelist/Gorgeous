@@ -1086,6 +1086,56 @@
               <FileType>5</FileType>
               <FilePath>..\Core\Hardware\JY61P\MyI2C.h</FilePath>
             </File>
+            <File>
+              <FileName>Chassis.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Hardware\Chassis.c</FilePath>
+            </File>
+            <File>
+              <FileName>Chassis.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Hardware\Chassis.h</FilePath>
+            </File>
+            <File>
+              <FileName>pid.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Hardware\pid.c</FilePath>
+            </File>
+            <File>
+              <FileName>pid.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Hardware\pid.h</FilePath>
+            </File>
+            <File>
+              <FileName>MissionControl.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Hardware\MissionControl.c</FilePath>
+            </File>
+            <File>
+              <FileName>MissionControl.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Hardware\MissionControl.h</FilePath>
+            </File>
+            <File>
+              <FileName>ServoArm.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Hardware\ServoArm.c</FilePath>
+            </File>
+            <File>
+              <FileName>ServoArm.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Hardware\ServoArm.h</FilePath>
+            </File>
+            <File>
+              <FileName>ArmUartTest.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Hardware\ArmUartTest.c</FilePath>
+            </File>
+            <File>
+              <FileName>ArmUartTest.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Hardware\ArmUartTest.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

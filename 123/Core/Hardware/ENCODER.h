@@ -1,4 +1,4 @@
-#ifndef __ENCODER_H__
+﻿#ifndef __ENCODER_H__
 #define __ENCODER_H__
 
 /*
@@ -10,7 +10,7 @@
  *
  * 配置 (由 MX 生成):
  *   - 编码器模式: TIM_ENCODERMODE_TI12 (4倍频, CH1+CH2 双沿计数)
- *   - 计数器周期: TIM1/TIM5 为 32 位, TIM3/TIM4 为 16 位
+ *   - 计数器周期: TIM5 为 32 位, TIM1/TIM3/TIM4 为 16 位
  *   - 分频: 0 (不分频)   极性: 上升沿 (Rising)
  *
  * 与 motor 模块的关系 (功能分开、相辅相成):
@@ -65,7 +65,7 @@ void Encoder_Stop(uint8_t n);
 /**
  * @brief  读取指定电机编码器原始计数值
  * @param  n 电机号 1~4
- * @return 当前计数值, 溢出自动回绕 (TIM1/TIM5 为 32 位, TIM3/TIM4 为 16 位)
+ * @return 当前计数值, 溢出自动回绕 (TIM5 为 32 位, TIM1/TIM3/TIM4 为 16 位)
  * @note   4倍频模式下, 每圈计数 = 编码器线数 × 4
  */
 uint32_t Encoder_Read(uint8_t n);

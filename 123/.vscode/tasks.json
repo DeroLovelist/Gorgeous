@@ -45,6 +45,19 @@
             "problemMatcher": [],
             "group": "build",
             "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+        },
+        {
+            "label": "编码: 检查/补 UTF-8 BOM",
+            "detail": "Keil(AC5) 按本地编码解析源文件；含中文的源文件必须是 GBK 或 UTF-8+BOM。此任务给「UTF-8 无 BOM」的文件补 BOM（VS Code 编辑后跑一次，再让 Keil 全编译）",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}/tools/fix-src-encoding.ps1"
+            ],
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
         }
     ]
 }

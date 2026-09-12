@@ -56,7 +56,8 @@ void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, Light_Pin|BIN1_1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, AIN1_2_Pin|AIN1_1_Pin|BIN2_1_Pin|AIN2_1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, MAX485_DR_Pin|AIN1_2_Pin|AIN1_1_Pin|BIN2_1_Pin
+                          |AIN2_1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, BIN1_2_Pin|LED_Pin|JY_SCL_Pin|JY_SDA_Pin, GPIO_PIN_RESET);
@@ -70,6 +71,13 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(Light_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : MAX485_DR_Pin */
+  GPIO_InitStruct.Pin = MAX485_DR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(MAX485_DR_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : AIN1_2_Pin AIN1_1_Pin BIN2_1_Pin AIN2_1_Pin */
   GPIO_InitStruct.Pin = AIN1_2_Pin|AIN1_1_Pin|BIN2_1_Pin|AIN2_1_Pin;

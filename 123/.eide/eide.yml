@@ -39,9 +39,14 @@ virtualFolder:
         - path: Core/Hardware/LASER.c
         - path: Core/Hardware/LED.c
         - path: Core/Hardware/motor.c
+        - path: Core/Hardware/Chassis.c
+        - path: Core/Hardware/pid.c
         - path: Core/Hardware/PWM.c
         - path: Core/Hardware/Timer.c
         - path: Core/Hardware/Serial.c
+        - path: Core/Hardware/ServoArm.c
+        - path: Core/Hardware/ArmUartTest.c
+        - path: Core/Hardware/MissionControl.c
         - path: Core/Hardware/easylogger/elog.c
         - path: Core/Hardware/easylogger/elog_async.c
         - path: Core/Hardware/easylogger/elog_buf.c

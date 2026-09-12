@@ -1,4 +1,4 @@
-#ifndef __LASER_H__
+﻿#ifndef __LASER_H__
 #define __LASER_H__
 
 /*

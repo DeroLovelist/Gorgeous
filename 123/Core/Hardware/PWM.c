@@ -1,4 +1,4 @@
-#include "main.h"
+﻿#include "main.h"
 #include "tim.h"
 #include "PWM.h"
 
@@ -15,6 +15,7 @@ void PWM_Init(void)
 	HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_4);
 }
 
+//设置 PWM 占空比 (0~100)
 void PWM_SetCompare1(uint16_t Compare)
 {
 	__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_1, Compare);

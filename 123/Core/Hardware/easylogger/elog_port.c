@@ -1,4 +1,4 @@
-/*
+﻿/*
  * This file is part of the EasyLogger Library.
  *
  * Copyright (c) 2015, Armink, <armink.ztl@gmail.com>

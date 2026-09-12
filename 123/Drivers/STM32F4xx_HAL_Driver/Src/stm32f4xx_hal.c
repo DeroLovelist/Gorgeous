@@ -1,4 +1,4 @@
-/**
+﻿/**
   ******************************************************************************
   * @file    stm32f4xx_hal.c
   * @author  MCD Application Team
@@ -315,9 +315,9 @@ __weak void HAL_IncTick(void)
 }
 
 /**
-  * @brief Provides a tick value in millisecond.
+  * @brief Provides a tick value in millisecond.提供一个以毫秒为单位的滴答值
   * @note This function is declared as __weak to be overwritten in case of other 
-  *       implementations in user file.
+  *       implementations in user file.这个功能被声明为__weak，以便在用户文件中覆盖其他实现。
   * @retval tick value
   */
 __weak uint32_t HAL_GetTick(void)

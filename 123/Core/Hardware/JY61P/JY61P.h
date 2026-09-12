@@ -1,4 +1,4 @@
-#ifndef __JY61P_H
+﻿#ifndef __JY61P_H
 #define __JY61P_H
 #include <stdint.h>
 #include "MyI2C.h"
