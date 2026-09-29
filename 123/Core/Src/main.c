@@ -69,10 +69,13 @@
 /* USER CODE BEGIN PV */
 static uint32_t oledTick = 0;   /* OLED 上次刷新时刻 */
 #if !ARM_UART_TEST_MODE
-static uint32_t logTick = 0;    /* 串口/蓝牙日志上次打印时刻 */
 static uint32_t imuTick = 0;    /* 航向角(yaw)快速读取时刻 */
+/* 调试模式(视觉/机械臂)下屏蔽周期性状态日志, 免得淹没收发日志 */
+#if !MISSION_DEBUG_VISION_TASK && !MISSION_DEBUG_ARM_SEQ
+static uint32_t logTick = 0;    /* 串口/蓝牙日志上次打印时刻 */
 static uint32_t dbgTick = 0;    /* 底盘调试日志上次打印时刻 */
 static bool     demoRun = false;/* 底盘演示是否运行 (KEY1 切换) */
+#endif
 #endif
 static JY61P_Driver *jy61p = NULL;
 /* USER CODE END PV */
@@ -296,7 +299,7 @@ int main(void)
    * Chassis_Move_* 前的 Chassis_SetMaxSpeed 单独提速即可。 */
   Chassis_SetMaxSpeed(200);
 
-  elog_i("MAIN", "KEY1=Demo  KEY2=JY61P_YawZero");
+  elog_i("MAIN", "KEY1=Start  KEY2=YawZero  KEY2_LONG=ArmTeach");
 #endif /* !ARM_UART_TEST_MODE */
   /* USER CODE END 2 */
 
@@ -321,7 +324,7 @@ int main(void)
     {
       ArmUartTest_MoveSelected();
     }
-    /* KEY2 按下 -> 切换到下一个待测舵机 ID (1->2->3->4->5->1) */
+    /* K EY2 按下 -> 切换到下一个待测舵机 ID (1->2->3->4->5->1) */
     if (Key_Check(KEY_2, KEY_DOWN))
     {
       ArmUartTest_NextServo();
@@ -337,7 +340,7 @@ int main(void)
     /* KEY1 按下 -> 启动/停止底盘演示 (原 MotorTest 已注释) */
     // if (Key_Check(KEY_1, KEY_DOWN))
     // {
-    //   // MotorTest();
+    //   MotorTest();
     //   demoRun = !demoRun;
     //   if (demoRun)
     //   {
@@ -351,57 +354,173 @@ int main(void)
     //     elog_i("MAIN", "KEY1: demo STOP");
     //   }
     // }
-    /* KEY1 按下 -> 启动比赛任务 */
-    if (Key_Check(KEY_1, KEY_DOWN))
+    /* ---- 机械臂示教标定模式(联调期): KEY2 长按 进入/退出 ---- */
+#if !MISSION_TEST_NO_ARM
+    if (Key_Check(KEY_2, KEY_LONG))
     {
-      demoRun = false;
-      if (HAL_GetTick() < JY_WARMUP_MS)
+      if (ArmTeach_IsActive())
       {
-        /* 陀螺仪未稳定前不启动任务, 保证每次上电跑法一致 */
-        elog_i("MAIN", "JY61P warming up (%lu/%d ms), wait...",
-               (unsigned long)HAL_GetTick(), (int)JY_WARMUP_MS);
+        ArmTeach_Exit();
+        elog_i("MAIN", "Arm teach EXIT (back to mission mode)");
       }
       else
       {
-        /* 启动前把当前朝向归零: 每次上电都以放置朝向为 0°, 跑法一致 */
-        if (jy61p != NULL)
-        {
-          jy61p->fun->YAW_ZERO(jy61p);
-          jy61p->var.yaw = 0;
-          elog_i("MAIN", "Yaw auto-zero before mission");
-        }
-        Mission_Init();
-        Mission_Start();
-        elog_i("MAIN", "KEY1 LONG: mission START");
-      }
-    }
-    /* KEY2 按下 -> JY61P 航向角归零 */
-    if (Key_Check(KEY_2, KEY_DOWN))
-    {
-      if (jy61p != NULL)
-      {
-        elog_i("JY", "Yaw zeroing...");
-        jy61p->fun->YAW_ZERO(jy61p);
-        jy61p->var.yaw = 0;
-        elog_i("JY", "Yaw zero done");
+        ArmTeach_Enter();
+        elog_i("MAIN", "Arm teach ENTER (KEY2=next, KEY1=write)");
       }
     }
 
-    /* 底盘演示(循环: 前进/横移/旋转/后退), KEY1 启动 */
-    if (demoRun)
+    if (ArmTeach_IsActive())
     {
-      Chassis_Demo();
-
-      /* 每 200ms 打印底盘调试信息(位置/目标/转向剩余), 方便诊断 */
-      if (HAL_GetTick() - dbgTick >= 200)
+      /* 示教中: KEY2 = 切换动作数组, KEY1 = 读取当前位置并写入当前动作 */
+      if (Key_Check(KEY_2, KEY_DOWN))
       {
-        dbgTick = HAL_GetTick();
-        Chassis_DebugLog();
+        ArmTeach_NextAction();
+      }
+      if (Key_Check(KEY_1, KEY_DOWN))
+      {
+        ArmTeach_WriteCurrent();
       }
     }
     else
+#endif /* !MISSION_TEST_NO_ARM */
     {
-      Mission_Update();   /* 比赛任务主状态机(非演示时运行) */
+#if MISSION_DEBUG_ARM_SEQ
+      /* ---- 机械臂动作单独调试: KEY1 跑一遍该序列(底盘完全不动) ---- */
+      if (Key_Check(KEY_1, KEY_DOWN))
+      {
+        Mission_DebugArmStart();
+      }
+      Mission_DebugArmUpdate();
+#elif MISSION_DEBUG_VISION_TASK
+#if MISSION_DEBUG_VISION_TASK == 5
+      /* ---- 视觉串口链路监控: KEY1长按=scan_qr, KEY1=run_task:1, KEY2=reset:0 ---- */
+      if (Key_Check(KEY_1, KEY_LONG))
+      {
+        Mission_DebugVisionLinkSend(1);
+      }
+      if (Key_Check(KEY_1, KEY_DOWN))
+      {
+        Mission_DebugVisionLinkSend(2);
+      }
+      if (Key_Check(KEY_2, KEY_DOWN))
+      {
+        Mission_DebugVisionLinkSend(0);
+      }
+#else
+      /* ---- 视觉单独调试: KEY1 触发一次对应目标对准(不跑路线、不动机械臂) ---- */
+      if (Key_Check(KEY_1, KEY_DOWN))
+      {
+        Mission_DebugVisionStart();
+      }
+#endif
+      Mission_DebugVisionUpdate();
+#elif CHASSIS_ENC_CALIB
+      /* ================= 编码器静态标定 (人工推车, 小车不会自己动) =================
+       * 目标: 测"每轮走同样距离各报多少编码器计数" → 标定 Chassis.h 的
+       *       CH_WHEEL_SCALE_*(报告里乘 1000 打印, 如 1027 → 填 1.027f)。
+       * 步骤:
+       *   ① KEY1 → 清零(内部自动挂起底盘, 电机不输出、不跑任务/机械臂)
+       *   ② 用卷尺在地上量出 ENC_CALIB_DIST_MM, 沿【车头方向】把车直线推过去;
+       *      推的过程中蓝牙每 500ms 打一次累计计数(live), 推到 1000mm 约 6622
+       *   ③ KEY2 → 打印 I/CALIB 两行(四轮计数 + 建议系数)
+       *   ④ 反向再推一次对比: 两次系数一致(差<0.5%)才用静态标定;
+       *      两次差得多 / "有时 M1 多有时 M2 多" → 不是 counts/mm 问题, 别改
+       *   ⑤ KEY1 长按 → 结束标定, 恢复正常闭环(长按时会先触发一次清零, 无妨)
+       * ⚠️ 标定要开着 EIDE 重载+构建烧录, 完成后记得把 CHASSIS_ENC_CALIB 改回 0 */
+      Chassis_CalibPoll();   /* 必须频繁调: 每次取一次编码器增量并累计 */
+      if (Key_Check(KEY_1, KEY_DOWN))
+      {
+        Chassis_CalibStart();
+        elog_i("CALIB", "已清零: 沿车头方向直线推 %.0f mm 后按 KEY2", (double)ENC_CALIB_DIST_MM);
+      }
+      if (Key_Check(KEY_1, KEY_LONG))
+      {
+        Chassis_CalibStop();
+        elog_i("CALIB", "标定结束, 已恢复正常闭环");
+      }
+      if (Key_Check(KEY_2, KEY_DOWN))
+      {
+        Chassis_CalibReport((float)ENC_CALIB_DIST_MM);
+      }
+      if (Key_Check(KEY_2, KEY_LONG))
+      {
+        /* ---- 闭环直行, 测"实际走了多远"(修全局比例, 用卷尺量) ----
+         * 用法: 车头对准卷尺 0 刻度 → 长按 KEY2 → 停稳后读卷尺实际距离 D_act。
+         *       多测 2~3 次取平均(每次先按 KEY1 挂起、摆回 0 刻度)。
+         * 结论怎么用:
+         *   ① 四轮一起偏 (比如永远走 1015mm) → 是全局比例: 把四个
+         *      CH_WHEEL_SCALE_* 同时乘 1000/D_act(≈0.985), 或者把
+         *      CH_WHEEL_DIAMETER_MM 从 75 改成 75*D_act/1000(≈76.2)。
+         *   ② 距离对但不直 → 那是轮间差异/打滑, 看 I/MOVE 日志的 e: 和 yaw。
+         * ⚠️ 每次都会直行 1m, 留够场地。 */
+        Chassis_CalibStop();                                          /* 退出挂起, 恢复闭环 */
+        Chassis_SetHeadingRef(jy61p ? jy61p->var.yaw : 0.0f);         /* 以当前朝向为准, 免得边跑边纠 */
+        Chassis_Move_Forward(ENC_CALIB_DIST_MM);
+        elog_i("CALIB", "已直行 %d mm: 停稳后量卷尺 D_act, 看四个 scale 是否都要乘 %d/D_act",
+               (int)ENC_CALIB_DIST_MM, (int)ENC_CALIB_DIST_MM);
+      }
+      if (HAL_GetTick() - dbgTick >= 500)
+      {
+        dbgTick = HAL_GetTick();
+        elog_i("CALIB", "live(前进为正): FL=%ld FR=%ld BL=%ld BR=%ld",
+               (long)Chassis_CalibAccum(0), (long)Chassis_CalibAccum(1),
+               (long)Chassis_CalibAccum(2), (long)Chassis_CalibAccum(3));
+      }
+#else
+      /* KEY1 按下 -> 启动比赛任务 */
+      if (Key_Check(KEY_1, KEY_DOWN))
+      {
+        demoRun = false;
+        if (HAL_GetTick() < JY_WARMUP_MS)
+        {
+          /* 陀螺仪未稳定前不启动任务, 保证每次上电跑法一致 */
+          elog_i("MAIN", "JY61P warming up (%lu/%d ms), wait...",
+                 (unsigned long)HAL_GetTick(), (int)JY_WARMUP_MS);
+        }
+        else
+        {
+          /* 启动前把当前朝向归零: 每次上电都以放置朝向为 0°, 跑法一致 */
+          if (jy61p != NULL)
+          {
+            jy61p->fun->YAW_ZERO(jy61p);
+            jy61p->var.yaw = 0;
+            elog_i("MAIN", "Yaw auto-zero before mission");
+          }
+          Mission_Init();
+          Mission_Start();
+          elog_i("MAIN", "KEY1: mission START");
+        }
+      }
+      /* KEY2 按下 -> JY61P 航向角归零 */
+      if (Key_Check(KEY_2, KEY_DOWN))
+      {
+        if (jy61p != NULL)
+        {
+          elog_i("JY", "Yaw zeroing...");
+          jy61p->fun->YAW_ZERO(jy61p);
+          jy61p->var.yaw = 0;
+          elog_i("JY", "Yaw zero done");
+        }
+      }
+
+      /* 底盘演示(循环: 前进/横移/旋转/后退), KEY1 启动 */
+      if (demoRun)
+      {
+        Chassis_Demo();
+
+        /* 每 200ms 打印底盘调试信息(位置/目标/转向剩余), 方便诊断 */
+        if (HAL_GetTick() - dbgTick >= 200)
+        {
+          dbgTick = HAL_GetTick();
+          Chassis_DebugLog();
+        }
+      }
+      else
+      {
+        Mission_Update();   /* 比赛任务主状态机(非演示时运行) */
+      }
+#endif /* 调试模式(ARM_SEQ / VISION_TASK) */
     }
 
     /* 每 20ms 快速读取航向角 yaw, 供底盘转向闭环使用 */
@@ -436,12 +555,29 @@ int main(void)
       OLED_ShowSignedNum(48, 32, Encoder_GetCount(2), 6, OLED_6X8);
       OLED_ShowSignedNum(0,  40, Encoder_GetCount(3), 6, OLED_6X8);
       OLED_ShowSignedNum(48, 40, Encoder_GetCount(4), 6, OLED_6X8);
-      OLED_ShowString(0, 48, "S:", OLED_6X8);
-      OLED_ShowNum(12, 48, (uint32_t)g_mission_state, 2, OLED_6X8);
+#if !MISSION_TEST_NO_ARM
+      if (ArmTeach_IsActive())
+      {
+        OLED_ShowString(0, 48, "Teach:", OLED_6X8);
+        OLED_ShowString(36, 48, (char *)ArmTeach_GetActionName(), OLED_6X8);
+      }
+      else
+#endif
+      {
+        OLED_ShowString(0, 48, "S:", OLED_6X8);
+        OLED_ShowNum(12, 48, (uint32_t)g_mission_state, 2, OLED_6X8);
+      }
+      /* 转向环 PID 调试(仅原地转向时有值): Si=I项瞬时, Ip=本次转向 I 项峰值(保持) */
+      OLED_ShowString(0,  56, "Si:", OLED_6X8);
+      OLED_ShowFloatNum(18, 56, Chassis_GetSteerITerm(), 3, 1, OLED_6X8);
+      OLED_ShowString(60, 56, "Ip:", OLED_6X8);
+      OLED_ShowFloatNum(78, 56, Chassis_GetSteerIPeak(), 3, 1, OLED_6X8);
       OLED_Update();
     }
 
-    /* 每 500ms 经蓝牙串口(USART3)打印姿态角与编码器计数 */
+    /* 每 500ms 经蓝牙串口(USART3)打印姿态角与编码器计数
+     * (调试模式下屏蔽, 免得淹没视觉收发日志) */
+#if !MISSION_DEBUG_VISION_TASK && !MISSION_DEBUG_ARM_SEQ && !CHASSIS_ENC_CALIB
     if (HAL_GetTick() - logTick >= 500)
     {
       logTick = HAL_GetTick();
@@ -454,7 +590,9 @@ int main(void)
              (long)Encoder_GetCount(1), (long)Encoder_GetCount(2),
              (long)Encoder_GetCount(3), (long)Encoder_GetCount(4));
       Chassis_HeadingDebugLog();
+      Chassis_SteerDebugLog();   /* 转向环 PID: err/P/I/D/out/积分值 */
     }
+#endif
 #endif /* !ARM_UART_TEST_MODE */
   }
   /* USER CODE END 3 */

@@ -40,6 +40,18 @@ void ServoArm_Init(void);
 void Servos_SetPositions(uint16_t positions[SERVO_COUNT], uint16_t time_ms);
 
 /**
+ * @brief  更新上电初始姿态(示教标定 HOME 时同步, 下次 ServoArm_Init 生效)
+ * @param  positions 长度为 SERVO_COUNT 的初始位置数组 (0~4095)
+ */
+void Servos_SetHomePositions(const uint16_t positions[SERVO_COUNT]);
+
+/**
+ * @brief  获取上电初始姿态数组指针(唯一来源, 供 MissionControl 的 HOME 动作共用)
+ * @retval 指向内部 SERVO_POS_HOME 的指针(可直接写入)
+ */
+uint16_t *Servos_GetHomePositions(void);
+
+/**
  * @brief  设置单个舵机位置(阻塞, 等待应答)
  * @param  servo_id  舵机 ID (1~5)
  * @param  position  目标位置 (0~4095)

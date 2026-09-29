@@ -38,18 +38,50 @@ float DualPID_Update(DualPID_Controller *pid,
     /* ---------- 位置环 ---------- */
     float pos_error = target_pos - current_pos;
 
-    /* 位置环积分限幅 = 期望速度上限的 23% (经验系数, 防积分饱和导致到点猛冲)
-     * 一般无需调整: 调大→积分消除误差能力更强但更易超调, 调小→更稳但偏慢 */
-    pid->pos_integral += pid->pos_Ki * pos_error * dt;
-    float integral_limit_pos = pid->max_vel * 0.23f;
-    if (pid->pos_integral > integral_limit_pos)  pid->pos_integral = integral_limit_pos;
-    if (pid->pos_integral < -integral_limit_pos) pid->pos_integral = -integral_limit_pos;
+    /* ⭐ 位置环积分: 只在"接近目标"(|误差| < POS_INTEGRAL_BAND)时才累积 (2026-09-27 改)
+     * 为什么加: pos_Ki=0(纯 P)时, 被静摩擦卡住的轮子残差 = 克服静摩擦所需PWM/pos_Kp,
+     *          实测 20~50 计数, 而且四轮不等 → 四轮在不同位置停住 → 停车瞬间车被拧一下、
+     *          每段车姿都偏一点, 几十段累积成"越走越偏/停不回原位"。
+     *          加上积分后, 卡住的轮子会持续加大 PWM 直到磨到位(残差 → 几个计数)。
+     * 为什么加带宽: 长距离段内不累积 → 不会积分饱和导致到点猛冲/超调;
+     *          只在最后约 18mm 内起作用, 对"走直/走快"没有任何影响。
+     * 上限 max_vel*0.23 → 最大超调 ≈ 上限/pos_Kp (十几计数, 可接受)。
+     * 位置环积分限幅 = 期望速度上限的 23% (经验系数, 防积分饱和导致到点猛冲) */
+    const float POS_INTEGRAL_BAND = 120.0f;   /* 计数 ≈ 18mm */
+    if (fabsf(pos_error) < POS_INTEGRAL_BAND)
+    {
+        pid->pos_integral += pid->pos_Ki * pos_error * dt;
+        float integral_limit_pos = pid->max_vel * 0.23f;
+        if (pid->pos_integral > integral_limit_pos)  pid->pos_integral = integral_limit_pos;
+        if (pid->pos_integral < -integral_limit_pos) pid->pos_integral = -integral_limit_pos;
+    }
 
     float pos_D = pid->pos_Kd * (pos_error - pid->pos_error_prev) / dt;
 
     float vel_target = pid->pos_Kp * pos_error + pid->pos_integral + pos_D;
-    vel_target = fmaxf(fminf(vel_target, pid->max_vel), -pid->max_vel);
-    vel_target += vel_bias;   /* 航向保持偏置: 必须在限幅后叠加, 否则位置环饱和时被吞掉 */
+
+    /* ---------- 航向保持速度偏置 (2026-09-27 重整) ----------
+     * 1) 偏置自身限幅(≤0.7×max_vel): 防止"偏置比平移速度还大"时把车拧成原地打转;
+     * 2) 不允许偏置把"平移方向"反掉(最多把某轮减到 0): 实测踩过——位置环顶在
+     *    max_vel 时, ±25 的偏置会让一侧轮子反转, 另一侧正转 → 车原地打转卡死
+     *    (10s 超时兜底后 e: 残留 57 计数, 切走状态后车又猛拱一下);
+     * 3) 位置环输出按 (max_vel - |偏置|) 限幅 → 给偏置留出余量。否则位置环一旦
+     *    饱和(平移途中基本都顶在 max_vel), 加在"减速侧"的偏置生效、加在"加速侧"
+     *    的被钳掉 → 差速不对称, 航向修正实际只发挥了一半。 */
+    float bias = vel_bias;
+    float bias_max = pid->max_vel * 0.7f;
+    if (bias >  bias_max) bias =  bias_max;
+    if (bias < -bias_max) bias = -bias_max;
+
+    float pos_lim = pid->max_vel - fabsf(bias);
+    if (pos_lim < 0.0f) pos_lim = 0.0f;
+    vel_target = fmaxf(fminf(vel_target, pos_lim), -pos_lim);
+
+    /* 不允许偏置反向: 正向平移时偏置最多把该轮减到 0(反向平移同理) */
+    if (vel_target > 0.0f && bias < -vel_target) bias = -vel_target;
+    if (vel_target < 0.0f && bias > -vel_target) bias = -vel_target;
+
+    vel_target += bias;
     vel_target = fmaxf(fminf(vel_target, pid->max_vel), -pid->max_vel);
 
     pid->pos_error_prev = pos_error;

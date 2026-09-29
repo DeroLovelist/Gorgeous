@@ -13,6 +13,7 @@
 #define __MISSIONCONTROL_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 /* =====================================================================
  * ⭐ 测试开关 (调参时最常改的两个开关)
@@ -29,8 +30,42 @@
  * 调好路线距离后: 先把 MISSION_TEST_NO_VISION 置 0 联调视觉, 最后再把
  * MISSION_TEST_NO_ARM 置 0 联调机械臂。
  * ===================================================================== */
-#define MISSION_TEST_NO_ARM      1   /* 1=不初始化/不驱动机械臂 */
+#define MISSION_TEST_NO_ARM      0   /* 1=不初始化/不驱动机械臂 */
 #define MISSION_TEST_NO_VISION   1   /* 1=K230 不参与, 用模拟数据推进状态机 */
+
+/* ⭐ 视觉单独调试开关: 0=正常整场任务(联合调试);
+ *   1=球(抓取前对准) 2=靶(打靶) 3=桶(放置前对准) 4=形状(救援)。
+ *   非 0 时: 上电按 KEY1 直接进入对应视觉目标对准(不跑路线、不动机械臂),
+ *   对准完成后停车并打印结果。改完记得重载+构建。
+ *   5 = 视觉串口链路监控(纯收发打印, 车/臂完全不动):
+ *     上电后 KEY1=发 scan_qr, KEY1 长按=发 run_task:1, KEY2=发 reset:0,
+ *     收到 K230 任何一行打印 "RX: ..." */
+#define MISSION_DEBUG_VISION_TASK  0
+
+/* ⭐ 机械臂动作单独调试开关(底盘完全不动, 不跑视觉也不跑路线):
+ *   0 = 关;
+ *   1 = 排爆序列(回初始位 → 抓取 → 停顿 → 放置 → 回初始位)。
+ *   非 0 时: 上电按 KEY1 跑一遍该序列(需 MISSION_TEST_NO_ARM=0)。
+ *   用途: 标定完 ARM_* 位置后, 小车静止时验证机械臂动作是否正确/会不会撞。 */
+#define MISSION_DEBUG_ARM_SEQ  0
+
+/* ⭐ 编码器静态标定开关 (标定 CH_WHEEL_SCALE_*):
+ *   0 = 关;
+ *   1 = 上电进入标定模式(底盘闭环挂起, 电机不输出, 小车不会自己跑)。
+ *   流程: ① KEY1 清零 → ② 沿车头方向用卷尺量 ENC_CALIB_DIST_MM 推过去
+ *         → ③ KEY2 蓝牙打印 I/CALIB 建议系数 → ④ 反向再推一次对比
+ *         → ⑤ KEY1 长按结束标定(恢复正常闭环)。
+ *   详细说明/怎么判断该不该用静态标定 → 见 Chassis.h 的 Chassis_CalibStart 注释。 */
+#define CHASSIS_ENC_CALIB        0
+#define ENC_CALIB_DIST_MM        1000   /* 标定时人工推车的距离(mm), 自己用卷尺量准 */
+
+#if MISSION_DEBUG_ARM_SEQ && MISSION_TEST_NO_ARM
+#error "MISSION_DEBUG_ARM_SEQ 需要 MISSION_TEST_NO_ARM=0 (机械臂必须启用)"
+#endif
+
+#if MISSION_DEBUG_ARM_SEQ && CHASSIS_ENC_CALIB
+#error "MISSION_DEBUG_ARM_SEQ 与 CHASSIS_ENC_CALIB 只能开一个"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -110,10 +145,49 @@ extern volatile MissionState_t g_mission_state;
 extern volatile uint8_t g_vision_task_in_progress;
 extern char g_qr_code_string[8];
 
+/* ---------------- 机械臂动作数组(示教标定用) ---------------- */
+#define ARM_ACTION_COUNT  9
+typedef enum {
+    ARM_ACTION_HOME = 0,
+    ARM_ACTION_GRAB_OPEN,
+    ARM_ACTION_GRAB_LOWER,
+    ARM_ACTION_GRAB_CLOSE,
+    ARM_ACTION_GRAB_LIFT,
+    ARM_ACTION_PLACE_TURN,
+    ARM_ACTION_PLACE_LOWER,
+    ARM_ACTION_PLACE_OPEN,
+    ARM_ACTION_PLACE_LIFT
+} ArmAction_t;
+
+/* ---- 动作数组访问接口 ---- */
+void ArmAction_SetPositions(uint8_t action_idx, const uint16_t pos[5]);
+const char *ArmAction_GetName(uint8_t action_idx);
+
+/* ---- 示教标定模式(联调期) ----
+ * KEY2 长按 = 进入/退出示教模式;
+ * 示教中: KEY2 = 切换动作数组, KEY1 = 读取当前位置并写入当前动作 */
+bool ArmTeach_IsActive(void);
+void ArmTeach_Enter(void);
+void ArmTeach_Exit(void);
+void ArmTeach_NextAction(void);
+void ArmTeach_WriteCurrent(void);
+uint8_t ArmTeach_GetActionIdx(void);
+const char *ArmTeach_GetActionName(void);
+
 /* ---------------- 接口 ---------------- */
 void Mission_Init(void);
 void Mission_Start(void);
 void Mission_Update(void);
+
+/* ---- 视觉单独调试接口(仅 MISSION_DEBUG_VISION_TASK != 0 时使用) ---- */
+void Mission_DebugVisionStart(void);
+void Mission_DebugVisionUpdate(void);
+/* 链路监控(值 5)发送: which 0=reset:0, 1=scan_qr, 2=run_task:1 */
+void Mission_DebugVisionLinkSend(uint8_t which);
+
+/* ---- 机械臂单独调试接口(仅 MISSION_DEBUG_ARM_SEQ != 0 时使用) ---- */
+void Mission_DebugArmStart(void);
+void Mission_DebugArmUpdate(void);
 
 #ifdef __cplusplus
 }

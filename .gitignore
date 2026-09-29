@@ -30,3 +30,8 @@
 
 # 手工备份包(大文件, 不入库)
 /123.zip
+
+# Windows shortcut files (not source)
+*.lnk
+# standalone YOLO vision script (managed separately)
+/yolo_main3.py
