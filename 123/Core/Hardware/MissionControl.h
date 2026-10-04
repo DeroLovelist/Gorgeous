@@ -103,7 +103,12 @@ typedef enum {
     STATE_10_APPROACH_BOMB,                 // 接近炸弹
     STATE_11_PERFORMING_BOMB_DISPOSAL,      // 视觉对准并抓取/放置炸弹
 
-    /* 阶段三: 打靶 */
+    /* 阶段三: 打靶 (2026-10-04 改版: 底盘只走“右移1510 → 停 → 航向校正”,
+     *        之后由任务2 视觉子状态机【原地小步转底座 ID1】对准靶子;
+     *        收到 C 后依次摆 FIRE → LIFT → SCAN_RESET, 再“右移400 → 航向校正”
+     *        直接进入 STATE_14 救援。
+     * ⚠️ PART1_MOVE_B/CORRECT_B/MOVE_C 和 TURN_A/TURN_B 现已废弃不再经过;
+     *    PART2_MOVE_A(右移400) 与 PART2_CORRECT_A(航向校正) 仍在用。 */
     STATE_12_PART1_MOVE_A,
     STATE_12_PART1_CORRECT_A,
     STATE_12_PART1_MOVE_B,
@@ -116,7 +121,7 @@ typedef enum {
     STATE_12_PART2_MOVE_B,
     STATE_12_PART2_CORRECT_B,
     STATE_12_PART2_MOVE_C,
-    STATE_13_PERFORMING_TARGETING,          // 视觉对准并打靶
+    STATE_13_PERFORMING_TARGETING,          // 视觉原地转底座 ID1 对准靶子, 然后摆 FIRE/LIFT/SCAN_RESET
 
     /* 阶段四: 救援 */
     STATE_14_MOVE_FORWARD_B,                 // (原有) 救援前前进(掉头准备)
