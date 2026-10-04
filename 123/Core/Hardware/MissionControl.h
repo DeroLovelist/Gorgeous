@@ -31,7 +31,7 @@
  * MISSION_TEST_NO_ARM 置 0 联调机械臂。
  * ===================================================================== */
 #define MISSION_TEST_NO_ARM      0   /* 1=不初始化/不驱动机械臂 */
-#define MISSION_TEST_NO_VISION   1   /* 1=K230 不参与, 用模拟数据推进状态机 */
+#define MISSION_TEST_NO_VISION   0   /* 1=K230 不参与, 用模拟数据推进状态机 */
 
 /* ⭐ 视觉单独调试开关: 0=正常整场任务(联合调试);
  *   1=球(抓取前对准) 2=靶(打靶) 3=桶(放置前对准) 4=形状(救援)。
@@ -145,23 +145,46 @@ extern volatile MissionState_t g_mission_state;
 extern volatile uint8_t g_vision_task_in_progress;
 extern char g_qr_code_string[8];
 
-/* ---------------- 机械臂动作数组(示教标定用) ---------------- */
-#define ARM_ACTION_COUNT  9
+/* ---------------- 机械臂姿态表(示教标定/动作编排用) ----------------
+ * 每个姿态 = 5 个舵机的位置(0~4095), 顺序固定:
+ *   [0]=ID1 底座  [1]=ID2 大臂  [2]=ID3 副关节  [3]=ID4 腕部
+ *   [4]=ID5 夹爪(数值小=张开, 数值大=闭合)
+ * 数值本体在 MissionControl.c 的 s_arm_pose_table 里(实测标定), 这里只列下标。
+ * ⚠️ 相邻两姿态的差值不要超过 2048(半圈): 飞特舵机按“最短路径”转,
+ *    超过 2048 会朝反方向甩近一整圈。 */
+#define ARM_POSE_COUNT  20
 typedef enum {
-    ARM_ACTION_HOME = 0,
-    ARM_ACTION_GRAB_OPEN,
-    ARM_ACTION_GRAB_LOWER,
-    ARM_ACTION_GRAB_CLOSE,
-    ARM_ACTION_GRAB_LIFT,
-    ARM_ACTION_PLACE_TURN,
-    ARM_ACTION_PLACE_LOWER,
-    ARM_ACTION_PLACE_OPEN,
-    ARM_ACTION_PLACE_LIFT
-} ArmAction_t;
+    ARM_POSE_HOME = 0,      /* 复位/初始姿态(取自 ServoArm.c 的 SERVO_POS_HOME) */
+    ARM_POSE_SCAN,          /* 扫码: 车停稳后伸臂给摄像头扫码 */
+    ARM_POSE_SCAN_RESET,    /* 扫码之后复位: 扫到码后把机械臂收回 */
+    ARM_POSE_BALL_LOOK,     /* 看球: 摄像头对准小球(抓取前视觉对准) */
+    ARM_POSE_BALL_PRE,      /* 抓夹移动到小球前 */
+    ARM_POSE_BALL_CLOSE,    /* 夹爪夹紧小球 */
+    ARM_POSE_BALL_LIFT,     /* 抓到小球后大臂抬起 */
+    ARM_POSE_BUCKET_CARRY,  /* 携带姿态: 端着球, 底盘移动到另一侧 */
+    ARM_POSE_BUCKET_LOOK,   /* 看桶: 摄像头对准球桶(放置前视觉对准) */
+    ARM_POSE_PLACE_PRE,     /* 机械臂移动到放置小球的位置 */
+    ARM_POSE_PLACE_OPEN,    /* 夹爪松开(放球) */
+    ARM_POSE_PLACE_LIFT,    /* 放置完之后大臂抬起 */
+    ARM_POSE_TARGET_READY,  /* 转动到准备识别靶子的位置 */
+    ARM_POSE_TARGET_LOOK,   /* 识别靶子: 摄像头对准靶子 */
+    ARM_POSE_TARGET_FIRE,   /* 激光发射位 */
+    ARM_POSE_TARGET_LIFT,   /* 发射完激光后大臂抬起 */
+    ARM_POSE_HOSTAGE_LOOK,  /* 识别人质: 摄像头对准人质 */
+    ARM_POSE_HOSTAGE_PRE,   /* 机械臂准备抱人质 */
+    ARM_POSE_HOSTAGE_CLOSE, /* 抱紧人质 */
+    ARM_POSE_HOSTAGE_LIFT   /* 抱起人质后大臂抬起 */
+} ArmPose_t;
 
-/* ---- 动作数组访问接口 ---- */
-void ArmAction_SetPositions(uint8_t action_idx, const uint16_t pos[5]);
-const char *ArmAction_GetName(uint8_t action_idx);
+/* ---- 姿态表访问/执行接口 ---- */
+void ArmAction_SetPositions(uint8_t pose_idx, const uint16_t pos[5]);
+const char *ArmAction_GetName(uint8_t pose_idx);
+/* 摆到指定姿态(阻塞: 等舵机走完 pose 自己的运动时间 + hold_time 再返回) */
+void Arm_GotoPose(uint8_t pose_idx);
+/* 分两步摆到指定姿态(阻塞): 先动 first_mask 里的舵机(SERVO_MASK_*),
+ * 等它们到位停稳, 再动剩下的。用于实测“一步摆到位会剐蹭”的动作,
+ * 例如 PLACE_LIFT: Arm_GotoPoseSplit(ARM_POSE_PLACE_LIFT, SERVO_MASK_ARM_BODY) */
+void Arm_GotoPoseSplit(uint8_t pose_idx, uint8_t first_mask);
 
 /* ---- 示教标定模式(联调期) ----
  * KEY2 长按 = 进入/退出示教模式;
@@ -179,6 +202,16 @@ void Mission_Init(void);
 void Mission_Start(void);
 void Mission_Update(void);
 
+/* ---------------- 机械臂阻塞等待的支撑(重要) ----------------
+ * 陀螺仪 yaw 只在 main.c 主循环里每 20ms 刷新一次; 而摆臂一次要阻塞好几秒,
+ * 期间 TIM9 里的航向/转向闭环会一直读到冻结的角度 → 原地转向的
+ * s_turn_remaining 永远减不下去 → 车会一直自转。
+ * Mission_Coop_Wait() 就是替代 HAL_Delay 的“协作式等待”:
+ *   等待期间自己刷 yaw, 并把 K230 收到的行存进内部小队列(不丢帧)。
+ * Mission_SetYawPollHook() 由 main.c 初始化时注入“刷新 yaw”的函数。 */
+void Mission_Coop_Wait(uint32_t ms);
+void Mission_SetYawPollHook(void (*fn)(void));
+
 /* ---- 视觉单独调试接口(仅 MISSION_DEBUG_VISION_TASK != 0 时使用) ---- */
 void Mission_DebugVisionStart(void);
 void Mission_DebugVisionUpdate(void);
@@ -188,6 +221,10 @@ void Mission_DebugVisionLinkSend(uint8_t which);
 /* ---- 机械臂单独调试接口(仅 MISSION_DEBUG_ARM_SEQ != 0 时使用) ---- */
 void Mission_DebugArmStart(void);
 void Mission_DebugArmUpdate(void);
+/* KEY2 切换当前调试步骤(序列执行中才生效), 见 MissionControl.c */
+void Mission_ChangeStep(void);
+/* 1=调试序列尚未启动(等 KEY1); 0=序列执行中。供 main.c 区分 KEY1 是“启动”还是“切步” */
+uint8_t Mission_DebugArmIsIdle(void);
 
 #ifdef __cplusplus
 }

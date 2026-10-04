@@ -25,8 +25,25 @@ extern "C" {
 #define SERVO_ARM_ID_MIN  1
 #define SERVO_ARM_ID_MAX  5
 
+/* 舵机选择掩码(bit0=ID1 底座, bit1=ID2 大臂, bit2=ID3 副关节,
+ *                bit3=ID4 腕部, bit4=ID5 夹爪)
+ * 用途: “分步动作” —— 一次只让其中几个舵机动, 避免整臂同时扫动剐蹭车架 */
+#define SERVO_MASK_ID1        0x01u
+#define SERVO_MASK_ID2        0x02u
+#define SERVO_MASK_ID3        0x04u
+#define SERVO_MASK_ID4        0x08u
+#define SERVO_MASK_ID5        0x10u
+#define SERVO_MASK_ALL        0x1Fu
+#define SERVO_MASK_ARM_BODY   (SERVO_MASK_ID1 | SERVO_MASK_ID2 | SERVO_MASK_ID3)  /* 底座+大臂+副关节 */
+#define SERVO_MASK_WRIST_GRIP (SERVO_MASK_ID4 | SERVO_MASK_ID5)                   /* 腕部+夹爪 */
+
+/* 上电/复位“回初始姿态”的运动时间(ms): 值大 = 慢 = 安全(防剐蹭)。
+ * 同时被 ServoArm_Init() 和 Mission_Init() 使用, 保证两处一致 */
+#define SERVO_HOME_MOVE_MS    10000
+
 /**
- * @brief  初始化机械臂: 初始化舵机串口、使能扭矩并回到初始姿态
+ * @brief  初始化机械臂: 初始化舵机串口、等舵机上电、读回实际位置、
+ *         使能扭矩并回到初始姿态
  * @note   需在 main() 中 SCServo 串口(USART2)初始化完成后调用
  */
 void ServoArm_Init(void);
@@ -38,6 +55,18 @@ void ServoArm_Init(void);
  * @note   本函数为阻塞发送, 但不等待舵机真正到位; 调用方自行延时/判断
  */
 void Servos_SetPositions(uint16_t positions[SERVO_COUNT], uint16_t time_ms);
+
+/**
+ * @brief  只设置 mask 选中的舵机位置(其余舵机保持不动)
+ * @param  positions 长度为 SERVO_COUNT 的目标位置数组 (0~4095)
+ * @param  mask      舵机选择掩码, 见上面 SERVO_MASK_*
+ * @param  time_ms   期望运动时间(ms), 0 表示最快
+ * @note   用于“分步动作”: 先让大臂等到位, 再动腕部/夹爪。
+ *         例: 先 Servos_SetPositionsMasked(pos, SERVO_MASK_ARM_BODY, 2500);
+ *             再 Servos_SetPositionsMasked(pos, SERVO_MASK_WRIST_GRIP, 1200);
+ */
+void Servos_SetPositionsMasked(const uint16_t positions[SERVO_COUNT],
+                               uint8_t mask, uint16_t time_ms);
 
 /**
  * @brief  更新上电初始姿态(示教标定 HOME 时同步, 下次 ServoArm_Init 生效)

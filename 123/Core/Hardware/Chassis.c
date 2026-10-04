@@ -5,6 +5,8 @@
 #include "ENCODER.h"
 #include "elog.h"
 #include <math.h>
+#include <stdio.h>   /* snprintf (MOVE 日志把超时时长打出来) */
+#include <string.h>  /* memcpy (MOVE 日志从 ISR 搬出来时用) */
 
 /* =====================================================================
  * 车轮索引 (内部): 0=FL 1=FR 2=BL 3=BR
@@ -28,6 +30,7 @@ static pid_param_t        s_steer;           /* 转向 PID */
 static int32_t            s_target[W_NUM];   /* 目标位置 (编码器计数) */
 static int32_t            s_pos[W_NUM];      /* 当前位置 (编码器计数) */
 static int16_t            s_speed[W_NUM];    /* 当前速度 (计数/周期) */
+static int32_t            s_speed_filt[W_NUM];/* |速度| 低通值 (计数/周期, 判"停稳"用) */
 static int16_t            s_last_pwm[W_NUM]; /* 最近一次输出 PWM (软启动斜坡基准 + 调试用) */
 
 static const float *s_yaw = NULL;            /* 航向角数据源 (度) */
@@ -41,8 +44,11 @@ static float s_turn_prev_yaw = 0.0f;        // 上一周期航向 (度, PD 阻�
 static uint16_t s_turn_stable = 0;          // 转向停车稳定计数
 static float s_steer_i_peak = 0.0f;         /* 转向环 I 项峰值(本次转向内保持, 调试用) */
 static uint16_t s_move_stable = 0;           /* 平移停车稳定计数 */
+static uint16_t s_arrived_cycles = 0;        /* 位置已达标持续的周期数 (兜底: 到位了却一直判不到停稳) */
 static int32_t  s_move_start_pos[W_NUM];     /* 本段平移的起点位置 (算"实走多少"用, 见 MOVE 日志) */
 static uint16_t s_move_cycles = 0;           /* 本段平移已运行的控制周期数 (超时兜底用) */
+static uint16_t s_move_timeout_cycles = 0;   /* 本段平移的超时周期数 (按距离自适应, 见 add_move) */
+static uint16_t s_stall_cycles = 0;          /* "停住但没到位"连续周期数 (见 Chassis.h 的 CH_STALL_DETECT_CYCLES) */
 
 static float s_heading_target = 0.0f;       /* 平移时的目标航向 (度) */
 static float s_heading_prev_yaw = 0.0f;     /* 上一周期航向 (度, PD 阻尼用) */
@@ -103,7 +109,7 @@ typedef struct
 static const ChassisPidCfg_t s_cfg_straight = {
     .pos_Kp = 0.6f,  .pos_Ki = 0.25f,  .pos_Kd = 0.0f,
     .vel_Kp = 0.4f,  .vel_Ki = 0.05f,  .vel_Kd = 0.0f,
-    .vel_ff = 0.3f,  .vel_ff_dead = 14.0f,
+    .vel_ff = 0.18f,  .vel_ff_dead = 14.0f,
     .hd_Kp = 1.8f,   .hd_Ki = 1.0f,    .hd_Kd = 1.5f,
     .hd_max = 25.0f, .hd_imax = 50.0f, .hd_dead = 0.5f,
     .hd_trim = 0.0f   /* 直行实测很直 → 航向保持保持原样(只用速度偏置), 不动 */
@@ -113,14 +119,19 @@ static const ChassisPidCfg_t s_cfg_straight = {
  * 2026-09-27: pos_Ki 0→0.25, hd_Kp 4.5→2.0, hd_max 12→25 (理由同 s_cfg_straight)
  * 2026-09-27(二修, 治"横移走不直"): 横移时辊子侧向刮地被地面拧着转,
  *   四轮位置环会把"速度环偏置"抵消掉 → 改成 hd_trim=1.0(把修正量投入位置
- *   目标微调) 才真能修住; 同时把增益降下来(机制变有效了, 不改会过冲)。 */
+ *   目标微调) 才真能修住; 同时把增益降下来(机制变有效了, 不改会过冲)。
+ * ⚠️ 2026-09-29: hd_Ki 0.8 → **0**。原因: hd_trim 这条路本身就是个积分器
+ *   (trim 是"累加"出来的), 再叠 PID 的 I 项 = 双积分 → 积分饱和后大过冲。
+ *   实测铁证: 横移途中 yaw 从 -0.4° 自己甩到 +7.3°, 而同时 trim 顶在 -250
+ *   (已经要求转 10° 而车才偏 0.4°) → 就是它。横移段的稳态误差由 trim 的
+ *   积分作用消化, 不需要 I 项。(若仍残留固定偏差, 可给 0.1~0.2 一点点) */
 static const ChassisPidCfg_t s_cfg_strafe = {
     .pos_Kp = 0.6f,  .pos_Ki = 0.25f,  .pos_Kd = 0.0f,
-    .vel_Kp = 0.4f,  .vel_Ki = 0.05f,  .vel_Kd = 0.0f,
+    .vel_Kp = 0.4f,  .vel_Ki = 0.05f,  .vel_Kd = 0.0f,//0.4
     .vel_ff = 0.3f,  .vel_ff_dead = 12.0f,
-    .hd_Kp = 1.4f,   .hd_Ki = 0.8f,    .hd_Kd = 1.0f,
-    .hd_max = 12.0f, .hd_imax = 40.0f, .hd_dead = 0.3f,
-    .hd_trim = 1.0f
+    .hd_Kp = 1.6f,   .hd_Ki = 1.0f,    .hd_Kd = 1.5f,//1.4，0.0f，1.0
+    .hd_max = 16.0f, .hd_imax = 50.0f, .hd_dead = 0.3f,//16，10,40
+    .hd_trim = 0.0f//1.0f
 };
 
 static const ChassisPidCfg_t *s_cfg = &s_cfg_straight;  /* 当前生效的分段参数集 */
@@ -162,6 +173,18 @@ static void read_encoders(void)
         int16_t d = (int16_t)(raw * s_enc_dir[i]);
         s_speed[i] = d;
         s_pos[i] += d;
+
+        /* |速度| 一阶低通 (时间常数≈4 个控制周期=80ms):
+         * 轮子静止时编码器仍有 ±1~2 计数抖动(日志实测 M1=61557→61558→61558),
+         * 直接用瞬时速度判"停稳"会永远判不到。
+         * ⚠⚠️ 步长必须"四舍五入": 若写成 s_speed_filt += (|d| - s_speed_filt) / 4,
+         *   整数除法在 |d|=0 时会把值卡在 2~3 下不去(3/4=0) → 速度判据永远不满足
+         *   → 车早就到位却每段都干等到超时(实测每段白等 3~12s, MOVE 行全是 TO)。 */
+        {
+            int32_t dabs = iabs(d);
+            int32_t diff = dabs - s_speed_filt[i];
+            s_speed_filt[i] += (diff >= 0) ? (diff + 2) / 4 : -((-diff + 2) / 4);
+        }
     }
 }
 
@@ -223,6 +246,8 @@ static void chassis_freeze(void)
     s_heading_trim = 0;
     s_heading_integral = 0.0f;
     s_heading_corr_last = 0.0f;
+    s_move_stable = 0;
+    s_arrived_cycles = 0;
     for (int i = 0; i < W_NUM; i++)
     {
         s_vel_bias_last[i] = 0;
@@ -301,6 +326,7 @@ void Chassis_Init(void)
         s_target[i] = 0;
         s_pos[i] = 0;
         s_speed[i] = 0;
+        s_speed_filt[i] = 0;
         s_move_start_pos[i] = 0;
     }
 
@@ -324,7 +350,9 @@ void Chassis_Init(void)
     s_moving = false;
     s_turn_open = false;
     s_move_stable = 0;
+    s_arrived_cycles = 0;
     s_move_cycles = 0;
+    s_move_timeout_cycles = (uint16_t)(CH_MOVE_TIMEOUT_MIN_MS / CH_CTRL_PERIOD_MS);
     s_heading_integral = 0.0f;
     s_heading_trim = 0;
     s_heading_target = 0.0f;   /* 默认基准 0°; 任务层也可用 Chassis_SetHeadingRef() 改 */
@@ -350,6 +378,7 @@ void Chassis_Resume(void)
         Encoder_Start(s_motor[i]);
         s_pos[i] = 0;
         s_speed[i] = 0;
+        s_speed_filt[i] = 0;
         s_target[i] = 0;
         s_move_start_pos[i] = 0;
     }
@@ -357,7 +386,9 @@ void Chassis_Resume(void)
     s_turn_open = false;
     s_turn_stable = 0;
     s_move_stable = 0;
+    s_arrived_cycles = 0;
     s_move_cycles = 0;
+    s_move_timeout_cycles = (uint16_t)(CH_MOVE_TIMEOUT_MIN_MS / CH_CTRL_PERIOD_MS);
     s_heading_integral = 0.0f;
     s_heading_trim = 0;
     s_heading_prev_yaw = (s_yaw != NULL) ? *s_yaw : 0.0f;
@@ -475,16 +506,69 @@ void Chassis_Tick(void)
  *     差几拾计数就是轮子不齐。
  *   - 各段 yaw 应该都接近 0°(航向基准)。若每段都比上一段偏一点 → 航向基准或
  *     转向到位阈值有问题(已用 Chassis_SetHeadingRef + CH_ANGLE_ERR_THRESHOLD 修)。
- *   - 出现 TO → 该段 10s 没走完, 看 d/e 定位是哪个轮卡住。 */
+ *   - 出现 TO(后面带本段允许时长, 如 TO(11900ms)) → 本段是被超时切断的,
+ *     e: 还很大说明没走完: 这时"走了多少"≈速度×超时, 与 ROUTE_x_MM 无关!!
+ *     (实踩: 超时设 3000ms 时 900mm 段只走 ~380mm、990mm 段只走 ~660mm,
+ *      日志全是 TO。) 先检查 CH_MOVE_TIMEOUT_MIN_MS 会不会偏小, 再调 pos_Ki。 */
+/* ⭐ 2026-09-30: 本函数是在 1ms 定时中断里被调用的(调用链:
+ *   TIM1_BRK_TIM9_IRQHandler -> HAL_TIM_PeriodElapsedCallback -> Chassis_Tick
+ *   -> Chassis_Update_Control -> move_finish_log)
+ * 而 elog 是【同步阻塞 + __disable_irq】的串口输出(USART3@115200, 一行约 10ms,
+ * 见 easylogger/elog_port.c)。在中断里打印的后果:
+ *   ① 控制周期从 20ms 被拉长到 30ms+, 而 pid 里 dt 是写死的 0.02
+ *      → 积分/微分按错误的 dt 计算;
+ *   ② 这 10ms 内所有中断被关闭(SysTick/编码器/UART 全停),
+ *      HAL_GetTick 也不涨(状态机全靠它计时)。
+ * 所以这里【只把这一行格式化进缓冲区并置标志】, 真正的打印交给主循环的
+ * Chassis_FlushPendingLog()。日志的内容与取值时刻(d/e/yaw)完全不变。 */
+static char             s_move_log_buf[160];
+static volatile uint8_t s_move_log_pending = 0;
+
 static void move_finish_log(const char *why)
 {
-    elog_i("MOVE", "%s d:FL=%ld FR=%ld BL=%ld BR=%ld e:FL=%ld FR=%ld BL=%ld BR=%ld yaw=%.2f",
-           (why != NULL) ? why : "",
-           (long)(s_pos[W_FL] - s_move_start_pos[W_FL]), (long)(s_pos[W_FR] - s_move_start_pos[W_FR]),
-           (long)(s_pos[W_BL] - s_move_start_pos[W_BL]), (long)(s_pos[W_BR] - s_move_start_pos[W_BR]),
-           (long)(eff_tgt(W_FL) - s_pos[W_FL]), (long)(eff_tgt(W_FR) - s_pos[W_FR]),
-           (long)(eff_tgt(W_BL) - s_pos[W_BL]), (long)(eff_tgt(W_BR) - s_pos[W_BR]),
-           (double)((s_yaw != NULL) ? *s_yaw : 0.0f));
+    char tag[24];
+
+    if (why != NULL && why[0] != '\0')
+    {
+        /* 带原因的行(TO/PV)附上本段【实际用时】(ms), 方便看"停多久":
+         *   TO(用时) = 超时切断(距离被切短了);
+         *   PV(用时) = 位置已到位但速度判据不满足 → 强制结束。 */
+        snprintf(tag, sizeof(tag), "%s(%ums)", why,
+                 (unsigned)s_move_cycles * CH_CTRL_PERIOD_MS);
+    }
+    else
+    {
+        tag[0] = '\0';
+    }
+
+    if (s_move_log_pending) return;   /* 上一条还没被主循环取走: 不覆盖(宁丢不叠) */
+
+    snprintf(s_move_log_buf, sizeof(s_move_log_buf),
+             "%s d:FL=%ld FR=%ld BL=%ld BR=%ld e:FL=%ld FR=%ld BL=%ld BR=%ld yaw=%.2f",
+             tag,
+             (long)(s_pos[W_FL] - s_move_start_pos[W_FL]), (long)(s_pos[W_FR] - s_move_start_pos[W_FR]),
+             (long)(s_pos[W_BL] - s_move_start_pos[W_BL]), (long)(s_pos[W_BR] - s_move_start_pos[W_BR]),
+             (long)(eff_tgt(W_FL) - s_pos[W_FL]), (long)(eff_tgt(W_FR) - s_pos[W_FR]),
+             (long)(eff_tgt(W_BL) - s_pos[W_BL]), (long)(eff_tgt(W_BR) - s_pos[W_BR]),
+             (double)((s_yaw != NULL) ? *s_yaw : 0.0f));
+    s_move_log_pending = 1;
+}
+
+/* 由【主循环】调用: 打印中断里攒下的 MOVE 行。
+ * 这里才做真正的串口输出(阻塞 ~10ms), 但此时不影响控制中断。 */
+void Chassis_FlushPendingLog(void)
+{
+    char buf[sizeof(s_move_log_buf)];
+
+    if (!s_move_log_pending) return;
+
+    /* 拷贝期间关中断, 避免 ISR 正好在覆盖缓冲区 → 打出半新半旧的行 */
+    __disable_irq();
+    memcpy(buf, s_move_log_buf, sizeof(buf));
+    s_move_log_pending = 0;
+    __enable_irq();
+
+    elog_i("MOVE", "%s", buf);
 }
 
 void Chassis_Update_Control(void)
@@ -498,6 +582,59 @@ void Chassis_Update_Control(void)
 
     float dt = CH_CTRL_PERIOD_MS / 1000.0f;
 
+    /* ⭐⭐ 2026-09-30/10-01: "卡住"检测 (位置环与航向环都用它)
+     * 判定: 连续 CH_STALL_DETECT_CYCLES 个周期都满足
+     *        "四轮速度都 < CH_STALL_SPEED_COUNT 且 位置还没到位" → stalled=true。
+     * 为什么需要:
+     *   ① 航向环: 段末车已停住(但残差 > CH_POS_THRESHOLD_COUNT 判不到位)时, 车头
+     *      即使歪着也转不动 → 航向积分只能一直涨(实测 4.5s 内 corr 3.6→22.8 限幅),
+     *      而速度偏置一涨就会: ⓐ pos_lim = max_vel-|bias| 把位置环权限掐到只剩 8;
+     *      ⓑ "偏置不许反向"把 FR/BR 直接夹成 0 → 四轮锁死、残差永远收不掉。
+     *      所以 stalled 时本轮不做纠偏(清积分 + corr=0), 把权限全还给位置环。
+     *   ② 位置环: stalled 持续到 CH_STALL_FINISH_CYCLES 就直接结束本段(日志打 "ST"),
+     *      不再干等到超时(实测每段白等 3.5~4.5s)。
+     * ⚠️ 速度阈值取 CH_STALL_SPEED_COUNT(4)而不是 CH_STOP_SPEED_THRESHOLD(2):
+     *    段末常有某一轮以 1~3 计数/周期"爬"(实测 M1 57492→57502), 用 2 判不出
+     *    "停住" → 卡住检测失效、偏置照样涨。正常行驶四轮都在 20~30 计数/周期。 */
+    bool stalled;
+    bool hdg_cut = false;   /* ⭐ 2026-10-01: 段末"停偏置"标志, 见 Chassis.h 的 CH_HDG_CUT_ERR_COUNT */
+    {
+        bool quiet = true;
+        bool not_arrived = false;
+        int32_t max_err = 0;   /* 四轮中最大的剩余残差 (计数) */
+        for (int i = 0; i < W_NUM; i++)
+        {
+            int32_t e = iabs(eff_tgt(i) - s_pos[i]);
+            if (s_speed_filt[i] >= CH_STALL_SPEED_COUNT) quiet = false;
+            if (e >= CH_POS_THRESHOLD_COUNT) not_arrived = true;
+            if (e > max_err) max_err = e;
+        }
+        if (quiet && not_arrived)
+        {
+            if (s_stall_cycles < 0xFFFFu) s_stall_cycles++;
+        }
+        else
+        {
+            s_stall_cycles = 0;
+        }
+        stalled = (s_stall_cycles >= CH_STALL_DETECT_CYCLES);
+
+        /* ⭐⭐ 2026-10-01 新增: 段末"停偏置"(主动让权给位置环), 详见 Chassis.h 同名宏。
+         * 四轮最大残差已经很小(最后十几毫米) → 本周期不做航向纠偏, corr 强制 0。
+         * 为什么: 段末 corr 常常顶在 hd_max 饱和, 而饱和的 vel_bias 会让
+         *   ⓐ pos_lim = max_vel-|bias| 白扣掉位置环权限; ⓑ "偏置不许反向"把
+         *   残差小的轮子夹成 0 → "一条对角还在推、另一条已停" = 纯转动。
+         *   日志铁证: 864mm 段末一拍 FL=-46 BR=+4(停) 而 FR=+227 BL=+110(走),
+         *   反算 wk=+42 计数 ≈ +1.6°, 与实测 yaw 1.6°→4.3° 吻合。
+         * 若 CH_HDG_CUT_ERR_COUNT 设为 0 → 恒为 false, 恢复原行为。 */
+        hdg_cut = (s_moving && max_err < (int32_t)CH_HDG_CUT_ERR_COUNT);
+    }
+    if (stalled || hdg_cut)
+    {
+        /* 车都不动 / 段末让权: 航向积分没有意义, 清掉, 免得轮子一动就"猛纠一下" */
+        s_heading_integral = 0.0f;
+    }
+
     /* ---- 0. 平移时的航向保持 (陀螺仪 PID, 输出速度环偏置) ---- */
     int16_t vel_bias[W_NUM] = { 0, 0, 0, 0 };
     if (s_moving && s_yaw != NULL)
@@ -510,7 +647,9 @@ void Chassis_Update_Control(void)
         /* 航向误差死区: 误差足够小时不再修正, 避免停车前微调甩尾 */
         const ChassisPidCfg_t *cfg = s_cfg;   /* 分段参数: 直行/平移各一套 */
         float corr = 0.0f;
-        if (fabsf(yaw_err) >= cfg->hd_dead)
+        /* ⭐ hdg_cut = 段末让权(残差已很小): 本拍 corr 强制 0、vel_bias 全 0,
+         * 把最后十几毫米完全交给位置环, 四轮才能同时减速同时停(见 Chassis.h)。 */
+        if (!stalled && !hdg_cut && fabsf(yaw_err) >= cfg->hd_dead)
         {
             /* 积分 (带抗饱和), 消除持续漂移下的稳态航向误差 */
             s_heading_integral += yaw_err * dt;
@@ -620,21 +759,29 @@ void Chassis_Update_Control(void)
     /* ---- 2. 平移到位判断 (位置 + 速度都达标, 连续多周期才算停稳) ---- */
     else if (s_moving)
     {
-        bool settled = true;
+        bool pos_ok = true;    /* 四轮位置都在容差内(真正"到位") */
+        bool vel_ok = true;    /* 四轮速度都小于"停稳"阈值(用低通速度, 滤掉静止抖动) */
         for (int i = 0; i < W_NUM; i++)
         {
-            if (iabs(eff_tgt(i) - s_pos[i]) >= CH_POS_THRESHOLD_COUNT ||
-                iabs(s_speed[i]) >= CH_STOP_SPEED_THRESHOLD)
-            {
-                settled = false;
-                break;
-            }
+            if (iabs(eff_tgt(i) - s_pos[i]) >= CH_POS_THRESHOLD_COUNT) pos_ok = false;
+            if (s_speed_filt[i] >= CH_STOP_SPEED_THRESHOLD)              vel_ok = false;
         }
-        if (settled)
+
+        if (pos_ok)
+        {
+            if (s_arrived_cycles < 0xFFFFu) s_arrived_cycles++;
+        }
+        else
+        {
+            s_arrived_cycles = 0;
+        }
+
+        if (pos_ok && vel_ok)
         {
             if (++s_move_stable >= CH_STOP_STABLE_COUNT)
             {
                 s_move_stable = 0;
+                s_arrived_cycles = 0;
                 move_finish_log("");   /* 先打日志: 要的是"到位瞬间"的 d/e */
                 s_moving = false;
                 chassis_freeze();       /* ⭐ 冻结: 目标=当前位置 + 输出 0,
@@ -645,28 +792,122 @@ void Chassis_Update_Control(void)
         else
         {
             s_move_stable = 0;
+
+            /* ⭐ 兜底(2026-09-29): 位置已经到位, 但速度/阈值判据迟迟不满足 →
+             * 最多再等 CH_STOP_HOLD_MAX_MS 就强制结束本段, 不许白等到超时。
+             * 卡过两次同类的坑: ① CH_STOP_SPEED_THRESHOLD 设 1 要求"速度恰好0";
+             * ② 低通速度的整数除法卡在 2~3 下不去 → 表现都是"车到了却停着不走/干等
+             * 3~12s, MOVE 行带 TO 而 e: 已经很小"。日志里强制结束的行打 "PV"。 */
+            if (pos_ok && s_arrived_cycles >= (uint16_t)(CH_STOP_HOLD_MAX_MS / CH_CTRL_PERIOD_MS))
+            {
+                s_arrived_cycles = 0;
+                move_finish_log("PV");
+                s_moving = false;
+                chassis_freeze();
+            }
+            /* ⭐ 2026-10-01 兑底: "卡住"太久(车确实不动了, 但位置始终判不到位)
+             * → 直接结束本段(日志打 "ST"), 不再干等到超时(实测每段白等 3.5~4.5s)。
+             * 典型场景: 横移段末某一轮(实测 FR)落后 ~180 计数, 其余三轮都已到位
+             *   停住, 它单独推不动整车 → 四轮都不动 → 判卡住。 */
+            else if (s_stall_cycles >= CH_STALL_FINISH_CYCLES)
+            {
+                s_stall_cycles = 0;
+                move_finish_log("ST");
+                s_moving = false;
+                chassis_freeze();
+            }
         }
 
         /* ⭐ 安全兜底: 单段平移超时就强制结束并打 MOVE 行(带 TO)。
-         * 阈值收紧后万一某轮被卡住, 状态机不会永远停在原地。 */
-        if (s_moving && ++s_move_cycles >= (uint16_t)(CH_MOVE_TIMEOUT_MS / CH_CTRL_PERIOD_MS))
+         * 超时周期数是 add_move 里按本段距离算出来的(见 Chassis.h), 不能用固定值:
+         * 固定值一旦比"本段应耗时"短, 本段就会被切断 → 车走的距离变成
+         * "速度×超时", 与 ROUTE_x_MM 无关(踩过)。 */
+        if (s_moving && ++s_move_cycles >= s_move_timeout_cycles)
         {
             move_finish_log("TO");
             s_moving = false;
             s_move_stable = 0;
+            s_arrived_cycles = 0;
             chassis_freeze();       /* 超时兜底也要冻结: 残留可能很大(e: 几十~上百),
                                      * 不冻结车会自己猛地拱一下 */
         }
     }
 
-    /* ---- 3. 串级 PID 输出 (注入航向保持速度偏置) ---- */
+    /* ---- 3. 串级 PID 输出 (注入航向保持速度偏置) ----
+     * ⭐⭐ 2026-09-30 关键修复: 【只在"正在平移或正在转向"时才驱动电机】。
+     * 原来这一段是无条件执行的: 一段走完(s_moving=0)后, 第 2 段刚把电机置 0,
+     * 这里立刻又按"冻结的位置目标"算了一遍 PWM 输出 → 停止后底盘一直挂着一个
+     * 很硬的四轮独立位置伺服, 20ms 一次不停地顶残差。
+     * 为什么这会造成"停下时抖动 + 斜着漂移":
+     *   ① 只要有一点点残差, pid.c 的死区前馈会直接给出 ±vel_ff_dead(12~14)PWM;
+     *      而 PWM 只有 0~99 级(1% 一级), 十几个 PWM 足够"顶开"静摩擦 →
+     *      轮子一冲就过头 → 反向再顶 → 极限环(肉眼=抖);
+     *   ② 四轮静摩擦/PWM 补偿/悬挂载荷都不同 → 不会同时被顶动, 先动的那两个
+     *      轮子合成一个固定方向的蠕动(实测现象: M1(BL) 与 M4(FR) 同向前进
+     *      = 麦轮的纯 45° 平移, 车头不转);
+     *   ③ 机械臂一摆, 反作用力推车 → 位置环立刻"顶回去" → 停机等待期间自己挪。
+     * 别人的车停下就是断输出(滑行/短刹车), 所以不会这样。
+     * ⚠️ read_encoders() 必须在上面照常每周期调用(否则增量累积, 下次起步猛冲),
+     *    这里只是不【驱动电机】。
+     * 代价: 停机期间不再"保持位置"(被外力推了不会自己顶回来)。若某段对准
+     *      确实需要顶住, 把 CH_IDLE_HOLD_ENABLE 置 1 可恢复原行为对比。 */
+#if !CH_IDLE_HOLD_ENABLE
+    if (!s_moving && !s_turn_open)
+    {
+        stop_motors();   /* 也同步软启动斜坡基准(s_last_pwm=0) */
+        return;
+    }
+#endif
+
     int16_t pwm[W_NUM];
+
+    /* ⭐⭐ 2026-10-01 (C): 四轮"同步降速"。先算四轮剩余距离的平均值, 供下面
+     * 对"领先轮"追加反向偏置用。详见 Chassis.h 的 CH_SYNC_GAIN / CH_SYNC_MAX。
+     * 只在 CH_SYNC_GAIN > 0 (功能开启) 且正在平移时才算, 免得白花时间。 */
+    int32_t err_avg = 0;
+    if (CH_SYNC_GAIN > 0.0f && s_moving)
+    {
+        for (int i = 0; i < W_NUM; i++)
+        {
+            err_avg += iabs(eff_tgt(i) - s_pos[i]);
+        }
+        err_avg /= W_NUM;
+    }
+
     for (int i = 0; i < W_NUM; i++)
     {
+        /* ⭐ 冻结/结束后不再注入航向速度偏置: vel_bias 是第 0 段(s_moving 还是 1 时)
+         * 算出来的, 若原样用到这里, 会在"刚停稳"这一拍再给一次偏航踢(FL/BL +, FR/BR -)。 */
+        float bias = s_moving ? (float)vel_bias[i] : 0.0f;
+
+        /* ⭐⭐ C: 同步降速 —— 领先轮(r_i < 平均值)追加一个【反向】偏置, 让它慢
+         * 下来等落后的轮子。为什么用偏置而不是改位置目标:
+         *   ① 偏置经 pid.c 的 pos_lim = max_vel-|bias| 会把该轮速度压到约
+         *      max_vel-2×C, 是"减速", 不会让它反向;
+         *   ② 位置目标不动 → 最终每轮仍走到自己的计数目标 → 距离精度不受影响。
+         * 典型场景(实测): 右移段 BR 比 FR 快 15~20%, BR 先到位停住, 只剩
+         * FR/BL 推车 → 绕车心转动 → 段末甩 3° 且车身斜飘 30mm。
+         * 关掉本功能: 把 Chassis.h 的 CH_SYNC_GAIN 置 0。 */
+        if (s_moving && CH_SYNC_GAIN > 0.0f)
+        {
+            int32_t e    = eff_tgt(i) - s_pos[i];
+            int32_t lead = err_avg - iabs(e);   /* >0 = 本轮的剩余比平均小 = 领先 */
+            if (lead > 0)
+            {
+                int32_t c = (int32_t)((float)lead * CH_SYNC_GAIN);
+                if (c > (int32_t)CH_SYNC_MAX) c = (int32_t)CH_SYNC_MAX;
+                if (c > 0)
+                {
+                    if (e >= 0) bias -= (float)c;   /* 正向运动 → 给反向(减速)偏置 */
+                    else        bias += (float)c;   /* 反向运动同理 */
+                }
+            }
+        }
+
         pwm[i] = (int16_t)DualPID_Update(&s_pid[i],
                                          (float)eff_tgt(i), (float)s_pos[i],
                                          (float)s_speed[i], dt,
-                                         (float)vel_bias[i]);
+                                         bias);
     }
     //s_target是由转向环PID作用得到的，vel_bias是由航向保持PID作用得到的，
     //s_pos和s_speed是由编码器得到的，dt是控制周期时间，DualPID_Update()函数会根据这些参数计算出每个轮子的PWM输出值
@@ -700,11 +941,26 @@ static void add_move(int32_t fwd_mm, int32_t strafe_mm)
     }
 
     /* 按每轮 counts/mm 标定系数缩放目标, 补偿左右轮轮径/编码器差异 */
+    int32_t max_cnt = 0;   /* 本段四轮目标增量的最大绝对值(算超时用) */
     for (int i = 0; i < W_NUM; i++)
     {
         float delta = (float)(s_fwd_sign[i] * fwd_cnt + s_strafe_sign[i] * strafe_cnt) * s_wheel_scale[i];
-        s_target[i] += (int32_t)(delta >= 0.0f ? delta + 0.5f : delta - 0.5f);
+        int32_t dc = (int32_t)(delta >= 0.0f ? delta + 0.5f : delta - 0.5f);
+        s_target[i] += dc;
         s_move_start_pos[i] = s_pos[i];   /* 记本段起点, 结束时算"实走多少"(见 MOVE 日志) */
+        if (iabs(dc) > max_cnt) max_cnt = iabs(dc);
+    }
+
+    /* ⭐ 超时按本段距离自适应 (见 Chassis.h 的 CH_MOVE_MIN_SPEED_MMPS 说明)。
+     * 固定超时一旦小于"本段应耗时"就会把本段切断 → 车走的距离变成"速度×超时",
+     * 用户会看到"不管距离宏改多少, 车都走同一个值"。 */
+    {
+        uint32_t ms = 2000u + (uint32_t)((float)max_cnt / CH_COUNTS_PER_MM
+                                        / CH_MOVE_MIN_SPEED_MMPS * 1000.0f);
+        if (ms < CH_MOVE_TIMEOUT_MIN_MS) ms = CH_MOVE_TIMEOUT_MIN_MS;
+        if (ms > CH_MOVE_TIMEOUT_MAX_MS) ms = CH_MOVE_TIMEOUT_MAX_MS;
+        s_move_timeout_cycles = (uint16_t)(ms / CH_CTRL_PERIOD_MS);
+        if (s_move_timeout_cycles == 0) s_move_timeout_cycles = 1;
     }
 
     /* ⚠️ 2026-09-27: 这里【不再】重设航向基准 s_heading_target(原来 = *s_yaw)。
@@ -719,7 +975,9 @@ static void add_move(int32_t fwd_mm, int32_t strafe_mm)
     s_heading_integral = 0.0f;
     s_turn_open = false;
     s_move_stable = 0;
+    s_arrived_cycles = 0;
     s_move_cycles = 0;
+    s_stall_cycles = 0;      /* 新一段开始: 清"卡住"计数(起步瞬间车还没动, 免得误判) */
     s_moving = true;
 }
 
@@ -810,6 +1068,7 @@ void Chassis_SyncTarget(void)
     }
     s_heading_trim = 0;      /* 航向微调也清零(否则生效目标 = 目标+微调 会与当前位置差一截) */
     s_move_stable = 0;
+    s_arrived_cycles = 0;
     s_move_cycles = 0;
 }
 

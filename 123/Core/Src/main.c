@@ -192,6 +192,23 @@ static void __attribute__((unused)) JY61P_ReadYaw(void)
   }
 }
 
+#if !ARM_UART_TEST_MODE
+/**
+ * @brief  机械臂动作阻塞等待期间的回调: 刷新陀螺仪 yaw
+ * @note   由 Mission_SetYawPollHook() 注入, 供 MissionControl.c 的
+ *         Mission_Coop_Wait() 在摆臂的几秒里周期性调用。
+ *         不刷的话: TIM9 里的航向/转向闭环一直读到冻结的角度 →
+ *         原地转向的 s_turn_remaining 永远减不下去 → 车会一直自转。
+ */
+static void ArmWait_PollYaw(void)
+{
+  if (HAL_GetTick() >= JY_WARMUP_MS)
+  {
+    JY61P_ReadYaw();
+  }
+}
+#endif /* !ARM_UART_TEST_MODE */
+
 /* USER CODE END 0 */
 
 /**
@@ -299,6 +316,12 @@ int main(void)
    * Chassis_Move_* 前的 Chassis_SetMaxSpeed 单独提速即可。 */
   Chassis_SetMaxSpeed(200);
 
+  /* ---- ⭐ 注入“摆臂阻塞期间刷新陀螺仪 yaw”的回调 ----
+   * Arm_GotoPose() 摆一次臂要阻塞好几秒; 期间底盘闭环跑在 TIM9 中断里,
+   * 如果不继续刷 yaw, 航向/转向闭环会读到冻结角度(原地转向会转不完 → 车自转)。
+   * 详见 MissionControl.c 的 Mission_Coop_Wait()。 */
+  Mission_SetYawPollHook(ArmWait_PollYaw);
+
   elog_i("MAIN", "KEY1=Start  KEY2=YawZero  KEY2_LONG=ArmTeach");
 #endif /* !ARM_UART_TEST_MODE */
   /* USER CODE END 2 */
@@ -386,12 +409,24 @@ int main(void)
 #endif /* !MISSION_TEST_NO_ARM */
     {
 #if MISSION_DEBUG_ARM_SEQ
-      /* ---- 机械臂动作单独调试: KEY1 跑一遍该序列(底盘完全不动) ---- */
+      /* ---- 机械臂动作单独调试: 底盘完全不动 ----
+       * KEY1 第一次按 = 启动调试序列(step0), 之后每按一次 = 切到下一个动作。
+       * ⚠️ 以前这里把 Mission_DebugArmStart() 整段注释掉了, 而
+       *    Mission_DebugArmUpdate() 开头就是 if(s_armdbg_idle) return;
+       *    → 序列永远处于“空闲”, 按 KEY1 不会执行任何动作。 */
       if (Key_Check(KEY_1, KEY_DOWN))
       {
-        Mission_DebugArmStart();
+        // if (Mission_DebugArmIsIdle())
+        // {
+        //   // Mission_DebugArmStart();   /* 尚未开始: 进入序列 */
+        // }
+        // else
+        // {
+          Mission_ChangeStep();      /* 已在序列中: 切到下一个动作 */
+        // }
       }
       Mission_DebugArmUpdate();
+
 #elif MISSION_DEBUG_VISION_TASK
 #if MISSION_DEBUG_VISION_TASK == 5
       /* ---- 视觉串口链路监控: KEY1长按=scan_qr, KEY1=run_task:1, KEY2=reset:0 ---- */

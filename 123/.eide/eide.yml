@@ -161,7 +161,7 @@ targets:
           linker:
             $outputTaskExcludes:
               - .bin
-            LD_FLAGS: ""
+            LD_FLAGS: "-u _printf_float"
             LIB_FLAGS: -lm
             output-format: elf
             remove-unused-input-sections: true
@@ -250,6 +250,11 @@ targets:
         otherCmds: ""
         proType: 1
         speed: 8000
+      OpenOCD:
+        baseAddr: "0x08000000"
+        bin: ""
+        interface: cmsis-dap
+        target: stm32f4x
       STLink:
         address: "0x8000000"
         bin: ""
@@ -260,4 +265,4 @@ targets:
         resetMode: HWrst
         runAfterProgram: true
         speed: 1800
-    uploader: STLink
+    uploader: OpenOCD
