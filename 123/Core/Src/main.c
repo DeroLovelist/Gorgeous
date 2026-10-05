@@ -429,7 +429,7 @@ int main(void)
 
 #elif MISSION_DEBUG_VISION_TASK
 #if MISSION_DEBUG_VISION_TASK == 5
-      /* ---- 视觉串口链路监控: KEY1长按=scan_qr, KEY1=run_task:1, KEY2=reset:0 ---- */
+      /* ---- 视觉串口链路监控: KEY1长按=run_task:2(靶), KEY1=run_task:1(球), KEY2=reset:0 ---- */
       if (Key_Check(KEY_1, KEY_LONG))
       {
         Mission_DebugVisionLinkSend(1);

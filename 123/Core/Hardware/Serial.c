@@ -170,7 +170,9 @@ void K230_SendLine(const char *line)
 }
 
 /**
-  * 函    数：回传二维码数据给 K230(让其“学习”任务内容)
+  * 函    数：回传二维码数据给 K230
+  * 备    注：新 K230 的 handle_command 对 "qr_code:" 只做 print, 不再用它
+  *           (目标号存在 K230 本地 /sdcard/target.txt), 保留仅为兼容旧版。
   */
 void K230_Send_QRCode_Data(const char *qr_data_string)
 {
@@ -191,6 +193,10 @@ void K230_Run_Specific_Task(uint8_t task_number)
 
 /**
   * 函    数：请求 K230 进行一次二维码扫描
+  * 备    注：⚠️ 新 K230(main.py)在自己的扫码阶段【不读串口】, 它扫到码后
+  *           会主动回一行 "SCAN_OK" 并重启进入 yolo_main。所以这个请求
+  *           现在已无效(保留仅为兼容旧版 K230)。STM32 侧改为在 STATE_2 里
+  *           等 SCAN_OK, 见 MissionControl.c。
   */
 void K230_Request_QRScan(void)
 {

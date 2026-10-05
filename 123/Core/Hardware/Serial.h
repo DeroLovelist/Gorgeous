@@ -32,9 +32,12 @@ void Serial_FlushRx(void);
 
 /* ---- 与 K230 的通信指令(发送) ---- */
 void K230_SendLine(const char *line);
-void K230_Send_QRCode_Data(const char *qr_data_string); /* 回传二维码数据 */
-void K230_Run_Specific_Task(uint8_t task_number);       /* 让 K230 执行指定任务 */
-void K230_Request_QRScan(void);                          /* 请求 K230 扫码 */
+void K230_Send_QRCode_Data(const char *qr_data_string); /* 回传二维码数据(旧 K230 用, 新 K230 仅打印) */
+void K230_Run_Specific_Task(uint8_t task_number);       /* 让 K230 执行指定任务(1=球 2=靶 3=桶 4=形状) */
+/* ⚠️ 新 K230(main.py)在自己的扫码阶段【不读串口】, 所以这个请求已无效;
+ *   扫码改为“STM32 摆好 SCAN 姿态后在 STATE_2 等 K230 回 SCAN_OK”。
+ *   保留此接口仅为兼容旧版 K230。 */
+void K230_Request_QRScan(void);                          /* 请求 K230 扫码(旧版, 已废弃) */
 void K230_Start_Align(void);                             /* 请求进入精对准 */
 void K230_Reset(void);                                   /* 复位 K230 */
 

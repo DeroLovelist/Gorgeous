@@ -35,11 +35,22 @@
 
 /* ⭐ 视觉单独调试开关: 0=正常整场任务(联合调试);
  *   1=球(抓取前对准) 2=靶(打靶) 3=桶(放置前对准) 4=形状(救援)。
- *   非 0 时: 上电按 KEY1 直接进入对应视觉目标对准(不跑路线、不动机械臂),
+ *   非 0 时: 上电按一下 KEY1 直接进入对应视觉目标对准(不跑路线、不动机械臂),
  *   对准完成后停车并打印结果。改完记得重载+构建。
+ *   ⚠️ 1~4 都是“底盘横移式对准”(收到 L/R 会横移 50~60mm), 收到 D:x,y 后
+ *      用 K_GAIN 算横移量 —— 所以【它们标不了打靶的 ID1/ID4 舵机】。
+ *   6 = ⭐ 打靶两轴标定模式【底盘一步不动】:
+ *     上电按一下 KEY1 → 机械臂自动摆 TARGET_LOOK → 发 run_task:2 →
+ *     收到 C/L/R 后发 start_align → 之后每来一帧 D:x,y 就:
+ *       先修横向(ID1) / 后修竖直(ID4), 一次只转一个舵机。
+ *     用途: 标定 TARGET_ID1_LR_SIGN / TARGET_ID1_STEP /
+ *           TARGET_ID4_DY_SIGN / TARGET_ID4_STEP。
+ *     日志前缀是 [TCAL], 详细判定方法见 MissionControl.c 里 mode 6 的注释块。
+ *     用法: 把靶子【故意放偏】(放正中间 K230 直接回 OK, 没东西可标)。
  *   5 = 视觉串口链路监控(纯收发打印, 车/臂完全不动):
- *     上电后 KEY1=发 scan_qr, KEY1 长按=发 run_task:1, KEY2=发 reset:0,
- *     收到 K230 任何一行打印 "RX: ..." */
+ *     上电后 KEY1=发 run_task:1(球), KEY1 长按=发 run_task:2(靶), KEY2=发 reset:0,
+ *     收到 K230 任何一行打印 "RX: ..."
+ *     ⚠️ 新 K230(main.py + yolo_main.py)不支持 "scan_qr", 所以链路监控不再发它 */
 #define MISSION_DEBUG_VISION_TASK  0
 
 /* ⭐ 机械臂动作单独调试开关(底盘完全不动, 不跑视觉也不跑路线):
@@ -226,7 +237,7 @@ void Mission_SetYawPollHook(void (*fn)(void));
 /* ---- 视觉单独调试接口(仅 MISSION_DEBUG_VISION_TASK != 0 时使用) ---- */
 void Mission_DebugVisionStart(void);
 void Mission_DebugVisionUpdate(void);
-/* 链路监控(值 5)发送: which 0=reset:0, 1=scan_qr, 2=run_task:1 */
+/* 链路监控(值 5)发送: which 0=reset:0, 1=run_task:1(球), 2=run_task:2(靶) */
 void Mission_DebugVisionLinkSend(uint8_t which);
 
 /* ---- 机械臂单独调试接口(仅 MISSION_DEBUG_ARM_SEQ != 0 时使用) ---- */
