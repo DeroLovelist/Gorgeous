@@ -123,15 +123,17 @@ extern "C" {
  * 参考测量(静止单轮, 注意带载会变): 正转 BL=1518 BR=1858 FL=1358 FR=1336;
  * 反转 BL=1761 BR=1359 FL=1392 FR=1408。补偿系数 = 该方向四轮平均增益 ÷ 该轮增益。
  * --------------------------------------------------------------------- */
+// 前进
 #define CH_PWM_SCALE_FWD_FL          (1.00f)//(1.061f)
 #define CH_PWM_SCALE_FWD_FR          (1.10f)//(1.061f)
 #define CH_PWM_SCALE_FWD_BL          (1.00f)//(0.83f)
 #define CH_PWM_SCALE_FWD_BR          (1.00f)//(1.12f)
-
+// 后退 
 #define CH_PWM_SCALE_REV_FL          (1.10f)//(1.12f)
-#define CH_PWM_SCALE_REV_FR          (1.00f)
+#define CH_PWM_SCALE_REV_FR          (1.00f)//(1.00f)
 #define CH_PWM_SCALE_REV_BL          (1.00f)//(0.98f)
 #define CH_PWM_SCALE_REV_BR          (1.08f)//(0.90f)
+
 /* ⚠️ 2026-10-01: REV_FR / REV_BL 试过 1.06 (想给右移时落后的 FR/BL 补 PWM),
  * 实测【无效】且略差: 右移段四轮离散度 0.29% → 2.1%, 段末同样 {FL,BR} 停 /
  * {FR,BL} 走、同样甩 3°, 前向"斜飘" +34mm/−36mm 一点没变。
@@ -171,8 +173,7 @@ extern "C" {
                                                       * ⚠️ 不要设成 1: 轮子静止时编码器仍有 ±1~2 计数的
                                                       * 抖动(日志里 M1=61557→61558→61558, M2=3986→3987),
                                                       * 阈值 1 = 要求"速度恰好为 0"连 4 个周期, 实测永远
-                                     Set-ExecutionPolicy -Scope Process Bypass -Force
-& .\tools\eide-mcp.ps1 -Action all                 * 满足不了 → 每段都判不到位、等到超时(日志里 MOVE 行
+                                                    * 满足不了 → 每段都判不到位、等到超时(日志里 MOVE 行
                                                       * 带 TO)→ 走过多少完全由"超时×速度"决定!!!
                                                       * 已配套: 判据改用 Chassis.c 里低通后的速度 s_speed_filt
                                                       * (时问常数 4 个周期) 滤掉抖动, 所以 2 是安全的。

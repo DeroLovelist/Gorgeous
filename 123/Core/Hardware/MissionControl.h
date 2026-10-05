@@ -103,12 +103,16 @@ typedef enum {
     STATE_10_APPROACH_BOMB,                 // 接近炸弹
     STATE_11_PERFORMING_BOMB_DISPOSAL,      // 视觉对准并抓取/放置炸弹
 
-    /* 阶段三: 打靶 (2026-10-04 改版: 底盘只走“右移1510 → 停 → 航向校正”,
-     *        之后由任务2 视觉子状态机【原地小步转底座 ID1】对准靶子;
-     *        收到 C 后依次摆 FIRE → LIFT → SCAN_RESET, 再“右移400 → 航向校正”
-     *        直接进入 STATE_14 救援。
-     * ⚠️ PART1_MOVE_B/CORRECT_B/MOVE_C 和 TURN_A/TURN_B 现已废弃不再经过;
-     *    PART2_MOVE_A(右移400) 与 PART2_CORRECT_A(航向校正) 仍在用。 */
+    /* 阶段三: 打靶 (2026-10-05 定稿)
+     *   走位链: MOVE_A(右移850) → CORRECT_A(航向校正) → MOVE_B(右移850)
+     *           → CORRECT_B(停稳 TARGET_STOP_SETTLE_MS) → MOVE_C(摆 TARGET_LOOK)
+     *           → STATE_13 视觉
+     *   视觉对准(任务2): 底盘完全不动, 根据 K230 回的 C/L/R 原地小步转底座 ID1;
+     *           收到 C 后依次摆 FIRE → LIFT → SCAN_RESET。
+     *   收尾: 出了 STATE_13 后走 PART2_MOVE_A(右移) → PART2_CORRECT_A(航向校正)
+     *         → 直接进入 STATE_14 救援。
+     * ⚠️ TURN_A/TURN_B 与 PART2_MOVE_B/CORRECT_B/MOVE_C 不在流程里(不可达),
+     *    PART1_MOVE_B/CORRECT_B/MOVE_C 是【在用】的, 别当废弃删掉。 */
     STATE_12_PART1_MOVE_A,
     STATE_12_PART1_CORRECT_A,
     STATE_12_PART1_MOVE_B,
@@ -121,25 +125,27 @@ typedef enum {
     STATE_12_PART2_MOVE_B,
     STATE_12_PART2_CORRECT_B,
     STATE_12_PART2_MOVE_C,
-    STATE_13_PERFORMING_TARGETING,          // 视觉原地转底座 ID1 对准靶子, 然后摆 FIRE/LIFT/SCAN_RESET
+    STATE_13_PERFORMING_TARGETING,          // 视觉: 原地转底座 ID1 对准靶子, 然后摆 FIRE/LIFT/SCAN_RESET
 
-    /* 阶段四: 救援 */
-    STATE_14_MOVE_FORWARD_B,                 // (原有) 救援前前进(掉头准备)
-    STATE_15_TURN_FOR_HOSTAGE,               // (原有) 掉头朝救援方向
-
-    /* 阶段四后半(新增): 营救接近走位: 右移+航向校正 x4 -> 视觉营救 -> 右移收尾 */
-    STATE_16_RESCUE_RIGHT_A,                 // 右移 A
-    STATE_16A_RESCUE_HEADING_CORRECT,        // 航向校正
-    STATE_17_RESCUE_RIGHT_B,                 // 右移 B
-    STATE_17A_RESCUE_HEADING_CORRECT,        // 航向校正
-    STATE_18_RESCUE_RIGHT_C,                 // 右移 C
-    STATE_18A_RESCUE_HEADING_CORRECT,        // 航向校正
-    STATE_19_RESCUE_RIGHT_D,                 // 右移 D
-    STATE_19A_RESCUE_HEADING_CORRECT,        // 航向校正
-    STATE_20_PERFORMING_HOSTAGE_RESCUE,      // 停下, 交给视觉子状态(任务 3=救援)
-    STATE_21_RESCUE_RIGHT_E,                 // 右移 E(营救完成后)
-    STATE_21A_RESCUE_HEADING_CORRECT,        // 航向校正
-    STATE_22_RESCUE_RIGHT_F,                 // 右移 F(收尾, 结束后任务完成)
+    /* 阶段四: 救援 (2026-10-05 重新定义)
+     * 流程: ①后退 → ②航向校准 → ③停下等 3s → ④摆 HOSTAGE_LOOK
+     *      → ⑤视觉对准 + 抓取 → ⑥后退 600 → ⑦航向校准
+     *      → ⑧后退 600 → ⑨航向校准 → ⑩停下(任务完成) */
+    STATE_14_MOVE_FORWARD_B,                 // ① 后退 ROUTE_14_TO_HOSTAGE_MM
+    STATE_15_TURN_FOR_HOSTAGE,               // ② 航向校准
+    STATE_15A_RESCUE_STOP_WAIT,              // ③ 原地停等 RESCUE_STOP_WAIT_MS(3000ms)
+    STATE_16_RESCUE_RIGHT_A,                 // ④ 摆 ARM_POSE_HOSTAGE_LOOK(看人质)
+    STATE_16A_RESCUE_HEADING_CORRECT,        // (未使用) 备用航向校正
+    STATE_17_RESCUE_RIGHT_B,                 // ⑥ 抓完后第 1 段后退 ROUTE_17_RIGHT_B_MM
+    STATE_17A_RESCUE_HEADING_CORRECT,        // ⑦ 航向校准
+    STATE_18_RESCUE_RIGHT_C,                 // ⑧ 抓完后第 2 段后退 ROUTE_18_RIGHT_C_MM
+    STATE_18A_RESCUE_HEADING_CORRECT,        // ⑨ 航向校正
+    STATE_19_RESCUE_RIGHT_D,                 // ⑩ 停下 → MISSION_STATE_COMPLETE
+    STATE_19A_RESCUE_HEADING_CORRECT,        // (未使用)
+    STATE_20_PERFORMING_HOSTAGE_RESCUE,      // ⑤ 底盘不动, 交给视觉子状态(任务 3=救援)
+    STATE_21_RESCUE_RIGHT_E,                 // (未使用)
+    STATE_21A_RESCUE_HEADING_CORRECT,        // (未使用)
+    STATE_22_RESCUE_RIGHT_F,                 // (未使用)
 
     /* 注: 原占位 STATE_16_APPROACH_HOSTAGE / STATE_17_ / STATE_18_RETURNING 未使用,
      *     已并入上方序列; 后续如要“返回起点”阶段再追加即可。 */

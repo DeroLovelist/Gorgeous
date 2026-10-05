@@ -129,7 +129,7 @@ static const ChassisPidCfg_t s_cfg_strafe = {
     .pos_Kp = 0.6f,  .pos_Ki = 0.25f,  .pos_Kd = 0.0f,
     .vel_Kp = 0.4f,  .vel_Ki = 0.05f,  .vel_Kd = 0.0f,//0.4
     .vel_ff = 0.3f,  .vel_ff_dead = 12.0f,
-    .hd_Kp = 1.6f,   .hd_Ki = 1.0f,    .hd_Kd = 1.5f,//1.4，0.0f，1.0
+    .hd_Kp = 1.60f,   .hd_Ki = 1.0f,    .hd_Kd = 1.5f,//1.4，0.0f，1.0
     .hd_max = 16.0f, .hd_imax = 50.0f, .hd_dead = 0.3f,//16，10,40
     .hd_trim = 0.0f//1.0f
 };

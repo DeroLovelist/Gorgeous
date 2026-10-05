@@ -202,11 +202,43 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 #define BUCKET_L_ADJUST_MM          20//60    /* 画面报 L: 小车右移这个距离 */
 #define BUCKET_R_ADJUST_MM          20//60    /* 画面报 R: 小车左移这个距离 */
 
-/* ---- 救援: 接近补偿距离(mm) ----
- * 机械臂在 HOSTAGE_LOOK(底座≈1190, 比球姿态多转≈90°)
- * → 画面的“左/右”对应车体的【前/后】:
- *      L(画面左) → 小车前进;  R(画面右) → 小车后退;  C → 不动 */
-#define RESCUE_ADJUST_MM            15      /* 建议 20~80 */
+/* ================= 救援任务参数 (2026-10-05 重新定义) ================= */
+/* ⭐ 救援“对准”方案开关(两套代码都保留, 改一个数就切):
+ *   1 = 方案二【当前使用】: 【小车底盘完全不动】, 按 K230 回的 L/R 小步转
+ *       机械臂底座 ID1; 收到 C 就认为对准 → 直接抓取。
+ *       (适合“摄像头和夹爪装在同一个可转底座上, 转底座就能同时把镜头
+ *        和夹爪对准人质”的机械结构)
+ *   0 = 方案一: 与排爆球/桶一样 —— L/R 让【小车前进/后退】一小段
+ *       (RESCUE_ADJUST_MM), 再发 start_align 用 D:x,y 精对准
+ *       (只修前后, 见 s_align_rescue)。
+ * ⚠️ 实测哪种都不对就换另一个值重新编译, 不用改其它代码。
+ * ⚠️ 方向约定(见文件头“视觉方向映射”): 臂在 HOSTAGE_LOOK(底座≈1190,
+ *    比球姿态多转≈90°) → 画面的“左/右”对应车体的【前/后】。
+ *      方案一: L → 小车前进;  R → 小车后退;  C → 不动
+ *      方案二: L → ID1 朝一个方向转一步; R → 反向; C → 对准 */
+#define RESCUE_SCHEME_ID1       1
+
+/* ---- ③ 停下等待时间(ms): 后退 + 航向校正好之后先停一会儿,
+ *      等车体晃动停下来再让机械臂摆出去, 免得抓的时候还在晃 ---- */
+#define RESCUE_STOP_WAIT_MS     3000
+
+/* ---- 【方案二】转 ID1 专用参数(和打靶那套完全同构) ---- */
+#define RESCUE_ID1_STEP         60      /* 每收到一次 L/R, 底座 ID1 转多少角度码
+                                         * (4096 码 = 360°, 60 码 ≈ 5.3°)。
+                                         * 建议 30~120 */
+#define RESCUE_ID1_LR_SIGN    (-1)      /* “收到 L”时 ID1 的增量符号:
+                                         *  -1 = 数值减小; +1 = 数值增大。
+                                         * ⚠️ 和打靶一样, 实测转反了只改这个 */
+#define RESCUE_ID1_MOVE_MS      300     /* ID1 每步转动时间(ms);
+                                         * 这期间把 K230 旧帧全丢掉 */
+#define RESCUE_ID1_POS_MIN      0       /* ID1 行程限幅(角度码), 防越界堵转 */
+#define RESCUE_ID1_POS_MAX      4095
+#define RESCUE_ID1_STEP_MAX     20      /* 🛡防卡死①: 最多转这么多步就强制认为对准 */
+#define RESCUE_ID1_TIMEOUT_MS   20000   /* 🛡防卡死②: 整个 L/R 环节最长等这么久(ms),
+                                         * 超时强制去抓取(含 K230 完全不回应) */
+
+/* ---- 【方案一】动底盘专用: L/R 时车前进/后退的距离(mm) ---- */
+#define RESCUE_ADJUST_MM        15      /* 建议 20~80 */
 
 /* ---- K230 run_task 编号(与 yolo_main3.py handle_command 对齐) ---- */
 #define K230_TASK_BALL      1   /* 球: 抓取小球(排爆第一步) */
@@ -259,9 +291,9 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 
 /* ---------- 阶段一: 扫码区走位 ---------- */
 #define ROUTE_1_TO_QR_MM            625//622    /* 起点 → 二维码扫描点(直行) */
-#define ROUTE_3_LEFT_A_MM           563    /* 扫码后左移 A 段 */
-#define ROUTE_4_DIAG_FWD_MM         111//97     /* 左上斜跑: 前进分量(≈45°斜走) */
-#define ROUTE_4_DIAG_LEFT_MM        111//97     /* 左上斜跑: 左移分量(≈45°斜走) */
+#define ROUTE_3_LEFT_A_MM           557//563    /* 扫码后左移 A 段 */
+#define ROUTE_4_DIAG_FWD_MM         110//111 97     /* 左上斜跑: 前进分量(≈45°斜走) */
+#define ROUTE_4_DIAG_LEFT_MM        110//111 97     /* 左上斜跑: 左移分量(≈45°斜走) */
 
 /* ---------- 过斜坡段 ---------- */
 #define ROUTE_5_TO_RAMP_MM          892    /* 斜坡前直行距离 */
@@ -269,35 +301,49 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 #define ROUTE_7_LEFT_C_MM           403    /* 左移 C 段 */
 
 /* ---------- 排爆区走位 ---------- */
-#define ROUTE_8_TO_BOMB_AREA_MM     988//940    /* 直行进入排爆区 */
+#define ROUTE_8_TO_BOMB_AREA_MM     995//988//940    /* 直行进入排爆区 */
 #define ROUTE_8B_RIGHT_MM           660//620    /* 右移微调 */
 #define ROUTE_9_TURN_DEG            (0.1)  /* 转向排爆点(相对角度, 负=右转) */
 #define ROUTE_9A_LEFT_MM            0      /* 转向后左移微调 */
 #define ROUTE_10_APPROACH_MM        0     /* 接近炸弹最后一段直行 */
 
 /* ---------- 打靶路线 (2026-10-04 改版后只剩两段真正在用) ---------- */
-#define ROUTE_12_P1_A_MM            1650   /* ⭐ 排爆结束后右移进入打靶位的距离(mm) */
-#define ROUTE_12_P1_B_MM            400    /* (已废弃) */
-#define ROUTE_12_P1_C_MM            400    /* (已废弃) */
-#define ROUTE_12_TURN_A_DEG         400    /* (已废弃) */
-#define ROUTE_12_P2_A_MM            700    /* ⭐ 打靶结束后的收尾右移距离(mm):
+#define ROUTE_12_P1_A_MM            850    /* ⭐ 打靶第 1 段右移(mm): 排爆结束后从桶边右移这么多,
+                                            * 然后做一个航向校正 */
+#define ROUTE_12_P1_B_MM            850    /* ⭐ 打靶第 2 段右移(mm): 航向校正完再右移这么多 */
+#define ROUTE_12_P1_C_MM            400    /* (未使用: MOVE_C 改成只摆 TARGET_LOOK, 不再走位) */
+#define ROUTE_12_TURN_A_DEG         400    /* (未使用: TURN_A/TURN_B 已不在流程里) */
+#define ROUTE_12_P2_A_MM            660/*700*/    /* ⭐ 打靶结束后的收尾右移距离(mm):
                                             * 打完靶、手臂收回 SCAN_RESET 之后右移这么多,
                                             * 再航向校正一次就进入救援阶段 */
 #define ROUTE_12_P2_B_MM            200    /* (已废弃) */
 #define ROUTE_12_P2_C_MM            200    /* (已废弃) */
 
+/* ⭐ 打靶走位: 第 2 段右移结束后的“停车停稳延时”(ms)
+ * 作用状态 = STATE_12_PART1_CORRECT_B。
+ * 为什么需要: 这个状态的进入动作只有 Chassis_Stop(), 而转移条件
+ *   Chassis_Task_Is_Complete() 在 Stop 之后【立刻】就为真 —— 所以它本来
+ *   会被“穿过”(同一周期直接跳到下一步摆 TARGET_LOOK), 等于没停。
+ *   加了这个延时: 停车 → 原地停稳这么久 → 再让臂/摄像头伸出去。
+ *   免得底盘刹车/麦轮摆动还没停, 机械臂就带着摄像头一起晃。
+ * 建议 0(关闭, 回到“穿过”行为) ~ 1500; 默认 800。 */
+#define TARGET_STOP_SETTLE_MS   800
+
 /* ---------- 救援(掉头) ---------- */
 #define ROUTE_14_TO_HOSTAGE_MM      800    /* 救援前前进距离 */
 // #define ROUTE_15_TURN_180_DEG       (-91) /* 原地掉头 180° */
 
-/* ---------- 救援接近(新阶段四): 右移距离占位宏 (默认100, 实测后只改这里) ----------
- * 航向校正使用 Turn_Angle_Compat(0.1f) = 转到绝对 0° 的微调占位。 */
-#define ROUTE_16_RIGHT_A_MM         300    /* 右移 A */
-#define ROUTE_17_RIGHT_B_MM         600    /* 右移 B */
-#define ROUTE_18_RIGHT_C_MM         600    /* 右移 C */
-#define ROUTE_19_RIGHT_D_MM         800    /* 右移 D */
-#define ROUTE_21_RIGHT_E_MM         0//300    /* 右移 E(视觉营救完成后) */
-#define ROUTE_22_RIGHT_F_MM         0//500    /* 右移 F(收尾) */
+/* ---------- 救援阶段 (2026-10-05 重新定义) ----------
+ *  ①后退 ROUTE_14_TO_HOSTAGE_MM → ②航向校准 → ③停等 RESCUE_STOP_WAIT_MS
+ *  → ④摆 HOSTAGE_LOOK → ⑤视觉对准 + 抓取
+ *  → ⑥后退 ROUTE_17_RIGHT_B_MM → ⑦航向校准
+ *  → ⑧后退 ROUTE_18_RIGHT_C_MM → ⑨航向校准 → ⑩停下 */
+#define ROUTE_16_RIGHT_A_MM         300    /* (未使用: 该状态已改成“只摆 HOSTAGE_LOOK”) */
+#define ROUTE_17_RIGHT_B_MM         600    /* ⭐ 抓完后第 1 段后退(mm) */
+#define ROUTE_18_RIGHT_C_MM         600    /* ⭐ 抓完后第 2 段后退(mm) */
+#define ROUTE_19_RIGHT_D_MM         800    /* (未使用) */
+#define ROUTE_21_RIGHT_E_MM         0//300    /* (未使用) */
+#define ROUTE_22_RIGHT_F_MM         0//500    /* (未使用) */
 
 /* =====================================================================
  * ⭐ 机械臂姿态表 (实测标定值, 0~4095)
@@ -322,13 +368,13 @@ static uint16_t s_arm_pose_table[ARM_POSE_COUNT][SERVO_COUNT] = {
     {  212,  656,1760, 2175, 93  },   /* SCAN          扫码: 车停稳后伸臂给摄像头 */
     {  222, 1843, 878, 1834, 93  },   /* SCAN_RESET    扫码之后复位: 扫到码后把机械臂收回 */
     {  232, 1026,1377, 1176, 93  },   /* BALL_LOOK     看球: 摄像头对准小球(抓球前对准) */
-    {  228,  343,1650, 1676, 93  },  /* BALL_PRE      抓夹移动到小球前 */
-    {  228,  343,1650, 1676, 600 },   /* BALL_CLOSE    夹爪夹紧小球 */
-    {  232, 1160,1795, 1748, 600 },   /* BALL_LIFT   抓到小球后大臂抬起 */
+    {  228,  406,1855, 1400, 93  },  /* BALL_PRE       抓夹移动到小球前 */
+    {  228,  406,1855, 1400, 600 },   /* BALL_CLOSE    夹爪夹紧小球 */
+    {  232, 1160,1795, 1748, 600 },   /* BALL_LIFT     抓到小球后大臂抬起 */
     { 2243,  886,1872, 1650, 600 },   /* BUCKET_CARRY  携带姿态: 端着球, 底盘移动到另一侧 */
-    { 2243, 1153,1498, 1264, 600 },   /* BUCKET_LOOK   看桶: 摄像头对准球桶(放置前对准) */
-    { 2243,   50,2155, 2234, 600  },   /* PLACE_PRE     机械臂移动到放置小球的位置 */
-    { 2243,   50,2155, 2234, 93  },   /* PLACE_OPEN    夹爪松开(放球) */
+    { 2243, 1254,1604, 1131, 600 },   /* BUCKET_LOOK   看桶: 摄像头对准球桶(放置前对准) */
+    { 2243,  197,1719, 2594, 600 },   /* PLACE_PRE     机械臂移动到放置小球的位置 */
+    { 2243,  197,1719, 2594, 93  },   /* PLACE_OPEN    夹爪松开(放球) */
     { 2168, 1285,2155, 2234, 93  },   /* PLACE_LIFT    放置完之后大臂抬起 */
     {  213, 1925, 988, 1463, 93  },   /* TARGET_READY     转动到准备识别靶子的位置 */
     {  213,  585,1899, 2180, 93  },   /* TARGET_LOOK   识别靶子: 摄像头对准靶子 */
@@ -1084,46 +1130,76 @@ static uint8_t Vision_FineAlignTimeout(const char *tag, uint32_t state_tick, uin
 
 #if !MISSION_TEST_NO_VISION
 /* =====================================================================
- * ⭐ 打靶专用: 原地只转底座 ID1  (2026-10-04)
+ * ⭐ 原地只转底座 ID1 (打靶 / 救援 共用; 2026-10-04 新增, 10-05 泛化)
  * ---------------------------------------------------------------------
- * 为什么不用 Arm_GotoPose/直接改姿态表:
+ * 为什么不用 Arm_GotoPose / 直接改姿态表:
  *   ① Arm_GotoPose 是“整张姿态表一起写”, 会把 ID2~ID5 也重写一遍;
- *   ② 它会阻塞(运动时间 + hold_time) ≈ 3s, 期间主循环收不到 C/L/R,
- *      不适合“转一点 → 看一眼画面”的逐个修正。
+ *   ② 它会阻塞(运动时间 + hold_time) ≈ 3~4.5s, 期间主循环收不到 C/L/R,
+ *      不适合“转一点 → 看一眼画面 → 再转一点”的逐个修正。
  * 所以这里只用 Servos_SetPositionsMasked(pose, SERVO_MASK_ID1, ...) 下发 ID1:
- *   位置数组里其余 4 个舵机仍填 TARGET_LOOK 那一行(因为没选中, 不会动),
+ *   位置数组里其余 4 个舵机仍填【基准姿态】那一行(因为没选中, 不会动),
  *   只有 [0]=ID1 被改成新值。下发后立即返回, 由调用方用冷却时间等它停稳。
+ * ⚠️ 调用前必须已经用 Arm_GotoPose(基准姿态) 把臂摆好, 否则缓存里记的 ID1
+ *    起点跟实际对不上(下发瞬间会先跳一下再走)。
  * ===================================================================== */
-static uint16_t s_target_id1_pos = 0;   /* ID1 当前指令位置(以 TARGET_LOOK 为起点) */
+static uint16_t s_id1_pos      = 0;   /* ID1 当前指令位置 */
+static uint8_t  s_id1_pose_idx = 0;   /* 上面那个位置对应的【基准姿态】 */
 
-/** @brief 把 ID1 位置缓存复位到 ARM_POSE_TARGET_LOOK 的底座值 */
-static void Target_Id1Reset(void)
+/** @brief 把 ID1 位置缓存复位到指定基准姿态的底座值 */
+static void Arm_Id1Reset(uint8_t pose_idx)
 {
-    s_target_id1_pos = s_arm_pose_table[ARM_POSE_TARGET_LOOK][0];
+    s_id1_pose_idx = pose_idx;
+    s_id1_pos      = s_arm_pose_table[pose_idx][0];
+    MLOG("ID1: reset base pose %s -> %d",
+         ArmAction_GetName(pose_idx), (int)s_id1_pos);
 }
 
 /**
- * @brief  只让底座 ID1 相对当前位置转一步(不阻塞)
- * @param  delta 角度码增量: 正 = 数值增大, 负 = 数值减小
- * @note   1) 已做 TARGET_ID1_POS_MIN/MAX 限幅, 防越界堵转;
- *         2) 单步增量远小于 2048, 不会触发飞特舵机的“最短路径反向甩”问题。
+ * @brief  让底座 ID1 相对当前位置转一步(不阻塞)
+ * @param  pose_idx 基准姿态(打靶=ARM_POSE_TARGET_LOOK, 救援=ARM_POSE_HOSTAGE_LOOK)
+ * @param  delta    角度码增量: 正 = 数值增大, 负 = 数值减小
+ * @param  move_ms  本步转动时间(ms)
+ * @param  pos_min  限幅下限(角度码), 防越界堵转
+ * @param  pos_max  限幅上限(角度码)
+ * @note   换了基准姿态时自动重新对齐缓存; 单步增量远小于 2048, 不会触发
+ *         飞特舵机的“最短路径反向甩”问题。
  */
-static void Target_Id1Step(int32_t delta)
+static void Arm_Id1Step(uint8_t pose_idx, int32_t delta, uint16_t move_ms,
+                        uint16_t pos_min, uint16_t pos_max)
 {
     uint16_t pose[SERVO_COUNT];
-    int32_t  v = (int32_t)s_target_id1_pos + delta;
+    int32_t  v;
 
-    if (v < TARGET_ID1_POS_MIN) v = TARGET_ID1_POS_MIN;
-    if (v > TARGET_ID1_POS_MAX) v = TARGET_ID1_POS_MAX;
-    s_target_id1_pos = (uint16_t)v;
+    if (s_id1_pose_idx != pose_idx) {
+        Arm_Id1Reset(pose_idx);          /* 换了阶段/基准姿态: 重新对齐 */
+    }
+    v = (int32_t)s_id1_pos + delta;
+    if (v < (int32_t)pos_min) v = (int32_t)pos_min;
+    if (v > (int32_t)pos_max) v = (int32_t)pos_max;
+    s_id1_pos = (uint16_t)v;
 
     for (uint8_t i = 0; i < SERVO_COUNT; i++) {
-        pose[i] = s_arm_pose_table[ARM_POSE_TARGET_LOOK][i];
+        pose[i] = s_arm_pose_table[pose_idx][i];
     }
-    pose[0] = s_target_id1_pos;
+    pose[0] = s_id1_pos;
 
-    MLOG("Target: ID1 %+ld -> %d", (long)delta, (int)s_target_id1_pos);
-    Servos_SetPositionsMasked(pose, SERVO_MASK_ID1, TARGET_ID1_MOVE_MS);
+    MLOG("ID1[%s] %+ld -> %d", ArmAction_GetName(pose_idx), (long)delta, (int)s_id1_pos);
+    Servos_SetPositionsMasked(pose, SERVO_MASK_ID1, move_ms);
+}
+
+/* ---- 打靶 / 救援 各自的封装: 把各自的参数宏收口在一处, 调用点更短 ---- */
+/** @brief 打靶: ID1 以 TARGET_LOOK 为基准转一步 */
+static void Target_Id1Step(int32_t delta)
+{
+    Arm_Id1Step(ARM_POSE_TARGET_LOOK, delta,
+                TARGET_ID1_MOVE_MS, TARGET_ID1_POS_MIN, TARGET_ID1_POS_MAX);
+}
+
+/** @brief 救援: ID1 以 HOSTAGE_LOOK 为基准转一步 */
+static void Rescue_Id1Step(int32_t delta)
+{
+    Arm_Id1Step(ARM_POSE_HOSTAGE_LOOK, delta,
+                RESCUE_ID1_MOVE_MS, RESCUE_ID1_POS_MIN, RESCUE_ID1_POS_MAX);
 }
 #endif /* !MISSION_TEST_NO_VISION */
 
@@ -1179,11 +1255,13 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
         TARGET_COMPLETE
     } TargetSubState_t;
 
-    /* 任务3: 救援(停下给视觉→对准→执行; K230 任务号 = 4 = K230_TASK_RESCUE) */
+    /* 任务3: 救援(停下给视觉→对准→抓取; K230 任务号 = 4 = K230_TASK_RESCUE)
+     * 两种对准方案由 RESCUE_SCHEME_ID1 切换(见文件头“救援任务参数”) */
     typedef enum {
-        RESCUE_IDLE,            /* 发 run_task:4(形状), 等 C/L/R */
-        RESCUE_WAIT_ADJUST,     /* 视觉给 L/R → 小车前进/后退一小段, 等它走完 */
-        RESCUE_WAIT_ALIGN,      /* 视觉精对准(D:/OK 脉冲, 方案一: 只修前后) */
+        RESCUE_IDLE,            /* 发 run_task:4(形状), 等 K230 回 C/L/R */
+        RESCUE_WAIT_ADJUST,     /* [方案一] 视觉给 L/R → 车前进/后退一小段, 等它走完 */
+        RESCUE_WAIT_ALIGN,      /* [方案一] 精对准(D:/OK, 只修前后) */
+        RESCUE_ID1_MOVING,      /* [方案二] 刚转了一步 ID1, 等它走完(RESCUE_ID1_MOVE_MS) */
         RESCUE_SETTLE,          /* 对准后停车稳定 */
         RESCUE_PERFORM,         /* 执行营救动作(HOSTAGE_PRE → CLOSE → LIFT) */
         RESCUE_COMPLETE
@@ -1214,6 +1292,13 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
     static uint16_t target_id1_steps = 0;     /* 本次已转了多少步(防卡死①) */
     static uint32_t target_id1_tick = 0;      /* 本次 L/R 对准起始时刻(防卡死②) */
     static uint32_t target_id1_move_tick = 0; /* 本步 ID1 开始转动时刻 */
+
+    /* ---- 救援专用(方案二): 底座 ID1 原地对准的状态量 ---- */
+    static uint8_t  rescue_id1_inited = 0;      /* 0=本次救援还没开始 L/R 对准 */
+    static uint8_t  rescue_heard      = 0;      /* 0=还没收到过 K230 任何回应 */
+    static uint16_t rescue_id1_steps  = 0;      /* 本次已转了多少步(防卡死①) */
+    static uint32_t rescue_id1_tick   = 0;      /* 本次 L/R 对准起始时刻(防卡死②) */
+    static uint32_t rescue_id1_move_tick = 0;   /* 本步 ID1 开始转动时刻 */
 
     char line[K230_LINE_MAX];
 
@@ -1416,7 +1501,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
         }
     }
     /* ================= 任务2: 打靶 (2026-10-04 改版: 底盘不动, 只转底座 ID1) =====
-     * 执行到本函数时: 小车已右移 1510mm 到位 → 已航向校正 →
+     * 执行到本函数时: 小车已走完 “右移850 → 航向校正 → 右移850 → 停车”,
      *                 臂已摆到 ARM_POSE_TARGET_LOOK(摄像头对准靶子)
      *
      *   ① TARGET_IDLE        发 run_task:2 → K230 回 C / L / R
@@ -1436,7 +1521,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
      *                          ARM_POSE_TARGET_FIRE  → 激光发射位(激光由 K230 控制)
      *                          ARM_POSE_TARGET_LIFT  → 打完把大臂抬起
      *                          ARM_POSE_SCAN_RESET   → 手臂收回, 准备跑路
-     *   ④ TARGET_COMPLETE    回主状态机 → 右移 400mm → 航向校正 → 救援
+     *   ④ TARGET_COMPLETE    回主状态机 → 右移 ROUTE_12_P2_A_MM → 航向校正 → 救援
      *
      * 🛡 防卡死: 转满 TARGET_ID1_STEP_MAX 步 或 超过 TARGET_ID1_TIMEOUT_MS
      *            仍未收到 C (含 K230 完全不回应) → 强制当作 C 处理, 保证能往下走
@@ -1457,8 +1542,8 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                     target_heard      = 0;
                     target_id1_steps  = 0;
                     target_id1_tick   = HAL_GetTick();
-                    Target_Id1Reset();
-                    MLOG("Target: ID1 align start (base=%d)", (int)s_target_id1_pos);
+                    Arm_Id1Reset(ARM_POSE_TARGET_LOOK);
+                    MLOG("Target: ID1 align start (base=%d)", (int)s_id1_pos);
                 }
 
                 /* 🛡防卡死: 步数或时长任一超限 → 强制走 C 流程 */
@@ -1539,16 +1624,22 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
             default: break;
         }
     }
-    /* ================= 任务3: 救援 (视觉对准; K230 任务号=4) =================
-     * 完整流程(臂已在 STATE_16_RESCUE_RIGHT_A 摆到 ARM_POSE_HOSTAGE_LOOK):
-     *   ① RESCUE_IDLE        发 run_task:4, 等 K230 回 C/L/R
-     *                        ⭐ 臂在 HOSTAGE_LOOK(底座≈1190, 比球姿态多转≈90°)
-     *                           → 画面的“左/右”对应车体的【前/后】:
-     *                             L → 小车前进;  R → 小车后退;  C → 已在中心, 不动
-     *   ② RESCUE_WAIT_ADJUST 等前进/后退走完 → 进精对准
-     *   ③ RESCUE_WAIT_ALIGN  按 D:x,y 微调(方案一: 只修前后, 见 s_align_rescue)
-     *   ④ RESCUE_SETTLE      停车稳定
-     *   ⑤ RESCUE_PERFORM     执行机械臂营救动作(HOSTAGE_PRE → CLOSE → LIFT)
+    /* ================= 任务3: 救援 (视觉对准 + 抓取; K230 任务号=4) =================
+     * 执行到本函数时: 小车已走完 “后退800 → 航向校准 → 停等3s”,
+     *                 臂已摆到 ARM_POSE_HOSTAGE_LOOK(摄像头对准人质)
+     *
+     * ⭐ 对准方式两套, 由 RESCUE_SCHEME_ID1 切换(见文件头“救援任务参数”):
+     *   【方案二】(=1, 当前) 与打靶同构 —— 【底盘完全不动】, 收到 L/R 就小步转
+     *       底座 ID1; 收到 C 就认为对准 → 抓取。
+     *   【方案一】(=0) 与排爆球/桶同构 —— L/R 先让车前进/后退一小段,
+     *       再发 start_align 用 D:x,y 精对准(只修前后), 对准后抓取。
+     * 两套共用的收尾:
+     *   ⑥ RESCUE_SETTLE   停车稳定(FINE_TUNE_SETTLE_MS)
+     *   ⑦ RESCUE_PERFORM  抓取(HOSTAGE_PRE → CLOSE) + 抱起抬起(HOSTAGE_LIFT)
+     *   ⑧ RESCUE_COMPLETE 回主状态机 → 后退 ROUTE_17_RIGHT_B_MM …
+     *
+     * 🛡 方案二防卡死: 转满 RESCUE_ID1_STEP_MAX 步 或 超过 RESCUE_ID1_TIMEOUT_MS
+     *    仍未收到 C(含 K230 完全不回应) → 强制当作 C 处理, 保证能往下走
      */
     else if (expected_task_number == 3) {
         switch (rescue_sub_state) {
@@ -1560,37 +1651,104 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                 settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
                 rescue_sub_state = RESCUE_SETTLE;
 #else
-                if (Mission_GetNewLine(line, sizeof(line))) {
-                    g_vision_task_in_progress = 0;
-                    rescue_path_taken = line[0];
-                    MLOG("Task3(Shape) Dir: %c", rescue_path_taken);
-                    /* ⭐ 救援方向: 画面左右 = 车体前后(见上面“视觉方向映射”)
-                     *   L → 前进;  R → 后退;  C → 已在中心, 不动 */
-                    if (rescue_path_taken == 'C') {
-                        /* 已在中心: 不移动, 直接进精对准(此时只修前后) */
-                        Vision_StartFineAlign("SHAPE", &state_start_tick, &align_start_time, &cooldown_until);
-                        rescue_sub_state = RESCUE_WAIT_ALIGN;
-                    } else if (rescue_path_taken == 'L') {
-                        if (RESCUE_ADJUST_MM) Chassis_Move_Forward(RESCUE_ADJUST_MM);
-                        rescue_sub_state = RESCUE_WAIT_ADJUST;
-                    } else if (rescue_path_taken == 'R') {
-                        if (RESCUE_ADJUST_MM) Chassis_Move_Backward(RESCUE_ADJUST_MM);
-                        rescue_sub_state = RESCUE_WAIT_ADJUST;
+                if (RESCUE_SCHEME_ID1) {
+                    /* ================= 方案二: 车不动, 只转底座 ID1 ================= */
+                    /* 本次救援第一次进来: 复位计数/计时, 并把 ID1 缓存对齐到
+                     * HOSTAGE_LOOK(进本状态前 STATE_16_RESCUE_RIGHT_A 已摆好它) */
+                    if (!rescue_id1_inited) {
+                        rescue_id1_inited = 1;
+                        rescue_heard      = 0;
+                        rescue_id1_steps  = 0;
+                        rescue_id1_tick   = HAL_GetTick();
+                        Arm_Id1Reset(ARM_POSE_HOSTAGE_LOOK);
+                        MLOG("Rescue: ID1 align start (base=%d)", (int)s_id1_pos);
                     }
-                } else if (!g_vision_task_in_progress ||
-                           HAL_GetTick() - vision_cmd_tick >= VISION_CMD_RESEND_MS) {
-                    if (!g_vision_task_in_progress) {
-                        rescue_idle_tick = HAL_GetTick();
-                    } else if (HAL_GetTick() - rescue_idle_tick > VISION_RESPONSE_TIMEOUT_MS) {
-                        /* K230 形状追踪尚未实现/未回应: 超时跳过视觉, 盲走营救(防卡死) */
-                        MLOG("Rescue: vision no response, blind rescue");
-                        g_vision_task_in_progress = 0;
-                        rescue_sub_state = RESCUE_PERFORM;
+                    /* 🛡防卡死: 步数 或 时长 超限 → 强制当作已对准, 直接去抓 */
+                    if (rescue_id1_steps >= RESCUE_ID1_STEP_MAX ||
+                        (HAL_GetTick() - rescue_id1_tick) > RESCUE_ID1_TIMEOUT_MS) {
+                        MLOG("Rescue: ID1 align FORCE C (steps=%u, %lums)",
+                             (unsigned)rescue_id1_steps,
+                             (unsigned long)(HAL_GetTick() - rescue_id1_tick));
+                        Chassis_Stop();
+                        settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
+                        rescue_sub_state = RESCUE_SETTLE;
                         break;
                     }
-                    Vision_SendTask(K230_TASK_RESCUE, "SHAPE", &vision_cmd_tick);
+                    if (Mission_GetNewLine(line, sizeof(line))) {
+                        rescue_heard = 1;   /* 已联系上 K230: 之后不再定时重发 */
+                        rescue_path_taken = line[0];
+                        MLOG("Task3(Shape) Dir: %c", rescue_path_taken);
+                        if (rescue_path_taken == 'L') {
+                            Rescue_Id1Step((int32_t)RESCUE_ID1_LR_SIGN * RESCUE_ID1_STEP);
+                            rescue_id1_steps++;
+                            rescue_id1_move_tick = HAL_GetTick();
+                            rescue_sub_state = RESCUE_ID1_MOVING;
+                        } else if (rescue_path_taken == 'R') {
+                            Rescue_Id1Step(-(int32_t)RESCUE_ID1_LR_SIGN * RESCUE_ID1_STEP);
+                            rescue_id1_steps++;
+                            rescue_id1_move_tick = HAL_GetTick();
+                            rescue_sub_state = RESCUE_ID1_MOVING;
+                        } else {
+                            /* 'C'(或其它字符): 认为已对准 → 停稳后去抓
+                             * (不直接上 RESCUE_PERFORM, 而是绕一下 RESCUE_SETTLE,
+                             *  等 ID1 完全停稳再夹, 免得还在动就把人质抱歪) */
+                            MLOG("Rescue: C after %u step(s) -> Grab",
+                                 (unsigned)rescue_id1_steps);
+                            Chassis_Stop();
+                            settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
+                            rescue_sub_state = RESCUE_SETTLE;
+                        }
+                    } else if (!rescue_heard &&
+                               (!g_vision_task_in_progress ||
+                                HAL_GetTick() - vision_cmd_tick >= VISION_CMD_RESEND_MS)) {
+                        Vision_SendTask(K230_TASK_RESCUE, "SHAPE", &vision_cmd_tick);
+                    }
+                } else {
+                    /* ============ 方案一: 动底盘(前进/后退) + D:x,y 精对准 ============ */
+                    if (Mission_GetNewLine(line, sizeof(line))) {
+                        g_vision_task_in_progress = 0;
+                        rescue_path_taken = line[0];
+                        MLOG("Task3(Shape) Dir: %c", rescue_path_taken);
+                        /* ⭐ 救援方向: 画面左右 = 车体前后(见上面“视觉方向映射”)
+                         *   L → 前进;  R → 后退;  C → 已在中心, 不动 */
+                        if (rescue_path_taken == 'C') {
+                            /* 已在中心: 不移动, 直接进精对准(此时只修前后) */
+                            Vision_StartFineAlign("SHAPE", &state_start_tick, &align_start_time, &cooldown_until);
+                            rescue_sub_state = RESCUE_WAIT_ALIGN;
+                        } else if (rescue_path_taken == 'L') {
+                            if (RESCUE_ADJUST_MM) Chassis_Move_Forward(RESCUE_ADJUST_MM);
+                            rescue_sub_state = RESCUE_WAIT_ADJUST;
+                        } else if (rescue_path_taken == 'R') {
+                            if (RESCUE_ADJUST_MM) Chassis_Move_Backward(RESCUE_ADJUST_MM);
+                            rescue_sub_state = RESCUE_WAIT_ADJUST;
+                        }
+                    } else if (!g_vision_task_in_progress ||
+                               HAL_GetTick() - vision_cmd_tick >= VISION_CMD_RESEND_MS) {
+                        if (!g_vision_task_in_progress) {
+                            rescue_idle_tick = HAL_GetTick();
+                        } else if (HAL_GetTick() - rescue_idle_tick > VISION_RESPONSE_TIMEOUT_MS) {
+                            /* K230 形状跟踪尚未实现/未回应: 超时跳过视觉, 盲走营救(防卡死) */
+                            MLOG("Rescue: vision no response, blind rescue");
+                            g_vision_task_in_progress = 0;
+                            rescue_sub_state = RESCUE_PERFORM;
+                            break;
+                        }
+                        Vision_SendTask(K230_TASK_RESCUE, "SHAPE", &vision_cmd_tick);
+                    }
                 }
 #endif
+                break;
+
+            case RESCUE_ID1_MOVING:
+                /* [方案二] 等 ID1 转完。期间把 K230 攒下的旧行【全部丢掉】,
+                 * 保证回到 RESCUE_IDLE 时拿到的是“转完之后”采集的新帧,
+                 * 否则会拿旧误差连续累加 → 转过头(和打靶一样的坑) */
+                while (Mission_GetNewLine(line, sizeof(line))) {
+                    /* 丢弃旧帧 */
+                }
+                if ((HAL_GetTick() - rescue_id1_move_tick) >= RESCUE_ID1_MOVE_MS) {
+                    rescue_sub_state = RESCUE_IDLE;
+                }
                 break;
 
             case RESCUE_WAIT_ADJUST:
@@ -1625,15 +1783,21 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
 
             case RESCUE_PERFORM:
                 MLOG("State: RESCUE PERFORM");
-                Arm_Start_Rescue_Grab();
-                Arm_Start_Rescue_Retract();
+                Arm_Start_Rescue_Grab();      /* HOSTAGE_PRE(准备抱) → HOSTAGE_CLOSE(抱紧) */
+                Arm_Start_Rescue_Retract();   /* HOSTAGE_LIFT(抱起后抬起) */
                 rescue_sub_state = RESCUE_COMPLETE;
                 break;
 
             case RESCUE_COMPLETE:
                 MLOG("Task 3 (Rescue) Done");
-                rescue_sub_state = RESCUE_IDLE;
-                g_mission_state++;
+                /* 复位, 并把 g_vision_task_in_progress 清 0,
+                 * 让后面的视觉任务重新走 “Vision Start + 换任务静默期” */
+                rescue_id1_inited = 0;
+                rescue_heard      = 0;
+                rescue_sub_state  = RESCUE_IDLE;
+                g_vision_task_in_progress = 0;
+                /* ⭐ 抓取完成 → ⑥ 抓完后第 1 段后退(STATE_17_RESCUE_RIGHT_B) */
+                g_mission_state = STATE_17_RESCUE_RIGHT_B;
                 break;
 
             default: break;
@@ -1925,6 +2089,10 @@ void Mission_Update(void)
     static uint32_t qr_scan_start = 0;
 #endif
     static uint32_t s_qr_cmd_tick = 0;   /* scan_qr 发送时刻(定时重发用) */
+    /* 阶段四③: 停下等待的起始时刻(等 RESCUE_STOP_WAIT_MS 再摆臂) */
+    static uint32_t s_rescue_wait_tick = 0;
+    /* 阶段三: 打靶走位第 2 段右移后“停车停稳”的起始时刻(TARGET_STOP_SETTLE_MS) */
+    static uint32_t s_target_stop_tick = 0;
 
     /* ============================================================
      * 第一段: 状态进入动作 (仅在状态切换瞬间执行一次)
@@ -1949,7 +2117,7 @@ void Mission_Update(void)
             /* ---------- STATE_7 分段: 左移B -> 中间停 -> 左移C -> 航向校正 ---------- */
             case STATE_7_MOVE_LEFT_B:         Chassis_Move_Left(ROUTE_7_LEFT_B_MM); break;    /* 左移阶段B */
             case STATE_7A_INTERMEDIATE_STOP:  Turn_Angle_Compat(0.1f); break;                 /* 中间停顿 + 航向校正 */
-            case STATE_7B_MOVE_LEFT_C:        break;//Chassis_Move_Left(ROUTE_7_LEFT_C_MM); break;    /* 左移阶段C */
+            case STATE_7B_MOVE_LEFT_C:        break;//Chassis_Move_Diagonal(ROUTE_7_LEFT_C_MM,ROUTE_7_LEFT_C_MM);Chassis_Move_Left(ROUTE_7_LEFT_C_MM); break;    /* 左移阶段C */
             case STATE_7A_HEADING_CORRECTION: break;//Turn_Angle_Compat(0.1f);                  /* 航向校正 */
 
             /* ---------- 排爆区走位 ---------- */
@@ -1965,57 +2133,75 @@ void Mission_Update(void)
             case STATE_11_PERFORMING_BOMB_DISPOSAL: Chassis_Stop(); break;                    /* 停下, 交给视觉子状态机 */
 
             /* ---------- 阶段二: 打靶 ----------
-             * 2026-10-04 改版: 底盘只走“右移1510 → 停 → 航向校正”, 之后就交给
-             * 任务2 的视觉子状态机【原地转底座 ID1】; 打完靶再“右移400 → 航向校正”
-             * → 直接进救援。中间那一大串分段走位已废弃(见下面置空的 case)。 */
-            case STATE_12_PART1_MOVE_A:       Chassis_Move_Right(ROUTE_12_P1_A_MM); break;  /* ⭐ 右移1510mm */
-            /* ⭐ 右移到位后: 先停 + 航向校正, 再把臂摆成 TARGET_LOOK(摄像头对准靶子)。
-             *    Arm_GotoPose 是阻塞的(约3s), 正好让车在摆臂期间把航向校完。
-             *    之后就交给任务2 的视觉子状态机, 等 K230 回 L/C/R。
-             *    ⚠️ 这里不能再摆 TARGET_READY —— 那个已经在放完球(BOMB_PERFORM_PLACE)
-             *       时摆过了。 */
-            case STATE_12_PART1_CORRECT_A:    Chassis_Stop();  Arm_GotoPose(ARM_POSE_TARGET_LOOK); break;//Turn_Angle_Compat(0.1f);
-            case STATE_12_PART1_MOVE_B:       break;   /* 已废弃 */
-            case STATE_12_PART1_CORRECT_B:    break;   /* 已废弃 */
-            case STATE_12_PART1_MOVE_C:       break;   /* 已废弃 */
+             * 走位链(2026-10-05 定稿):
+             *   MOVE_A(右移 ROUTE_12_P1_A_MM) →  CORRECT_A(航向校正到 0°)
+             * → MOVE_B(再右移 ROUTE_12_P1_B_MM) →  CORRECT_B(停车)
+             * → MOVE_C(摆 ARM_POSE_TARGET_LOOK) →  STATE_13 打靶视觉对准
+             * 打完靶收尾: PART2_MOVE_A(右移) → PART2_CORRECT_A(航向校正) → 救援
+             *
+             * ⚠️ 写法上的关键点(看下面代码时心里要数这一条):
+             *   【进入动作】只在“刚切到这个状态”的那一瞬间执行一次,
+             *   之后每个主循环只跑【转移检查】。
+             *   ⇒ “航向校正/右移”这种需要时间的动作, 就是靠
+             *     “进入时发一次指令 + 转移条件里等 Chassis_Task_Is_Complete()”
+             *     配合完成的(绝不能在转移里再发一次, 否则会反复重发)。 */
+            case STATE_12_PART1_MOVE_A:       Chassis_Move_Right(ROUTE_12_P1_A_MM); break;  /* ⭐ 第1段右移 */
+            /* ⭐ 右移到位后先做航向校正(转到给对 0°), 防止两次右移的累积误差。
+             *    之后 MOVE_B 继续右移, CORRECT_B 停车, MOVE_C 才摆臂。 */
+            case STATE_12_PART1_CORRECT_A:    Turn_Angle_Compat(0.1f);break;
+            case STATE_12_PART1_MOVE_B:       Chassis_Move_Right(ROUTE_12_P1_B_MM); break;  
+            case STATE_12_PART1_CORRECT_B:    Chassis_Stop(); s_target_stop_tick = HAL_GetTick(); break;  
+            case STATE_12_PART1_MOVE_C:       Arm_GotoPose(ARM_POSE_TARGET_LOOK);break;   
 
-            /* ⚠️ 下面 TURN_A/TURN_B 也已废弃(不可达): PART1_MOVE_C 不再往后推进。
-             *    (原用途: 大角度转弯拆成两步, 减小单次转向的超调) */
-            case STATE_12_TURN_A:             Chassis_Move_Right(ROUTE_12_TURN_A_DEG); break;  
-            case STATE_12_TURN_B:             Turn_Angle_Compat(0.1f); break;    
+            /* ⚠️ TURN_A/TURN_B 已不在流程里(不可达): 上面 MOVE_C 摆完臂直接跳 STATE_13。
+             *    这里置空, 免得万一被进入时车突然跑 400mm */
+            case STATE_12_TURN_A:             break;//Chassis_Move_Right(ROUTE_12_TURN_A_DEG);
+            case STATE_12_TURN_B:             break;//Turn_Angle_Compat(0.1f);
 
-            /* ⭐ 打靶收尾: 手臂收回 SCAN_RESET 之后右移400mm, 再航向校正一次 → 进救援。
-             *    这两个状态是复用的, 后面的 MOVE_B/CORRECT_B/MOVE_C 已废弃 */
-            case STATE_12_PART2_MOVE_A:       Chassis_Move_Right(ROUTE_12_P2_A_MM); break;  /* ⭐ 打靶后右移400mm */
+            /* ⭐ 打靶收尾: 手臂收回 SCAN_RESET 之后右移 ROUTE_12_P2_A_MM,
+             *    再航向校正一次 → 进救援。
+             *    (这两个状态是复用的, 后面的 MOVE_B/CORRECT_B/MOVE_C 未使用) */
+            case STATE_12_PART2_MOVE_A:       Chassis_Move_Right(ROUTE_12_P2_A_MM); break;  /* ⭐ 打靶后右移 ROUTE_12_P2_A_MM */
             case STATE_12_PART2_CORRECT_A:    Turn_Angle_Compat(0.1f); break;               /* ⭐ 航向校正 → 救援 */
             case STATE_12_PART2_MOVE_B:       break;   /* 已废弃 */
             case STATE_12_PART2_CORRECT_B:    break;//Turn_Angle_Compat(0.1f); break;                 /* 航向校正 */
             case STATE_12_PART2_MOVE_C:       break; //Chassis_Move_Right(ROUTE_12_P2_C_MM); break;  /* Part2 第3段 */
 
             /* 进入打靶视觉子状态机(底盘完全不动, 只转底座 ID1 对准 → 摆 FIRE/LIFT/SCAN_RESET)。
-             * ⚠️ 这里不再做航向校正 —— 上一个状态 STATE_12_PART1_CORRECT_A 已经校过了;
-             *    再调一次 Turn_Angle_Compat 会被下面 Vision_SendTask 里的 Chassis_Stop()
-             *    清掉, 只造成困惑 */
+             * ⚠️ 这里不再做航向校正 —— CORRECT_A 已经校过一次, 而且 MOVE_C 摆臂时
+             *    底盘是静止的, 不需要再校。 */
             case STATE_13_PERFORMING_TARGETING: break;
 
-            /* ---------- 阶段三: 救援(掉头后接新阶段四走位) ---------- */
-            case STATE_14_MOVE_FORWARD_B:     Chassis_Move_Backward(ROUTE_14_TO_HOSTAGE_MM); break;  /* 救援前前进 */
-            case STATE_15_TURN_FOR_HOSTAGE:   Turn_Angle_Compat(0.1f); Arm_GotoPose(ARM_POSE_HOSTAGE_LOOK);break;   /* 原地掉头 180° */
+            /* ---------- 阶段四: 救援 (2026-10-05 重新定义) ----------
+             * 完整流程:
+             *   ①后退 ROUTE_14_TO_HOSTAGE_MM → ②航向校准 → ③停下等 RESCUE_STOP_WAIT_MS
+             * → ④摆 ARM_POSE_HOSTAGE_LOOK → ⑤视觉对准 + 抓取(子状态机)
+             * → ⑥后退 ROUTE_17_RIGHT_B_MM → ⑦航向校准
+             * → ⑧后退 ROUTE_18_RIGHT_C_MM → ⑨航向校准 → ⑩停下(任务完成)
+             * ⚠️ ⑤ 的对准方式由 RESCUE_SCHEME_ID1 切换(1=转 ID1 车不动 / 0=动底盘)。
+             * ------------------------------------------------------------------ */
+            case STATE_14_MOVE_FORWARD_B:          Chassis_Move_Backward(ROUTE_14_TO_HOSTAGE_MM); break; /* ① 后退 */
+            case STATE_15_TURN_FOR_HOSTAGE:        Turn_Angle_Compat(0.1f); break;                     /* ② 航向校准 */
+            /* ③ 停下等 RESCUE_STOP_WAIT_MS: 等车体晃动停稳, 再让机械臂摆出去 */
+            case STATE_15A_RESCUE_STOP_WAIT:       Chassis_Stop(); s_rescue_wait_tick = HAL_GetTick(); break;
+            /* ④ 摆成“识别人质”姿态(臂阻塞约 3s, 摆完直接去视觉) */
+            case STATE_16_RESCUE_RIGHT_A:          Arm_GotoPose(ARM_POSE_HOSTAGE_LOOK); break;
+            /* ⑤ 底盘完全不动, 交给救援视觉子状态机(对准 + 抓取) */
+            case STATE_20_PERFORMING_HOSTAGE_RESCUE: break;
+            /* ⑥⑦⑧⑨ 抓完后的撒退: 后退600 → 航向 → 后退600 → 航向 */
+            case STATE_17_RESCUE_RIGHT_B:          Chassis_Move_Backward(ROUTE_17_RIGHT_B_MM); break;
+            case STATE_17A_RESCUE_HEADING_CORRECT: Turn_Angle_Compat(0.1f); break;
+            case STATE_18_RESCUE_RIGHT_C:          Chassis_Move_Backward(ROUTE_18_RIGHT_C_MM); break;
+            case STATE_18A_RESCUE_HEADING_CORRECT: Turn_Angle_Compat(0.1f); break;
+            /* ⑩ 停下 → 结束(转移里置 MISSION_STATE_COMPLETE) */
+            case STATE_19_RESCUE_RIGHT_D:          break;
 
-            /* ---------- 阶段四(新增): 营救接近: 右移+航向校正 x4 -> 视觉营救 -> 右移收尾 ---------- */
-            /* 掉头完成后摆到“识别人质”姿态(摄像头对准人质), 之后再走位/精对准 */
-            case STATE_16_RESCUE_RIGHT_A:         Chassis_Move_Backward(ROUTE_16_RIGHT_A_MM);  break;   /* 右移A */
-            case STATE_16A_RESCUE_HEADING_CORRECT: Turn_Angle_Compat(0.1f); break;                  /* 航向校正 */
-            case STATE_17_RESCUE_RIGHT_B:         Chassis_Move_Backward(ROUTE_17_RIGHT_B_MM); break;   /* 右移B */
-            case STATE_17A_RESCUE_HEADING_CORRECT: Turn_Angle_Compat(0.1f); break;                  /* 航向校正 */
-            case STATE_18_RESCUE_RIGHT_C:         Chassis_Move_Backward(ROUTE_18_RIGHT_C_MM); break;   /* 右移C */
-            case STATE_18A_RESCUE_HEADING_CORRECT: break;//Turn_Angle_Compat(0.1f); break;                  /* 航向校正 */
-            case STATE_19_RESCUE_RIGHT_D:         break;//Chassis_Move_Backward(ROUTE_19_RIGHT_D_MM); break;   /* 右移D */
-            case STATE_19A_RESCUE_HEADING_CORRECT: break;//Turn_Angle_Compat(0.1f); break;                  /* 航向校正 */
-            case STATE_20_PERFORMING_HOSTAGE_RESCUE: break;//Chassis_Stop(); break;                         /* 停下, 交给视觉(3=救援) */
-            case STATE_21_RESCUE_RIGHT_E:         break;//Chassis_Move_Backward(ROUTE_21_RIGHT_E_MM); break;   /* 右移E */
-            case STATE_21A_RESCUE_HEADING_CORRECT: break;//Turn_Angle_Compat(0.1f); break;                  /* 航向校正 */
-            case STATE_22_RESCUE_RIGHT_F:         break;//Chassis_Move_Backward(ROUTE_22_RIGHT_F_MM); break;   /* 右移F(收尾) */
+            /* ⚠️ 下面这几个状态本流程不再经过(留空防误入) */
+            case STATE_16A_RESCUE_HEADING_CORRECT: break;   /* 未使用 */
+            case STATE_19A_RESCUE_HEADING_CORRECT: break;   /* 未使用 */
+            case STATE_21_RESCUE_RIGHT_E:          break;   /* 未使用 */
+            case STATE_21A_RESCUE_HEADING_CORRECT: break;   /* 未使用 */
+            case STATE_22_RESCUE_RIGHT_F:          break;   /* 未使用 */
 
             default: break;   /* IDLE / COMPLETE 等状态无进入动作 */
         }
@@ -2087,7 +2273,7 @@ void Mission_Update(void)
         case STATE_7_MOVE_LEFT_B:         if (Chassis_Task_Is_Complete()) g_mission_state++; break;
         case STATE_7A_INTERMEDIATE_STOP:  if (Chassis_Task_Is_Complete()) g_mission_state++; break;
         /* 左移C完成后不是 ++, 而是跳回航向校正状态 */
-        case STATE_7B_MOVE_LEFT_C:        if (Chassis_Task_Is_Complete()) g_mission_state = STATE_7A_HEADING_CORRECTION; break;
+        case STATE_7B_MOVE_LEFT_C:        if (Chassis_Task_Is_Complete()) g_mission_state = STATE_7A_HEADING_CORRECTION; break;// g_mission_state++; break;//
         case STATE_7A_HEADING_CORRECTION: if (Chassis_Task_Is_Complete()) g_mission_state++; break;
 
         case STATE_8_MOVE_FORWARD_A:      if (Chassis_Task_Is_Complete()) g_mission_state++; break;
@@ -2100,14 +2286,24 @@ void Mission_Update(void)
         /* 排爆: 进入视觉辅助子状态机(内部处理完会自己 g_mission_state++) */
         case STATE_11_PERFORMING_BOMB_DISPOSAL: Handle_Vision_Alignment(1); break;
 
+        /* ---------- 打靶走位: 右移850 → 航向校正 → 右移850 → 停 → 摆TARGET_LOOK ---------- */
         case STATE_12_PART1_MOVE_A:       if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        /* ⭐ 摆完 TARGET_LOOK 后直接进打靶视觉(不再经过 PART1_MOVE_B/CORRECT_B/MOVE_C/TURN_A/TURN_B) */
-        case STATE_12_PART1_CORRECT_A:    if (Chassis_Task_Is_Complete()) g_mission_state = STATE_13_PERFORMING_TARGETING; break;
-        case STATE_12_PART1_MOVE_B:       break;   /* 已废弃 */
-        case STATE_12_PART1_CORRECT_B:    break;   /* 已废弃 */
-        case STATE_12_PART1_MOVE_C:       break;   /* 已废弃 */
-        case STATE_12_TURN_A:             break;   /* 已废弃 */
-        case STATE_12_TURN_B:             break;   /* 已废弃 */
+        /* CORRECT_A 发起的是“转到绝对 0°”, 等它转完再走第二段 */
+        case STATE_12_PART1_CORRECT_A:    if (Chassis_Task_Is_Complete()) g_mission_state++; break;
+        case STATE_12_PART1_MOVE_B:       if (Chassis_Task_Is_Complete()) g_mission_state++; break;
+        /* CORRECT_B: 停车 Chassis_Stop() 之后底盘【立刻】就算“完成”, 所以原来这里是
+         * 被“穿过”的(没起到停稳作用)。现在改成原地停稳 TARGET_STOP_SETTLE_MS
+         * 再进 MOVE_C 摆臂, 免得底盘还在晃就把臂/摄像头伸出去。
+         * (TARGET_STOP_SETTLE_MS 填 0 就回到原来的“直接穿过”行为) */
+        case STATE_12_PART1_CORRECT_B:
+            if ((HAL_GetTick() - s_target_stop_tick) >= TARGET_STOP_SETTLE_MS) {
+                g_mission_state++;
+            }
+            break;
+        /* ⭐ 摆完 TARGET_LOOK(阻塞约 4.5s)后才进打靶视觉子状态机 */
+        case STATE_12_PART1_MOVE_C:       if (Chassis_Task_Is_Complete()) g_mission_state = STATE_13_PERFORMING_TARGETING; break;
+        case STATE_12_TURN_A:             break;   /* 未使用 */
+        case STATE_12_TURN_B:             break;   /* 未使用 */
         case STATE_12_PART2_MOVE_A:       if (Chassis_Task_Is_Complete()) g_mission_state++; break;
         /* ⭐ 打靶收尾: 右移400到位 + 航向校正完成后, 直接跳进救援阶段 */
         case STATE_12_PART2_CORRECT_A:    if (Chassis_Task_Is_Complete()) g_mission_state = STATE_14_MOVE_FORWARD_B; break;
@@ -2117,35 +2313,45 @@ void Mission_Update(void)
         case STATE_12_PART2_MOVE_C:       break;   /* 已废弃 */
         case STATE_13_PERFORMING_TARGETING: Handle_Vision_Alignment(2); break;
 
-        case STATE_14_MOVE_FORWARD_B:     if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        /* 掉头完成后 -> 进入救援接近(新阶段四) */
+        case STATE_14_MOVE_FORWARD_B:     if (Chassis_Task_Is_Complete()) g_mission_state++; break;   /* ① → ② */
+        /* ② 航向校准完成 → ③ 停下等 3s */
         case STATE_15_TURN_FOR_HOSTAGE:
             if (Chassis_Task_Is_Complete()) {
                 g_mission_state++;
             }
             break;
 
-        /* ---------- 阶段四(救援): 右移/航向校正 顺序推进 ---------- */
-        case STATE_16_RESCUE_RIGHT_A:         if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        case STATE_16A_RESCUE_HEADING_CORRECT: if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        case STATE_17_RESCUE_RIGHT_B:         if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        case STATE_17A_RESCUE_HEADING_CORRECT: if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        case STATE_18_RESCUE_RIGHT_C:         if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        case STATE_18A_RESCUE_HEADING_CORRECT: if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        case STATE_19_RESCUE_RIGHT_D:         if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        case STATE_19A_RESCUE_HEADING_CORRECT: if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        /* 视觉营救: 交给视觉子状态机(任务3, 内部完成会自己 g_mission_state++) */
-        case STATE_20_PERFORMING_HOSTAGE_RESCUE: Handle_Vision_Alignment(3); break;
-        case STATE_21_RESCUE_RIGHT_E:         if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        case STATE_21A_RESCUE_HEADING_CORRECT: if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        /* 最后一段右移完成后 -> 结束整个任务 */
-        case STATE_22_RESCUE_RIGHT_F:
-            if (Chassis_Task_Is_Complete()) {
-                MLOG("All Done.");
-                Chassis_Stop();
-                g_mission_state = MISSION_STATE_COMPLETE;
+        /* ③ 原地停等 RESCUE_STOP_WAIT_MS, 时间到 → ④ 摆 HOSTAGE_LOOK */
+        case STATE_15A_RESCUE_STOP_WAIT:
+            if ((HAL_GetTick() - s_rescue_wait_tick) >= RESCUE_STOP_WAIT_MS) {
+                g_mission_state++;
             }
             break;
+
+        /* ---------- 阶段四(救援): 对准 → 抓取 → 后退 x2 + 航向校准 x2 ---------- */
+        /* ④ 摆臂是阻塞的, 返回时已经摆好 → 直接跳到 ⑤ 视觉对准 */
+        case STATE_16_RESCUE_RIGHT_A:
+            if (Chassis_Task_Is_Complete()) g_mission_state = STATE_20_PERFORMING_HOSTAGE_RESCUE;
+            break;
+        /* ⑤ 视觉对准 + 抓取; 完成后子状态机自己跳到 STATE_17_RESCUE_RIGHT_B */
+        case STATE_20_PERFORMING_HOSTAGE_RESCUE: Handle_Vision_Alignment(3); break;
+        case STATE_17_RESCUE_RIGHT_B:          if (Chassis_Task_Is_Complete()) g_mission_state++; break;   /* ⑥ → ⑦ */
+        case STATE_17A_RESCUE_HEADING_CORRECT: if (Chassis_Task_Is_Complete()) g_mission_state++; break;   /* ⑦ → ⑧ */
+        case STATE_18_RESCUE_RIGHT_C:          if (Chassis_Task_Is_Complete()) g_mission_state++; break;   /* ⑧ → ⑨ */
+        case STATE_18A_RESCUE_HEADING_CORRECT: if (Chassis_Task_Is_Complete()) g_mission_state++; break;   /* ⑨ → ⑩ */
+        /* ⑩ 最后一步: 停下, 整个任务完成 */
+        case STATE_19_RESCUE_RIGHT_D:
+            MLOG("All Done.");
+            Chassis_Stop();
+            g_mission_state = MISSION_STATE_COMPLETE;
+            break;
+
+        /* ⚠️ 下面这几个状态本流程不再经过(留空防误入) */
+        case STATE_16A_RESCUE_HEADING_CORRECT: break;
+        case STATE_19A_RESCUE_HEADING_CORRECT: break;
+        case STATE_21_RESCUE_RIGHT_E:          break;
+        case STATE_21A_RESCUE_HEADING_CORRECT: break;
+        case STATE_22_RESCUE_RIGHT_F:          break;
 
         default: break;   /* IDLE / COMPLETE 等状态无转移条件 */
     }
