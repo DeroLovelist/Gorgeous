@@ -174,7 +174,7 @@ extern char g_qr_code_string[8];
  * 数值本体在 MissionControl.c 的 s_arm_pose_table 里(实测标定), 这里只列下标。
  * ⚠️ 相邻两姿态的差值不要超过 2048(半圈): 飞特舵机按“最短路径”转,
  *    超过 2048 会朝反方向甩近一整圈。 */
-#define ARM_POSE_COUNT  20
+#define ARM_POSE_COUNT  30
 typedef enum {
     ARM_POSE_HOME = 0,      /* 复位/初始姿态(取自 ServoArm.c 的 SERVO_POS_HOME) */
     ARM_POSE_SCAN,          /* 扫码: 车停稳后伸臂给摄像头扫码 */
@@ -195,7 +195,46 @@ typedef enum {
     ARM_POSE_HOSTAGE_LOOK,  /* 识别人质: 摄像头对准人质 */
     ARM_POSE_HOSTAGE_PRE,   /* 机械臂准备抱人质 */
     ARM_POSE_HOSTAGE_CLOSE, /* 抱紧人质 */
-    ARM_POSE_HOSTAGE_LIFT   /* 抱起人质后大臂抬起 */
+    ARM_POSE_HOSTAGE_LIFT,  /* 抱起人质后大臂抬起 */
+
+    /* ⭐ 救援抓取位【三选一】(2026-10-06 新增) ----------------------------
+     * 救援时底盘不动, 靠底座 ID1 小步转对准人质(HOSTAGE_LOOK 为基准)。
+     * 人质偏左/偏右时 ID1 会多转几十~几百码, 若抓取姿态只有一套就抱不准,
+     * 所以按 ID1 的【累计偏移量】在下面三个姿态里挑一个执行:
+     *     |偏移| ≤ RESCUE_GRAB_MID_RANGE            → GRAB_M(中间抓取位)
+     *     偏移与 RESCUE_GRAB_LEFT_SIGN 同号且超范围 → GRAB_L(向左抓取)
+     *     否则                                      → GRAB_R(向右抓取)
+     * ⚠️ 三行初值都填成 = HOSTAGE_PRE, 所以改装后行为与以前【完全一致】;
+     *    实测时用示教模式(KEY2长按进入 → KEY2切换 → KEY1读出)挨个标定。 */
+    ARM_POSE_HOSTAGE_GRAB_L,/* 抓取位[左]: 人质偏左 */
+    ARM_POSE_HOSTAGE_GRAB_M,/* 抓取位[中]: 人质居中 */
+    ARM_POSE_HOSTAGE_GRAB_R,/* 抓取位[右]: 人质偏右 */
+
+    /* ⭐ 上述三个抓取位各自的【抱紧】与【抬起】(2026-10-06 新增) --------
+     * 为什么拆成 9 个: 三个方向的手臂姿态差得很大(左/右位 ID1 差 400 码≈35°,
+     *   ID2/ID3/ID4 也各不相同), 所以“合夹爪抱紧”和“抱起后抬臂”在这三个
+     *   姿态上并不是同一个动作 —— 用一套会拉回中间位或蹭到车架。
+     * 执行顺序(共 3 步, 由 Arm_Start_Rescue_Grab / _Retract 驱动):
+     *     ① GRAB_x  摆到该方向的抓取位
+     *     ② GRAB_x_CLOSE 在原位合夹爪抱紧(通常只 ID5 从张开→闭合,
+     *                     其余 4 个应与 GRAB_x 相同或仅降几码)
+     *     ③ GRAB_x_LIFT  抱起后抬大臂收尾(之后 → 后退)
+     * ⚠️ 初值: CLOSE = GRAB + (HOSTAGE_CLOSE - HOSTAGE_PRE), LIFT = HOSTAGE_LIFT
+     *    ⇒ 与拆开前的行为【完全一致】, 等你示教后逐个替换即可。
+     * ⚠️ 示教建议: 先示教 GRAB_x → 再在 GRAB_x 上手动合夹爪记录 GRAB_x_CLOSE
+     *    → 最后抱起记录 GRAB_x_LIFT(每行只改一行, 别动别的行)。 */
+    ARM_POSE_HOSTAGE_GRAB_L_CLOSE, /* 抱紧[左] */
+    ARM_POSE_HOSTAGE_GRAB_M_CLOSE, /* 抱紧[中] */
+    ARM_POSE_HOSTAGE_GRAB_R_CLOSE, /* 抱紧[右] */
+    ARM_POSE_HOSTAGE_GRAB_L_LIFT,  /* 抬起[左] */
+    ARM_POSE_HOSTAGE_GRAB_M_LIFT,  /* 抬起[中] */
+    ARM_POSE_HOSTAGE_GRAB_R_LIFT,  /* 抬起[右] */
+
+    /* ⭐ 救援回程姿态 (2026-10-06 新增) --------------------------------
+     * 抱起人质、大臂抬起之后执行【这一张】收臂姿态, 把臂收到“适合带着
+     * 人质后退”的位置(三个方向共用一套)。
+     * 顺序: ①GRAB_x → ②GRAB_x_CLOSE → ③GRAB_x_LIFT → ④RETURN → 后退 */
+    ARM_POSE_HOSTAGE_RETURN /* 抱起后的回程姿态(收臂, 准备后退) */
 } ArmPose_t;
 
 /* ---- 姿态表访问/执行接口 ---- */

@@ -572,6 +572,13 @@ float Chassis_GetSteerIntegrator(void);
 float Chassis_GetSteerIPeak(void);
 
 /**
+ * @brief  读取当前航向角 yaw (度)
+ * @note   未注入 yaw 源时返回 0;
+ *         供任务层判断“车正不正” / 打日志用(如打靶摆臂前的航向确认)
+ */
+float Chassis_GetYaw(void);
+
+/**
  * @brief  打印转向环 PID 调试信息 (误差/P/I/D/总输出/积分值), 供诊断
  * @note   需在主循环中周期调用, 勿在中断中调用;
  *         on=0 表示当前不在转向, 各值为上一次转向的残留

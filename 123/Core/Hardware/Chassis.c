@@ -110,9 +110,21 @@ static const ChassisPidCfg_t s_cfg_straight = {
     .pos_Kp = 0.6f,  .pos_Ki = 0.25f,  .pos_Kd = 0.0f,
     .vel_Kp = 0.4f,  .vel_Ki = 0.05f,  .vel_Kd = 0.0f,
     .vel_ff = 0.18f,  .vel_ff_dead = 14.0f,
-    .hd_Kp = 1.8f,   .hd_Ki = 1.0f,    .hd_Kd = 1.5f,
+    .hd_Kp = 1.8f,   .hd_Ki = 0.0f,    .hd_Kd = 1.5f,
     .hd_max = 25.0f, .hd_imax = 50.0f, .hd_dead = 0.5f,
-    .hd_trim = 0.0f   /* 直行实测很直 → 航向保持保持原样(只用速度偏置), 不动 */
+    /* ⭐ 2026-10-06 修正: hd_trim 0.0 → 1.0, hd_Ki 1.0 → 0。
+     * 原来“只用速度偏置(vel_bias)”: 而速度偏置会被四轮位置环自己抵消
+     *   (位置环看到某轮落后就加大输出), 所以它【修不住】平移/后退时的车头偏转,
+     *   只能靠 PID 的 I 项硬顶; I 项一大就把残差小的轮子速度夹成 0/反向
+     *   → 车“一顿一顿”跳, 而且段末一旦饱和(\"停偏置\"机制另管)还会被差速拧几度。
+     * 实测铁证(后退 600mm 段): I/HDG err 从 -0.5° 一路涨到 -5.5°,
+     *   同时 corr/vb 顶到 ±10 仍未纠住 —— 就是“纠偏手段根本不起作用”。
+     * 改成 hd_trim=1.0 = 把修正量【累加进位置目标】(左右两側真的走不同距离)
+     *   才是真正能产生偏航的手段; 同时 hd_Ki 归 0 ——
+     *   trim 这条路本身就是个积分器, 再叠 I 项 = 双积分 → 过冲
+     *   (和 s_cfg_strafe 里 2026-09-29 的分析同一个道理)。
+     * ⚠️ 若前进变差: 把本行改回 0.0f 即可(前进实测很直, trim 平时不累加, 理论上无影响) */
+    .hd_trim = 1.0f
 };
 
 /* 平移模式 (纯左移/右移) —— 横移漂移优先调这里
@@ -129,9 +141,19 @@ static const ChassisPidCfg_t s_cfg_strafe = {
     .pos_Kp = 0.6f,  .pos_Ki = 0.25f,  .pos_Kd = 0.0f,
     .vel_Kp = 0.4f,  .vel_Ki = 0.05f,  .vel_Kd = 0.0f,//0.4
     .vel_ff = 0.3f,  .vel_ff_dead = 12.0f,
-    .hd_Kp = 1.60f,   .hd_Ki = 1.0f,    .hd_Kd = 1.5f,//1.4，0.0f，1.0
-    .hd_max = 16.0f, .hd_imax = 50.0f, .hd_dead = 0.3f,//16，10,40
-    .hd_trim = 0.0f//1.0f
+    .hd_Kp = 1.60f,   .hd_Ki = 0.0f,    .hd_Kd = 1.5f,
+    .hd_max = 16.0f, .hd_imax = 50.0f, .hd_dead = 0.3f,
+    /* ⭐ 2026-10-06 修正: hd_trim 恢复成上面注释里写的设计值 1.0
+     *   —— 它被误改成 0.0, 等于把“平移纠偏”整个关掉了! 后果:
+     *     ① 横移/后退时车头一直漂(日志: 打靶右移 850mm 内 err 从 -0.3° 涨到 -5.5°,
+     *        停下来时车头歪 5°, 机械臂带着摄像头斜着就去识别靶子了);
+     *     ② 只能靠 vel_bias 硬顶 → 偏置把位置环权限扣掉(pos_lim=max_vel-|bias|)、
+     *        把部分轮子夹成 0 → 车“一抖一抖”地跳。
+     *   hd_Ki 同时归 0(与上面 2026-09-29 的注释配套): trim 已经是积分器,
+     *   再叠 I 项 = 双积分 → 大过冲。
+     * ⚠️ 当年 trim 顶到 -250 过冲的问题, 现已被两道限幅解决:
+     *   CH_HEADING_TRIM_MAX 250→80、CH_HEADING_TRIM_STEP 3→1。 */
+    .hd_trim = 1.0f
 };
 
 static const ChassisPidCfg_t *s_cfg = &s_cfg_straight;  /* 当前生效的分段参数集 */
@@ -1171,6 +1193,16 @@ float Chassis_GetSteerIntegrator(void)
 float Chassis_GetSteerIPeak(void)
 {
     return s_steer_i_peak;
+}
+
+/**
+ * @brief  读取当前航向角 yaw (度, 来自注入的陀螺仪数据源)
+ * @note   任务层用它判断/打印“车到底正不正”(例如打靶摆臂前确认航向已校正完)。
+ *         ⚠️ 未注入 yaw 源(Chassis_SetYawSource)时返回 0。
+ */
+float Chassis_GetYaw(void)
+{
+    return (s_yaw != NULL) ? *s_yaw : 0.0f;
 }
 
 void Chassis_SteerDebugLog(void)

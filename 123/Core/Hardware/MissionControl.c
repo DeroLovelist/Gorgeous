@@ -102,6 +102,23 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
                                         * 就继续往下走, 免得整场卡死在扫码点。
                                         * 建议 15000~40000 */
 
+/* ---- ⭐ 扫码“多角度扫描” (2026-10-06 新增) ----------------------------
+ * 目的: 只用一个固定姿态扫码时, 遇到二维码反光 / 角度偏 / K230 视野边缘
+ *       就扫不到。用腕部 ID4 微调出 3 个角度轮着扫, 命中率高很多。
+ * 做法: 进入 STATE_2 先摆 ARM_POSE_SCAN(其余 4 个舵机保持不动), 之后每隔
+ *       SCAN_MOVE_MS + SCAN_HOLD_MS 用掩码【只改 ID4】换一个角度:
+ *           ID4 = SCAN基准 + 0  →  SCAN基准 - SCAN_ID4_DELTA
+ *                                →  SCAN基准 + SCAN_ID4_DELTA
+ *       每个角度停 SCAN_HOLD_MS 给 K230 拍照识别; 期间它若回了 SCAN_OK
+ *       就立刻结束本状态(不会白等三个角度走完)。
+ * 调参: 还扫不到 → 加大 SCAN_ID4_DELTA(如 30~40) 或 SCAN_HOLD_MS(如 1200);
+ *       嫌慢     → 减 SCAN_HOLD_MS, 或把 SCAN_MOVE_MS 调到 300。
+ * 总耗时 ≈ 3 × (SCAN_MOVE_MS + SCAN_HOLD_MS) ≈ 3.9s, 远小于
+ *         QR_WAIT_TIMEOUT_MS(20s), 不会把整个扫码环节拖到超时。 */
+#define SCAN_ID4_DELTA          40     /* 每个角度相对 SCAN 姿态偏移多少码(4096=360°) */
+#define SCAN_MOVE_MS            500    /* 换角度时 ID4 的转动时间(ms) */
+#define SCAN_HOLD_MS            800    /* 每个角度到位后停留多久(ms), 给 K230 识别 */
+
 /* ================= 视觉精对准过程时序 (ms) ================= */
 #define FINE_TUNE_COOLDOWN_MS   800    /* 每次修正动作后的冷却时间:
                                         * 期间忽略 K230 新帧, 避免指令叠车。
@@ -132,8 +149,10 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
                                          * 建议 10~20。原来 35 → 只能左右荡 */
 #define MAX_MOVE_MM         60          /* 单次修正的最大距离(mm), 防止一开始误差很大时一下
                                          * 冲太远。建议 40~100。原来 120 */
-#define ALIGN_TOLERANCE     50          /* 判定“已对准”的像素误差容差。
-                                         * 建议 30~80。越小对准越准但越难达成(可能超时) */
+#define ALIGN_TOLERANCE     50          /* 【底盘阶段(球/桶/救援)】判定“已对准”的像素容差。
+                                         * 建议 30~80。越小对准越准但越难达成(可能超时)
+                                         * ⚠️ 打靶不走这里: 它用 TARGET_ALIGN_TOLERANCE(20),
+                                         *    且每个阶段的实际容差放在 AlignAxisCfg_t::tol_px */
 
 /* ---- ⭐ 前后(F/B)方向的【独立】步长 (2026-10-04 新增) ----
  * 为什么要单独给一套:
@@ -255,6 +274,72 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 /* ---- 【方案一】动底盘专用: L/R 时车前进/后退的距离(mm) ---- */
 #define RESCUE_ADJUST_MM        15      /* 建议 20~80 */
 
+/* =====================================================================
+ * ⭐⭐ 救援“搜目标”: ID1 慢速巡视 (2026-10-06 新增)
+ * ---------------------------------------------------------------------
+ * 【为什么】救援时底盘【完全不动】, 只有底座 ID1 能动。如果人质一开始不在
+ *   画面里, 光发 run_task 干等可能一直等不到 → 最后只能超时盲抓。
+ *   先让 ID1 把周围扫一遍, 命中的概率大很多。
+ * 【巡视顺序】(相对 HOSTAGE_LOOK 的 ID1 偏移)
+ *       中间(0)  →  右(+A)  →  左(-A)  →  中间(0)
+ *   每个点位: 先用 RESCUE_SWEEP_MOVE_MS 慢慢转过去, 再停 RESCUE_SWEEP_HOLD_MS
+ *   给 K230 拍照识别。全程【只动 ID1】(掩码 SERVO_MASK_ID1), ID2~ID5 不动。
+ * 【中止条件】巡视期间只要 K230 回【任何一行】, 立刻中止巡视, 把那一行原样
+ *   交给正常流程处理:
+ *       C        → 已对准 → 停稳后抓取
+ *       L / R    → 按原来的小步转 ID1 逻辑继续对准(和以前完全一样)
+ *       D:<x>,<y>→ 认为“已发现目标”, 用 x 小步把 ID1 修到中心
+ *                  (|x| < RESCUE_ID1_ALIGN_TOL 就算对准) → 抓取
+ *   对准完成后统一走【示教好的抓取姿态】(侧别由 ID1 累计偏移量决定)。
+ * 【扫完一圈没回应】回到中间, 继续原来的“发 run_task:4 等 C/L/R”。
+ * 【调参】视野不够 → 加大 RESCUE_SWEEP_ANGLE; 嫌慢 → 减 MOVE/HOLD;
+ *         不要这个功能 → RESCUE_SWEEP_ENABLE = 0 */
+#define RESCUE_SWEEP_ENABLE     1
+#define RESCUE_SWEEP_ANGLE      300     /* 左右各扫多少码(4096 码 = 360°, 300 码 ≈ 26°) */
+#define RESCUE_SWEEP_MOVE_MS    1500    /* 挪到下一个角度的转动时间(值大 = 慢 = 画面不糊) */
+#define RESCUE_SWEEP_HOLD_MS    800     /* 每个角度停多久给 K230 识别 */
+#define RESCUE_ID1_ALIGN_TOL    30      /* 收到 D:x,y 时, |x| < 它就算对准(像素容差) */
+
+/* ---- ⭐ 救援“抓取位三选一” (2026-10-06 新增) -------------------------
+ * 背景: 救援时底盘【完全不动】(HOSTAGE_LOOK 姿态下, 车和臂正好在三个目标
+ *   物的中间), 靠底座 ID1 小步转对准人质。人质偏哪边, ID1 就往哪边多转一点,
+ *   而夹爪的【抓取姿态】如果只有一套, 转得多了就抱不准/抱不到。
+ * 做法: 按 ID1 的【累计偏移量】选一侧(左/中/右), 然后每侧各有
+ *   【抓取 / 抱紧 / 抬起】三个姿态, 共 9 个(姿态本体在 s_arm_pose_table 的
+ *   HOSTAGE_GRAB_{L,M,R}[_CLOSE|_LIFT], 用示教模式挨个标定):
+ *     |偏移| ≤ RESCUE_GRAB_MID_RANGE            → 用中间那 3 个
+ *     偏移与 RESCUE_GRAB_LEFT_SIGN 同号且超范围 → 用左边那 3 个
+ *     否则                                      → 用右边那 3 个
+ * 调参:
+ *   ① 多大算“居中”  → 改 RESCUE_GRAB_MID_RANGE (★ 已按实测示教值标定为 200)
+ *
+ * ⭐⭐ 2026-10-06 按实测示教值标定 RESCUE_GRAB_MID_RANGE -----------------
+ *   用户示教量出的三个抓取姿态(ID1~ID5):
+ *       中间抓取  1201, 754,1626,1669, 120
+ *       左边抓取   791, 390,1889,1979, 121
+ *       右边抓取  1582, 515,1791,1909, 121
+ *   ⇒ 三个姿态的 ID1 分别是 791 / 1201 / 1582, 以【中间】为原点:
+ *        左抓取位 = 1201 - 410 = 791   (偏移 -410 码对应“左”)
+ *        右抓取位 = 1201 + 381 = 1582  (偏移 +381 码对应“右”)
+ *   ⇒ “离哪个姿态近就用哪个”的分界点:
+ *        左/中 分界 = (0 + 410)/2 = 205 码
+ *        中/右 分界 = (0 + 381)/2 = 190 码
+ *      两边差不多, 统一取 200(误差 ±10 码 ≈ 0.9°, 对抓取没影响)。
+ *   ⚠️ 原来的 60 是【错的】: RESCUE_ID1_STEP=60, 所以 ID1 只要转过 1 步
+ *      (偏移 60 码)就会去用“按 -410 码标定的左边抓取位” —— 姿态差了 350 码
+ *      (≈31°), 夹爪根本够不到人质。
+ *   ⚠️ 以后重新示教、三个姿态的 ID1 变了, 按同样方法重算本值即可:
+ *      取【两个相邻抓取位 ID1 差值的一半】中较小的那个。
+ *   ② 左右用反了    → 只改 RESCUE_GRAB_LEFT_SIGN 的符号, 别动别的 */
+#define RESCUE_GRAB_MID_RANGE   200     /* ±角度码: |ID1 偏移| ≤ 它 → 用中间抓取位
+                                         * (由三个示教抓取位的 ID1 差值取半得出) */
+
+/* ⭐ 偏移超过这么多码 ⇒ 已超出所有示教抓取位的覆盖范围, 只提示不改变行为。
+ * 依据: 左右抓取位分别标定在 -410 / +381 码处, 再多就都是“最远姿态”硬凑了。 */
+#define RESCUE_GRAB_FAR_WARN    420
+#define RESCUE_GRAB_LEFT_SIGN (-1)      /* 偏移与它同号 ⇒ 人质偏“左” ⇒ 用左抓取位。
+                                         * 默认与 RESCUE_ID1_LR_SIGN 同号(-1) */
+
 /* ---- K230 run_task 编号(与 yolo_main3.py handle_command 对齐) ---- */
 #define K230_TASK_BALL      1   /* 球: 抓取小球(排爆第一步) */
 #define K230_TASK_TARGET    2   /* 靶: 打靶 */
@@ -274,18 +359,34 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * ⚠️ 若实测转反了, 只改 TARGET_ID1_LR_SIGN 的符号即可, 别动别的。 */
 /* ⭐⭐ 横向(ID1)自适应步长 —— 2026-10-06 实测定版
  * 实测换算: 60 码 ≈ 107px(日志: x=-57px 转 +60 码后 下一帧变成 x=+50px)
- * ⚠️ 为什么必须自适应: K230 的容差窗口只有 ±50px(总宽 100px), 而 60 码一步就能
- *    改 107px —— 误差 ±57px 时一步直接跨到另一边 ±50px, 于是永远在窗口边界
- *    来回摆(日志里 393/333 反复 7 次就是这个原因), 根本收敛不了。
+ *          ⇒ 1 码 ≈ 1.78px
+ * ⚠️ 为什么必须自适应: 60 码一步就能改 107px, 而判定窗口只有 ±TARGET_ALIGN_TOLERANCE
+ *    (K230 已从 ±50px 收紧到 ±20px, 总宽只剩 40px) —— 一律用 60 码会在窗口两边
+ *    来回摆(旧日志里 393/333 反复 7 次就是这个原因), 根本收敛不了。
  * 分档(误差大走大步求快, 误差小走小步求稳):
  *    |x| > TARGET_ID1_STEP_BIG_PX(200) → TARGET_ID1_STEP(60 码 ≈ 107px)
- *    |x| > TARGET_ID1_STEP_MID_PX(100) → 一半(30 码 ≈ 53px)
- *    否则                              → TARGET_ID1_STEP_FINE(20 码 ≈ 36px)
- * ⚠️ TARGET_ID1_STEP_FINE 换算出的 px 必须 < 容差半宽(50px), 否则还是会跨过
- *    中心来回摆。—— 想再稳一点就继续减 FINE, 想再快就加大 BIG/MID 两档。 */
+ *    |x| > TARGET_ID1_STEP_MID_PX(50)  → 一半(30 码 ≈ 53px)
+ *    否则                              → TARGET_ID1_STEP_FINE(10 码 ≈ 18px)
+ * ⚠️ 硬约束: TARGET_ID1_STEP_FINE 换算出的 px(≈18px) 必须 < 窗口半宽(20px),
+ *    否则永远跨过中心来回摆。想再稳就继续减 FINE, 想再快就加大 BIG/MID 两档。 */
 #define TARGET_ID1_STEP_BIG_PX   200    /* 超过这么多 px 才用大步 */
-#define TARGET_ID1_STEP_MID_PX   100    /* 超过这么多 px 用中步 */
-#define TARGET_ID1_STEP_FINE     20     /* 小步(≈36px < 50px, 一定落进容差) */
+#define TARGET_ID1_STEP_MID_PX   50     /* 超过这么多 px 用中步(原来 100, 随窗口收紧改小) */
+#define TARGET_ID1_STEP_FINE     10     /* 小步(≈18px < 20px, 一定落进容差) */
+
+/* =====================================================================
+ * ⭐⭐ 打靶专用判定容差 (2026-10-06 新增, 适配 K230 收紧到 ±20px)
+ * ---------------------------------------------------------------------
+ * K230(yolo_main.py) 把【任务2 打靶】的对准判定从 |dx|,|dy| < 50px 改成了
+ * < 20px; 其他任务(球/桶/形状)的容差没变, 仍然是 50px。
+ * ⚠️ 所以本机也必须跟着改成 20:
+ *    本机是靠“|误差| ≥ 容差就再动一步”来推进的。若本机还用 50, 则误差在
+ *    20~50px 这段时本机认为“已经够准了、不再动舵机”, 而 K230 认为还没对准、
+ *    一直在发 D 帧 —— 两边干等到 K230 的 12s 自超时, 它只回 OK 不点激光。
+ * ⚠️ 容差收紧后【步长也必须跟着变小】: 窗口总宽只有 40px, 一步改 100px 就会
+ *    在窗口两边来回摆。所以同时改了 TARGET_ID1_STEP_MID_PX / _FINE 和
+ *    TARGET_ID4_STEP(见各自注释)。
+ * ===================================================================== */
+#define TARGET_ALIGN_TOLERANCE  20      /* 打靶: |dx|,|dy| 都 < 它才算对准(与 K230 一致) */
 
 #define TARGET_ID1_STEP         60      /* 每收到一次 L/R, 底座 ID1 转多少角度码。
                                          * 4096 码 = 360°, 所以 1° ≈ 11.4 码,
@@ -323,8 +424,9 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * ⭐⭐ 打靶精对准第二轴: 用 ID4(腕部) 修【竖直误差 dy】 (2026-10-06 新增)
  * ---------------------------------------------------------------------
  * 【为什么需要】
- *   K230(yolo_main.py)判定“打靶对准成功”的条件是【|dx|<50px 且 |dy|<50px】,
- *   只有判定成功它才会 fire_start() 点激光 + 发 "FIRE"。
+ *   K230(yolo_main.py)判定“打靶对准成功”的条件是【|dx|<20px 且 |dy|<20px】
+ *   (2026-10-06 起 K230 已从 50px 收紧到 20px; 单片机用 TARGET_ALIGN_TOLERANCE
+ *    同步跟随), 只有判定成功它才会 fire_start() 点激光 + 发 "FIRE"。
  *   而底座 ID1 只能修横向 dx —— 竖直 dy 没人管 ⇒ K230 永远等不到“成功”
  *   ⇒ 只能等它自己 12s 自超时发一个 OK(而 FIRE_ON_TIMEOUT=False ⇒ 不点激光)。
  *   (2026-10-06 实测日志就是这现象: x=0 刷了十几次一直不发 FIRE)
@@ -342,9 +444,25 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * ===================================================================== */
 #define TARGET_FIX_DY_WITH_ID4  1       /* 1=打靶精对准用 ID4 修 dy【当前】;
                                          * 0=只修 dx(回到旧行为, 此时激光不会发) */
-#define TARGET_ID4_STEP         40      /* 每收到一帧, ID4 转多少角度码(4096码=360°)。
-                                         * 建议 20~60: 太大→一步冲过头来回摆;
-                                         * 太小→修得慢, 可能超过 K230 的 12s 自超时 */
+/* ⭐⭐ 竖直轴(ID4)自适应步长 (2026-10-06) --------------------------------
+ * 现象: 用户实测“横向 ID1 动得很合适, 但 ID4 动少了” —— 说明 ID4 的
+ *       【px/码】比 ID1 小(转同样的码数, 画面竖直方向变位更小),
+ *       所以小误差时一步改不了多少, 要转很多步; 而 K230 只有 12s 自超时。
+ * 做法: 和 ID1 一样分两档 —— 误差大走大步(快), 误差小走小步(稳):
+ *      |y| > TARGET_ID4_STEP_FAR_PX(100) → TARGET_ID4_STEP_FAR(40 码)
+ *      否则                              → TARGET_ID4_STEP(25 码)
+ * ⚠️ 唯一必须守的硬约束: 小步换算出的 px 必须 < 窗口半宽(20px),
+ *    否则会永远跨过中心来回摆。—— 实测 20 码“动少了” ⇒ 20 码改的 px
+ *    明显小于 20px ⇒ 改成 25 码同样安全(2026-10-06 已按此改), 可以放心用。
+ * 怎么定准(跑一次看这行日志):
+ *   [靶][竖直轴变化] 上一步 ID4 转 25 码后, |y| ..px -> ..px (变化 ..px)
+ *    一步改的 px:  < 8px → 太小, 继续加大(30~40)
+ *                  10~25px → 正合适
+ *                  > 30px → 太大(接近整个窗口), 必须减到 20 以下
+ * 不想分档就把 TARGET_ID4_STEP_FAR 改成和 TARGET_ID4_STEP 一样即可。 */
+#define TARGET_ID4_STEP         30      /* 小步(误差小时用, 决定能否收敛进 ±20px) */
+#define TARGET_ID4_STEP_FAR_PX  100     /* 超过这么多 px 算“离得远”, 换大步 */
+#define TARGET_ID4_STEP_FAR     40      /* 大步(仅大误差时用; 目的是少走几步赶在 12s 内) */
 #define TARGET_ID4_DY_SIGN    (-1)      /* dy>0(目标偏画面下)时 ID4 的增量符号:
                                          *  -1 = 数值减小(往下低) ★正确值
                                          *  +1 = 数值增大(往上抬) —— 装配反了才用 */
@@ -365,6 +483,13 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *            设太大 → 白等。 */
 #define K230_FIRE_GRACE_MS      1500
 
+/* ⭐ 收到 K230 的 "OK" 之后, 【保持当前对准姿态】这么久再抬臂。
+ * 为什么需要: 激光是 K230 在它判“对准成功”那一刻自己点亮的, 而抬臂会【立刻】
+ *   改变摄像头/激光的朝向 —— 实测“刚收到 OK 就抬臂”时激光只闪了一下,
+ *   靶上打不出稳定的点。
+ * 取值/推荐: 2000~4000(默认 3000)。设小→激光照得短; 设大→白耗时。 */
+#define TARGET_FIRE_HOLD_MS     3000
+
 /* ⭐ 打靶两轴标定(mode 6)专用: 1 = 只标竖直轴(ID4), 横向(ID1)完全不动。
  * 用途: ID1 标好之后, 单独标 ID4 的符号 / 步长。
  * ⚠️ K230 每帧只发“误差大的那一个轴”, 所以用本项时必须【人工把靶子横向
@@ -379,8 +504,9 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *    ID1 = 底座(左右转)      ID4 = 腕部(俯仰): 数值【小=往下低 / 大=往上抬】
  *    K230 误差定义:  x = 画面中 - 目标x  → x>0 = 目标偏【画面左】
  *                   y = 目标y - 画面中  → y>0 = 目标偏【画面下】
- *    K230 判“对准成功”的条件: |dx|<50px 且 |dy|<50px(两者都要满足!),
+ *    K230 判“对准成功”的条件: |dx|<20px 且 |dy|<20px(两者都要满足!),
  *    只有判成功它才会 fire_start() 点激光并发一行 "FIRE"。
+ *    (2026-10-06 从 50px 收紧; 单片机侧对应 TARGET_ALIGN_TOLERANCE)
  * =====================================================================
  * ① 竖直轴 ID4 —— 方向(TARGET_ID4_DY_SIGN)
  *    推导: y>0(目标偏下) → 视线要往下低 → ID4 减小 → 增量取负 ⇒ 符号 = -1
@@ -390,11 +516,13 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *          判定: |y| 越修越小 = 方向对; 越修越大(-120→-200) 就把符号取反。
  *    ★当前 TARGET_ID4_DY_SIGN = -1 就是正确值。
  * ---------------------------------------------------------------------
- * ② 竖直轴 ID4 —— 步长(TARGET_ID4_STEP)
- *    看上面那行“变化 40px”:
- *      一步只改很少像素(如 40 码才改 10px) → 加大 TARGET_ID4_STEP
- *      一步就冲过头(如 -120 变成 +150)      → 减小 TARGET_ID4_STEP
- *    目标手感: 让“一步的 px 变化 ≈ 当前误差的 1/3”, 3~5 步内收敛。
+ * ② 竖直轴 ID4 —— 步长(TARGET_ID4_STEP / _FAR / _FAR_PX)
+ *    看上面那行“变化 xx px”, 它打的是【上一步实际转的码数】:
+ *      一步只改很少像素(如 25 码才改 8px) → 两步都加大(小步 30~40, 远步 50~60)
+ *      一步就冲过头(如 -120 变成 +150)      → 减小, 且【小步必须 < 20px】
+ *    经验: 大误差用大步(快), 小误差用大步会在 ±20px 窗口里来回摆 ——
+ *    所以“能否收敛”只看【小步】的 px, “快不快”看【远步】。
+ *    目标手感: 让“小步的 px 变化 ≈ 10~25px”, 2~4 步内收敛。
  * ---------------------------------------------------------------------
  * ③ 水平轴 ID1 —— 方向(TARGET_ID1_LR_SIGN)
  *    看日志: [靶] 精对准[横向] x=-80px (x>0=偏左) -> ID1 转 +60 码
@@ -409,7 +537,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * ---------------------------------------------------------------------
  * 【标定成功的标志】日志按顺序出现:
  *      [靶] 精对准[横向] x=..px -> ID1 转 ..码      (或 [竖直] ID4)
- *      [靶] 两轴都已在容差(50px)内 (x=.., y=..), 等 K230 回 OK/FIRE
+ *      [靶] 两轴都已在容差(20px)内 (x=.., y=..), 等 K230 回 OK/FIRE
  *      [靶] K230 已发射激光(FIRE)                    ← 激光真亮了
  *      [靶] 精对准完成(收到OK, 共微调N步) -> 摆发射位
  *      [靶] 打靶收尾(收到OK -> 抬起大臂 -> 收回手臂)
@@ -429,18 +557,18 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * ===================================================================== */
 
 /* ---------- 阶段一: 扫码区走位 ---------- */
-#define ROUTE_1_TO_QR_MM            625//622    /* 起点 → 二维码扫描点(直行) */
+#define ROUTE_1_TO_QR_MM            638//622    /* 起点 → 二维码扫描点(直行) */
 #define ROUTE_3_LEFT_A_MM           557//563    /* 扫码后左移 A 段 */
 #define ROUTE_4_DIAG_FWD_MM         110//111 97     /* 左上斜跑: 前进分量(≈45°斜走) */
 #define ROUTE_4_DIAG_LEFT_MM        110//111 97     /* 左上斜跑: 左移分量(≈45°斜走) */
 
 /* ---------- 过斜坡段 ---------- */
-#define ROUTE_5_TO_RAMP_MM          892    /* 斜坡前直行距离 */
-#define ROUTE_7_LEFT_B_MM           875//450    /* 左移 B 段 */
+#define ROUTE_5_TO_RAMP_MM          898    /* 斜坡前直行距离 */
+#define ROUTE_7_LEFT_B_MM           867//875//450    /* 左移 B 段 */
 #define ROUTE_7_LEFT_C_MM           403    /* 左移 C 段 */
 
 /* ---------- 排爆区走位 ---------- */
-#define ROUTE_8_TO_BOMB_AREA_MM     995//988//940    /* 直行进入排爆区 */
+#define ROUTE_8_TO_BOMB_AREA_MM     1001//988//940    /* 直行进入排爆区 */
 #define ROUTE_8B_RIGHT_MM           660//620    /* 右移微调 */
 #define ROUTE_9_TURN_DEG            (0.1)  /* 转向排爆点(相对角度, 负=右转) */
 #define ROUTE_9A_LEFT_MM            0      /* 转向后左移微调 */
@@ -452,7 +580,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 #define ROUTE_12_P1_B_MM            850    /* ⭐ 打靶第 2 段右移(mm): 航向校正完再右移这么多 */
 #define ROUTE_12_P1_C_MM            400    /* (未使用: MOVE_C 改成只摆 TARGET_LOOK, 不再走位) */
 #define ROUTE_12_TURN_A_DEG         400    /* (未使用: TURN_A/TURN_B 已不在流程里) */
-#define ROUTE_12_P2_A_MM            660/*700*/    /* ⭐ 打靶结束后的收尾右移距离(mm):
+#define ROUTE_12_P2_A_MM            640/*700*/    /* ⭐ 打靶结束后的收尾右移距离(mm):
                                             * 打完靶、手臂收回 SCAN_RESET 之后右移这么多,
                                             * 再航向校正一次就进入救援阶段 */
 #define ROUTE_12_P2_B_MM            200    /* (已废弃) */
@@ -476,7 +604,11 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *  ①后退 ROUTE_14_TO_HOSTAGE_MM → ②航向校准 → ③停等 RESCUE_STOP_WAIT_MS
  *  → ④摆 HOSTAGE_LOOK → ⑤视觉对准 + 抓取
  *  → ⑥后退 ROUTE_17_RIGHT_B_MM → ⑦航向校准
- *  → ⑧后退 ROUTE_18_RIGHT_C_MM → ⑨航向校准 → ⑩停下 */
+ *  → ⑧后退 ROUTE_18_RIGHT_C_MM → ⑨航向校准 → ⑩停下
+ *  ⭐ ⑤ 抓取 (2026-10-06): 底盘不动, 靠底座 ID1 小步转对准人质; 对准完
+ *     (收到 C, 或步数/时长超时兜底)按 ID1 的【累计偏移量】选左/中/右一侧,
+ *     再执行该侧的【抓取 → 抱紧 → 抬起】三个姿态(共 9 个姿态, 待示教标定,
+ *     见 Arm_Start_Rescue_Grab / Arm_Start_Rescue_Retract)。 */
 #define ROUTE_16_RIGHT_A_MM         300    /* (未使用: 该状态已改成“只摆 HOSTAGE_LOOK”) */
 #define ROUTE_17_RIGHT_B_MM         600    /* ⭐ 抓完后第 1 段后退(mm) */
 #define ROUTE_18_RIGHT_C_MM         600    /* ⭐ 抓完后第 2 段后退(mm) */
@@ -507,8 +639,8 @@ static uint16_t s_arm_pose_table[ARM_POSE_COUNT][SERVO_COUNT] = {
     {  212,  656,1760, 2175, 93  },   /* SCAN          扫码: 车停稳后伸臂给摄像头 */
     {  222, 1843, 878, 1834, 93  },   /* SCAN_RESET    扫码之后复位: 扫到码后把机械臂收回 */
     {  232, 1661,1359,  920, 93  },   /* BALL_LOOK     看球: 摄像头对准小球(抓球前对准) */
-    {  228,  452,1855, 1400, 93  },  /* BALL_PRE       抓夹移动到小球前 */
-    {  228,  452,1855, 1400, 600 },   /* BALL_CLOSE    夹爪夹紧小球 */
+    {  228,  452,1855, 1480, 93  },  /* BALL_PRE       抓夹移动到小球前 */
+    {  228,  452,1855, 1480, 600 },   /* BALL_CLOSE    夹爪夹紧小球 */
     {  232, 1160,1795, 1748, 600 },   /* BALL_LIFT     抓到小球后大臂抬起 */
     { 2243,  886,1872, 1650, 600 },   /* BUCKET_CARRY  携带姿态: 端着球, 底盘移动到另一侧 */
     { 2243, 1369,1324, 1321, 600 },   /* BUCKET_LOOK   看桶: 摄像头对准球桶(放置前对准) */
@@ -519,11 +651,53 @@ static uint16_t s_arm_pose_table[ARM_POSE_COUNT][SERVO_COUNT] = {
     {  213,  585,1899, 2180, 93  },   /* TARGET_LOOK   识别靶子: 摄像头对准靶子 */
     {  213,  565,1889, 2175, 93  },   /* TARGET_FIRE   激光发射位 */
     {  222, 1843, 878, 1834, 93  },   /* TARGET_LIFT   发射完激光后大臂抬起(与 LOOK 同值) */
-    { 1241, 1637,1411, 1131, 93  },   /* HOSTAGE_LOOK  识别人质: 摄像头对准人质 */
+    { 1241, 1711,1623,  870, 93  },   /* HOSTAGE_LOOK  识别人质: 摄像头对准人质 */
     { 1198,  484,1868, 1754, 93  },   /* HOSTAGE_PRE   机械臂准备抱人质 */
     { 1190,  484,1868, 1754, 600 },   /* HOSTAGE_CLOSE 抱紧人质 */
-    { 1190, 1892,1040, 2037, 600 }    /* HOSTAGE_LIFT  抱起人质后大臂抬起 */
+    { 1190, 1892,1040, 2037, 600 },   /* HOSTAGE_LIFT  抱起人质后大臂抬起 */
+    /* ⭐ 救援抓取位(三选一, 2026-10-06 新增) —— 初值全部 = HOSTAGE_PRE,
+     *    ⇒ 改装后行为与以前【完全一致】, 不影响现有比赛流程。
+     *    用示教模式(长按 KEY2 进入, KEY2 切到该姿态, KEY1 读出当前值)标定:
+     *      GRAB_L: 人质偏左  (ID1 偏移 ≥ +RESCUE_GRAB_MID_RANGE)
+     *      GRAB_M: 人质居中  (|ID1 偏移| ≤ RESCUE_GRAB_MID_RANGE)
+     *      GRAB_R: 人质偏右  (ID1 偏移 ≤ -RESCUE_GRAB_MID_RANGE)
+     *    ⚠️ 这三行只决定【抓取姿态】; 合夹爪时 ID5 会自动按 HOSTAGE_PRE→
+     *       HOSTAGE_CLOSE 的差值 +507 变成闭合值(见 Arm_Start_Rescue_Grab)。
+     *    ⚠️ 第 5 列(ID5)留 93 就行: 示教时舵机是卸力的, 读出的 120/121 是
+     *       夹爪“张开”的机械位置; 写 93 时 93+507=600(正好是闭合上限),
+     *       写 120 时 120+507=627 会被限幅成 600 —— 两者结果完全一样。 */
+    {  791,390,1889,1979, 93  },   /* HOSTAGE_GRAB_L 抓取位[左] */
+    { 1201,754,1626,1669, 93  },   /* HOSTAGE_GRAB_M 抓取位[中] */
+    { 1582,515,1791,1909, 93  },   /* HOSTAGE_GRAB_R 抓取位[右] */
+    /* ⭐ 各方向的【抱紧】与【抬起】(2026-10-06 新增, 待示教填入) ----------
+     * 初值来源(保证与拆成 9 个之前的行为完全一致):
+     *   GRAB_x_CLOSE = GRAB_x + (HOSTAGE_CLOSE - HOSTAGE_PRE)
+     *                  = {ID1-8, ID2, ID3, ID4, ID5+507}
+     *   GRAB_x_LIFT  = HOSTAGE_LIFT = {1190,1892,1040,2037,600}
+     * 示教方法: 先让臂摆到 GRAB_x(可以进示教模式手动掰), 合上夹爪后
+     *   KEY1 读出 → 填 GRAB_x_CLOSE; 再抱起人质读一次 → 填 GRAB_x_LIFT。
+     * ⚠️ 抱紧行通常只比抓取行多一个“ID5 由 93 → 600”, 其余 4 个列最好相同
+     *    (差得多了会在合夹爪的那一瞬间把已经对准的位置带偏)。
+     * ⚠️ 若实测“抱紧/抬起”的整臂动作很大, 记得把下面 s_arm_pose_time 里
+     *    对应行的时间从 2000/2500 调大(如 3000), 否则会抰得太猛。 */
+    {  791,390,1889,1979, 600 },   /* HOSTAGE_GRAB_L_CLOSE 抱紧[左] */
+    { 1201,754,1626,1669, 600 },   /* HOSTAGE_GRAB_M_CLOSE 抱紧[中] */
+    { 1582,515,1791,1909, 600 },   /* HOSTAGE_GRAB_R_CLOSE 抱紧[右] */
+    { 820,882,1736,1964, 600 }, /* HOSTAGE_GRAB_L_LIFT  抬起[左] */
+    { 1247,1273,1457,1863, 600 }, /* HOSTAGE_GRAB_M_LIFT  抬起[中] */
+    { 1595,836,1983,1810, 600 },  /* HOSTAGE_GRAB_R_LIFT  抬起[右] */
+    /* ⭐ 救援回程姿态 (2026-10-06 新增, 用户示教值)
+     *   抱起人质 + 大臂抬起之后执行这张, 把臂收到“适合带着人质后退”的位置,
+     *   三个方向共用(见 Arm_Start_Rescue_Return)。 */
+    { 1311,1753,1205,1656, 600 }  /* HOSTAGE_RETURN 抱起后回程姿态 */
 };
+
+/* ⭐ 每个舵机的【物理行程限幅】(角度码) —— 只给上面的抓取位做安全钳位用。
+ * 来源: 姿态表上方的实测注释
+ *       (id2 50~2300  id3 700~3100  id4 900~3010  id5 25张开~600闭合;
+ *        底座 ID1 不限, 按 0~4095)。 */
+static const uint16_t s_servo_pos_min[SERVO_COUNT] = {    0,   50,  700,  900,  25 };
+static const uint16_t s_servo_pos_max[SERVO_COUNT] = { 4095, 2300, 3100, 3010, 600 };
 
 /* ⭐ 每个姿态的“运动时间”(ms): 从上一个姿态走到本姿态用多久。
  *   值大 = 慢而稳; 值小 = 快但容易抖/过冲。想单独调某个动作就改对应行。
@@ -554,7 +728,20 @@ static uint16_t s_arm_pose_time[ARM_POSE_COUNT] = {
     2500,   /* HOSTAGE_LOOK  识别人质 */
     2500,   /* HOSTAGE_PRE   准备抱人质 */
     2000,   /* HOSTAGE_CLOSE 抱紧(只有夹爪动) */
-    2500    /* HOSTAGE_LIFT  抱起抬起 */
+    2500,   /* HOSTAGE_LIFT  抱起抬起 */
+    2500,   /* HOSTAGE_GRAB_L 抓取位[左](同 PRE 的 2500) */
+    2500,   /* HOSTAGE_GRAB_M 抓取位[中] */
+    2500,   /* HOSTAGE_GRAB_R 抓取位[右] */
+    2000,   /* HOSTAGE_GRAB_L_CLOSE 抱紧[左](同 HOSTAGE_CLOSE 的 2000;
+             * ⚠️ 示教后若这一行整臂动作很大(不只是夹爪), 调大到 3000) */
+    2000,   /* HOSTAGE_GRAB_M_CLOSE 抱紧[中] */
+    2000,   /* HOSTAGE_GRAB_R_CLOSE 抱紧[右] */
+    2500,   /* HOSTAGE_GRAB_L_LIFT  抬起[左](同 HOSTAGE_LIFT 的 2500) */
+    2500,   /* HOSTAGE_GRAB_M_LIFT  抬起[中] */
+    2500,   /* HOSTAGE_GRAB_R_LIFT  抬起[右] */
+    2500    /* HOSTAGE_RETURN       回程姿态(收臂)。
+             * ⚠️ 抱起人质后 ID2 从 1843降到 1753 / ID3 从 878升到 1205,
+             *    带着负载动作, 实测抖就调到 3000。 */
 };
 
 
@@ -563,7 +750,11 @@ static const char *const s_arm_pose_names[ARM_POSE_COUNT] = {
     "HOME", "SCAN", "SCAN_RESET", "BALL_LOOK", "BALL_PRE", "BALL_CLOSE", "BALL_LIFT",
     "BUCKET_CARRY", "BUCKET_LOOK", "PLACE_PRE", "PLACE_OPEN", "PLACE_LIFT",
     "TARGET_READY", "TARGET_LOOK", "TARGET_FIRE", "TARGET_LIFT",
-    "HOSTAGE_LOOK", "HOSTAGE_PRE", "HOSTAGE_CLOSE", "HOSTAGE_LIFT"
+    "HOSTAGE_LOOK", "HOSTAGE_PRE", "HOSTAGE_CLOSE", "HOSTAGE_LIFT",
+    "HOSTAGE_GRAB_L", "HOSTAGE_GRAB_M", "HOSTAGE_GRAB_R",
+    "HOSTAGE_GRAB_L_CLOSE", "HOSTAGE_GRAB_M_CLOSE", "HOSTAGE_GRAB_R_CLOSE",
+    "HOSTAGE_GRAB_L_LIFT", "HOSTAGE_GRAB_M_LIFT", "HOSTAGE_GRAB_R_LIFT",
+    "HOSTAGE_RETURN"
 };
 
 /* 取姿态数组指针(HOME 指向 ServoArm 的上电初始姿态, 保证唯一来源) */
@@ -628,15 +819,15 @@ void ArmAction_SetPositions(uint8_t pose_idx, const uint16_t pos[5])
  * @note   本函数会阻塞主循环数秒; 但底盘闭环在 TIM9 中断里跑, 所以
  *         “先发底盘指令 → 再调本函数”可以让车和臂同时动作, 节省时间。
  */
-void Arm_GotoPose(uint8_t pose_idx)
+/**
+ * @brief  姿态下发的公共实现(给一份位置数组 + 姿态号, 用它自己的运动时间阻塞)
+ * @param  pos      要下发的 5 个舵机位置(不一定等于姿态表里那行, 比如限幅后的副本)
+ * @param  pose_idx 姿态号(只用来取运动时间 / 打日志)
+ */
+static void Arm_GotoPoseBuffer(uint16_t *pos, uint8_t pose_idx)
 {
-    uint16_t *pos = ArmPose_Ptr(pose_idx);
-
-    if (pos == NULL) {
-        MLOG("机械臂: 姿态编号非法 %d", (int)pose_idx);
-        return;
-    }
 #if MISSION_TEST_NO_ARM
+    (void)pos;
     MLOG("机械臂: 跳过姿态 %s (%ums) —— MISSION_TEST_NO_ARM=1, 不驱动舵机",
          ArmAction_GetName(pose_idx), (unsigned)s_arm_pose_time[pose_idx]);
 #else
@@ -650,6 +841,57 @@ void Arm_GotoPose(uint8_t pose_idx)
      * 会读到冻结角度(原地转向会“转不完”→ 车一直自转)。 */
     Mission_Coop_Wait(t + hold_time);
 #endif
+}
+
+/**
+ * @brief  摆到指定姿态(阻塞: 等舵机走完该姿态的运动时间 + hold_time 再返回)
+ * @param  pose_idx  ARM_POSE_* (见 MissionControl.h)
+ * @note   本函数会阻塞主循环数秒; 但底盘闭环在 TIM9 中断里跑, 所以
+ *         “先发底盘指令 → 再调本函数”可以让车和臂同时动作, 节省时间。
+ */
+void Arm_GotoPose(uint8_t pose_idx)
+{
+    uint16_t *pos = ArmPose_Ptr(pose_idx);
+
+    if (pos == NULL) {
+        MLOG("机械臂: 姿态编号非法 %d", (int)pose_idx);
+        return;
+    }
+    Arm_GotoPoseBuffer(pos, pose_idx);
+}
+
+/**
+ * @brief  摆到指定姿态, 但先把每个舵机限幅到【物理行程】内再下发
+ * @note   为什么需要: 救援那 9 个姿态是【用示教模式手工填表】的, 手滑把
+ *         ID5 填成 700(闭合上限 600) 之类会让舵机堵转发热。这里下发前
+ *         逐个限幅到 s_servo_pos_min/max, 超限就打印一行提醒。
+ *         ⚠️ 只给救援抓取那一串用 —— 其余姿态仍走 Arm_GotoPose(原样下发),
+ *             ﹝HOSTAGE_LOOK 的 ID4 实测就是 870, 低于表里标称的 900 下限,
+ *             全局限幅会把已标定好的姿态改掉。
+ */
+static void Arm_GotoPoseClamped(uint8_t pose_idx)
+{
+    uint16_t *src = ArmPose_Ptr(pose_idx);
+    uint16_t  pose[SERVO_COUNT];
+    uint8_t   clipped = 0;
+
+    if (src == NULL) {
+        MLOG("机械臂: 姿态编号非法 %d", (int)pose_idx);
+        return;
+    }
+    for (uint8_t i = 0; i < SERVO_COUNT; i++) {
+        int32_t v = (int32_t)src[i];
+
+        if (v < (int32_t)s_servo_pos_min[i]) { v = (int32_t)s_servo_pos_min[i]; clipped = 1; }
+        if (v > (int32_t)s_servo_pos_max[i]) { v = (int32_t)s_servo_pos_max[i]; clipped = 1; }
+        pose[i] = (uint16_t)v;
+    }
+    if (clipped) {
+        MLOG("机械臂: ⚠ %s 有舵机值超出物理行程(id2 50~2300 / id3 700~3100 / "
+             "id4 900~3010 / id5 25~600), 已限幅后下发 —— 请检查姿态表",
+             ArmAction_GetName(pose_idx));
+    }
+    Arm_GotoPoseBuffer(pose, pose_idx);
 }
 
 /**
@@ -992,6 +1234,77 @@ void Arm_Start_Bomb_Place(void)
     Arm_GotoPoseSplit(ARM_POSE_PLACE_LIFT, SERVO_MASK_ARM_BODY);
 }
 
+/* =====================================================================
+ * ⭐ 扫码“多角度扫描” (2026-10-06 新增)
+ * ---------------------------------------------------------------------
+ * 为什么: 只用一个固定姿态扫码, 遇到反光/角度偏/K230 视野边缘就扫不到。
+ *         用腕部 ID4 微调出 3 个角度轮着扫, 命中率高很多。
+ * 怎么做: 进入 STATE_2 先摆 ARM_POSE_SCAN(其余 4 个舵机保持不动),
+ *         之后每 SCAN_MOVE_MS + SCAN_HOLD_MS 用掩码【只改 ID4】换一个角度:
+ *             ID4 = SCAN + 0  →  SCAN - SCAN_ID4_DELTA  →  SCAN + SCAN_ID4_DELTA
+ *         每个角度停 SCAN_HOLD_MS 让 K230 拍照识别; 期间它若回 SCAN_OK
+ *         就立刻结束本状态(不等三个角度走完)。
+ * 非阻塞: 由 STATE_2 的转移检查每周期驱动(Arm_Scan_Poll), 不占主循环。
+ * ===================================================================== */
+static const int16_t s_scan_id4_off[3] = { 0, -SCAN_ID4_DELTA, +SCAN_ID4_DELTA };
+static uint8_t  s_scan_idx = 0;            /* 已发出的角度序号; >=3 = 已扫完 */
+static uint32_t s_scan_hold_until = 0;     /* 下一个角度最早什么时候可以发 */
+
+/** @brief 扫码开始: 摆好 SCAN 姿态, 并把多角度扫描复位到第 1 个角度 */
+void Arm_Scan_Begin(void)
+{
+    Arm_GotoPose(ARM_POSE_SCAN);           /* 整表下发(阻塞), 其余 4 个舵机就位 */
+    s_scan_idx        = 0;
+    s_scan_hold_until = HAL_GetTick();     /* 允许立刻发第 1 个角度 */
+    MLOG("扫码: 开始多角度扫描 (ID4 偏移 %+d/%+d/%+d, 共 3 个角度, 每个停 %dms)",
+         (int)s_scan_id4_off[0], (int)s_scan_id4_off[1], (int)s_scan_id4_off[2],
+         (int)SCAN_HOLD_MS);
+}
+
+/**
+ * @brief 扫码多角度扫描推进 (非阻塞; 放在 STATE_2 的转移检查里每周期调用)
+ * @note  三个角度都发完后(s_scan_idx >= 3)直接返回, 之后就保持最后一个角度
+ *        继续等 K230 回 SCAN_OK。
+ */
+void Arm_Scan_Poll(void)
+{
+    uint16_t pose[SERVO_COUNT];
+    const uint16_t *scan = s_arm_pose_table[ARM_POSE_SCAN];
+    int32_t v;
+
+    if (s_scan_idx >= 3u) {
+        return;                            /* 三个角度都扫过了 */
+    }
+    if ((int32_t)(HAL_GetTick() - s_scan_hold_until) < 0) {
+        return;                            /* 还在转动/停留中 */
+    }
+
+    for (uint8_t i = 0; i < SERVO_COUNT; i++) {
+        pose[i] = scan[i];                 /* 其余 4 个舵机仍填 SCAN 姿态值 */
+    }
+    v = (int32_t)scan[3] + (int32_t)s_scan_id4_off[s_scan_idx];
+    if (v < 0)    v = 0;
+    if (v > 4095) v = 4095;
+    pose[3] = (uint16_t)v;                 /* [3] = ID4 腕部 */
+
+    MLOG("扫码: 角度 %u/3 (ID4=%d, 偏移 %+d), 停 %dms 给 K230 识别",
+         (unsigned)(s_scan_idx + 1u), (int)pose[3],
+         (int)s_scan_id4_off[s_scan_idx], (int)SCAN_HOLD_MS);
+
+#if MISSION_TEST_NO_ARM
+    MLOG("扫码: MISSION_TEST_NO_ARM=1, 跳过舵机驱动");
+#else
+    Servos_SetPositionsMasked(pose, SERVO_MASK_ID4, SCAN_MOVE_MS);
+#endif
+
+    s_scan_idx++;
+    s_scan_hold_until = HAL_GetTick() + (uint32_t)SCAN_MOVE_MS + (uint32_t)SCAN_HOLD_MS;
+
+    if (s_scan_idx >= 3u) {
+        MLOG("扫码: 3 个角度扫完, 停在最后一个角度继续等 SCAN_OK");
+    }
+}
+
 /** @brief 打靶: 摆到激光发射位(调用后由状态机开激光) */
 void Arm_Start_Target_Fire(void)
 {
@@ -1017,19 +1330,100 @@ void Arm_Start_Target_Lift(void)
     Arm_GotoPoseSplit(ARM_POSE_TARGET_LIFT, SERVO_MASK_ARM_BODY);
 }
 
-/** @brief 救援: 准备抱人质 → 抱紧 */
-void Arm_Start_Rescue_Grab(void)
+/* ⭐ 精对准/微调过程中 ID1(底座) / ID4(腕部) 相对【基准姿态】的累计偏移(角度码)。
+ * 为什么要有这个量:
+ *   ① 打靶 —— 精对准是用“只发 ID1” / “只发 ID4” 的掩码方式微调的, 而最后摆
+ *      发射位是【整表下发】, 会把 ID1/ID4 拉回姿态表标定值 ⇒ 对准白做。
+ *      所以摆发射位时要把偏移叠加回 TARGET_FIRE(见 Target_GotoFirePose)。
+ *   ② 救援 —— 抓取位要根据 ID1 一共转了多少、朝哪边转来三选一
+ *      (见 Rescue_GrabPoseFor / Arm_Start_Rescue_Grab)。
+ * 定义放在这里(而不是文件后半段)是为了让 Arm_Start_Rescue_Grab() 能用;
+ * 且放在条件编译之外, 保证 MISSION_TEST_NO_VISION 下也能编译。 */
+static int32_t s_id1_offset = 0;
+static int32_t s_id4_offset = 0;
+
+/**
+ * @brief  按底座 ID1 的累计偏移量, 判断人质偏哪一侧(0=左 1=中 2=右)
+ * @param  id1_offset ID1 相对基准姿态 HOSTAGE_LOOK 的累计偏移(角度码)
+ * @note   判定规则见上面 RESCUE_GRAB_MID_RANGE 处的注释。
+ *         ID1 一直没转过(偏移=0, 例如超时兜底直接去抓) → 返回中间(1)。
+ *         返回的是【侧别下标】而不是姿态号, 方便下面用同一张表取
+ *         “抓取/抱紧/抬起”三个姿态。
+ */
+static uint8_t Rescue_GrabSideFor(int32_t id1_offset)
 {
-    MLOG("机械臂: 救援抱人质(准备→抱紧)");
-    Arm_GotoPose(ARM_POSE_HOSTAGE_PRE);
-    Arm_GotoPose(ARM_POSE_HOSTAGE_CLOSE);
+    int32_t side = id1_offset * (int32_t)RESCUE_GRAB_LEFT_SIGN;   /* >0 = 偏“左” */
+
+    if (side > (int32_t)RESCUE_GRAB_MID_RANGE)  return 0u;   /* 左 */
+    if (side < -(int32_t)RESCUE_GRAB_MID_RANGE) return 2u;   /* 右 */
+    return 1u;                                              /* 中 */
 }
 
-/** @brief 救援: 抱起人质后抬起 */
+/* 三个方向 × 三个动作 的姿态号查找表(下标 = Rescue_GrabSideFor 的返回值) */
+static const uint8_t s_rescue_grab_pose[3] = {
+    ARM_POSE_HOSTAGE_GRAB_L, ARM_POSE_HOSTAGE_GRAB_M, ARM_POSE_HOSTAGE_GRAB_R
+};
+static const uint8_t s_rescue_close_pose[3] = {
+    ARM_POSE_HOSTAGE_GRAB_L_CLOSE, ARM_POSE_HOSTAGE_GRAB_M_CLOSE, ARM_POSE_HOSTAGE_GRAB_R_CLOSE
+};
+static const uint8_t s_rescue_lift_pose[3] = {
+    ARM_POSE_HOSTAGE_GRAB_L_LIFT, ARM_POSE_HOSTAGE_GRAB_M_LIFT, ARM_POSE_HOSTAGE_GRAB_R_LIFT
+};
+
+/* 本次救援选中的侧别(0=左 1=中 2=右), 给后面的“抬起”用。
+ * 默认 1(中): 万一 Arm_Start_Rescue_Grab 没被调到而先调了 Retract, 也不会乱跑 */
+static uint8_t s_rescue_grab_side = 1u;
+
+/**
+ * @brief  救援: ① 摆到三选一的抓取位 → ② 原位抱紧
+ * @note   ⭐ 拆成两个姿态的原因: 三个方向的抓取姿态差得很大(左/右位 ID1 差
+ *         约 400 码 ≈ 35°, ID2/ID3/ID4 也各不相同), “合夹爪”这一个动作
+ *         在这三个姿态上并不是同一个位置, 用一套会拉回中间位或蹭到车架。
+ *         ⇒ ①GRAB_x / ②GRAB_x_CLOSE / ③GRAB_x_LIFT 各自独立标定。
+ *         ① 用 Arm_GotoPoseClamped 下发(手工填表的值会被限幅保护)。
+ */
+void Arm_Start_Rescue_Grab(void)
+{
+    s_rescue_grab_side = Rescue_GrabSideFor(s_id1_offset);
+
+    MLOG("机械臂: 救援抓取 —— ID1 累计偏移 %+ld 码 -> 用 %s (居中判定 ±%d 码)",
+         (long)s_id1_offset, ArmAction_GetName(s_rescue_grab_pose[s_rescue_grab_side]),
+         RESCUE_GRAB_MID_RANGE);
+    if (s_id1_offset > (int32_t)RESCUE_GRAB_FAR_WARN ||
+        s_id1_offset < -(int32_t)RESCUE_GRAB_FAR_WARN) {
+        MLOG("机械臂: ⚠ ID1 偏移 %+ld 码已超出三个抓取位的覆盖范围(±%d 码) —— "
+             "人质太偏或对准跑飞了, 这次可能抱不准(先查 RESCUE_ID1_LR_SIGN 方向对不对)",
+             (long)s_id1_offset, (int)RESCUE_GRAB_FAR_WARN);
+    }
+
+    /* ① 摆到三选一的抓取位 */
+    Arm_GotoPoseClamped(s_rescue_grab_pose[s_rescue_grab_side]);
+    /* ② 在原位合夹爪抱紧(每个方向一套, 由示教标定) */
+    Arm_GotoPoseClamped(s_rescue_close_pose[s_rescue_grab_side]);
+}
+
+/**
+ * @brief  救援: 抱起人质后抬起(用【本次选中方向】的那一套抬起姿态)
+ * @note   ⚠️ 三个方向的抬起姿态分别标定: 左/右位手臂偏得多, 用同一张
+ *         HOSTAGE_LIFT 会把底座拉回中间 → 抱着人质硬掰回去, 很容易抖掉。
+ */
 void Arm_Start_Rescue_Retract(void)
 {
-    MLOG("机械臂: 人质抱起后抬起");
-    Arm_GotoPose(ARM_POSE_HOSTAGE_LIFT);
+    MLOG("机械臂: 人质抱起后抬起 —— 用 %s (侧别 %u)",
+         ArmAction_GetName(s_rescue_lift_pose[s_rescue_grab_side]),
+         (unsigned)s_rescue_grab_side);
+    Arm_GotoPoseClamped(s_rescue_lift_pose[s_rescue_grab_side]);
+}
+
+/**
+ * @brief  救援: 抱起人质后执行【回程姿态】(三个方向共用)
+ * @note   ⚠️ 顺序是 抓取位 → 抱紧位 → 抬起位 → 回程姿态, 回程姿态之后
+ *         主状态机才发“后退”指令。带着人质动作, 所以用限幅下发。
+ */
+void Arm_Start_Rescue_Return(void)
+{
+    MLOG("机械臂: 切换到回程姿态(收臂, 准备带人质后退)");
+    Arm_GotoPoseClamped(ARM_POSE_HOSTAGE_RETURN);
 }
 
 /**
@@ -1075,9 +1469,9 @@ void Mission_Start(void)
  * @note   前后轴用后面的 Calculate_Move_Distance_FB() —— 它多一层缩放 +
  *         自己的一套 min/max, 因为前后离目标太近, 必须比左右保守。
  */
-static int32_t Calculate_Move_Distance(int pixel_error)
+static int32_t Calculate_Move_Distance(int pixel_error, int tol_px)
 {
-    if (abs(pixel_error) < ALIGN_TOLERANCE) return 0;
+    if (abs(pixel_error) < tol_px) return 0;
     int32_t dist = (int32_t)(abs(pixel_error) * K_GAIN);
     if (dist < MIN_MOVE_MM) dist = MIN_MOVE_MM;
     if (dist > MAX_MOVE_MM) dist = MAX_MOVE_MM;
@@ -1099,14 +1493,13 @@ static int32_t Calculate_Move_Distance(int pixel_error)
 static int32_t s_align_shift_strafe = 0;   /* 正 = 左移累计(mm) */
 static int32_t s_align_shift_fwd    = 0;   /* 正 = 前进累计(mm) */
 
-/* ⭐ 打靶精对准: ID1/ID4 相对【基准姿态】的累计偏移(角度码)。
- * 为什么要单独记: 精对准是用“只发 ID1” / “只发 ID4” 的掩码方式微调的,
- *   而最后摆发射位 ARM_POSE_TARGET_FIRE 是【整表下发】—— 会把 ID1/ID4 拉回
- *   姿态表里的标定值(TARGET_FIRE: ID1=213 / ID4=2175), 精对准白做。
- *   所以摆发射位时要把这两个偏移叠加到 TARGET_FIRE 对应舵机上(见 Target_GotoFirePose)。
- * 定义在条件编译之外, 保证 MISSION_TEST_NO_VISION 下也能编译。 */
-static int32_t s_id1_offset = 0;
-static int32_t s_id4_offset = 0;
+/* ⭐ 精对准累计偏移 s_id1_offset / s_id4_offset 的【定义】已上移到
+ * Arm_Start_Rescue_Grab() 之前(救援要按 ID1 偏移量三选一抓取位)。
+ * 这里只留用途说明:
+ *   打靶精对准是用“只发 ID1” / “只发 ID4” 的掩码方式微调的, 而最后摆发射位
+ *   ARM_POSE_TARGET_FIRE 是【整表下发】—— 会把 ID1/ID4 拉回姿态表里的标定值
+ *   (TARGET_FIRE: ID1=213 / ID4=2175), 精对准白做。所以摆发射位时要把这两个
+ *   偏移叠加到 TARGET_FIRE 对应舵机上(见 Target_GotoFirePose)。 */
 
 /* =====================================================================
  * 精对准“轴向 / 方向 / 步长”配置 (每个阶段一套)
@@ -1141,34 +1534,49 @@ typedef struct {
     uint8_t fb_scale_pct;   /* 前后步长比例(%): 100=同左右, 50=一半 */
     uint8_t fb_min_mm;      /* 前后单步最小距离(mm) */
     uint8_t fb_max_mm;      /* 前后单步最大距离(mm) */
+    uint8_t tol_px;         /* ⭐ 本阶段“判定已对准”的像素容差。
+                             * 球/桶/救援 = ALIGN_TOLERANCE(50);
+                             * 打靶 = TARGET_ALIGN_TOLERANCE(20) —— K230 那边只把
+                             * 打完靶的窗口收紧到了 20px, 本机必须跟它一致, 否则本机
+                             * 会提前认为“够准了不再动舵机”而 K230 一直在发 D 帧,
+                             * 两边干等到 12s 自超时(只回 OK 不点激光)。 */
 } AlignAxisCfg_t;
 
 #if ALIGN_AXIS_SCHEME_1
 /* ---- 方案一(当前): 排爆/打靶 只修横向; 救援 只修前后 ----
  * (球/桶的 allow_fb=0, 所以它们那三行前后步长参数不参与运算) */
-static const AlignAxisCfg_t s_align_ball   = { 1, 0, 0, 0, FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM };
-static const AlignAxisCfg_t s_align_bucket = { 1, 0, 0, 1, BUCKET_FB_SCALE_PCT, BUCKET_FB_MIN_MM, BUCKET_FB_MAX_MM };
+static const AlignAxisCfg_t s_align_ball   = { 1, 0, 0, 0, FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM,
+                                               ALIGN_TOLERANCE };
+static const AlignAxisCfg_t s_align_bucket = { 1, 0, 0, 1, BUCKET_FB_SCALE_PCT, BUCKET_FB_MIN_MM, BUCKET_FB_MAX_MM,
+                                               ALIGN_TOLERANCE };
 #if MISSION_DEBUG_VISION_TASK
 /* 靶: ⚠️ 打靶已改版为“只转底座 ID1”, 不再做 D:x,y 精对准。
  * 本项只给 MISSION_DEBUG_VISION_TASK=2 的单独调试用, 平时包在 #if 里,
- * 免得触发 -Wunused-const-variable 警告 */
-static const AlignAxisCfg_t s_align_target = { 1, 0, 0, 0, FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM };
+ * 免得触发 -Wunused-const-variable 警告。
+ * ⚠️ 容差用 TARGET_ALIGN_TOLERANCE(20): K230 那边任务2 的窗口就是 20px */
+static const AlignAxisCfg_t s_align_target = { 1, 0, 0, 0, FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM,
+                                               TARGET_ALIGN_TOLERANCE };
 #endif
-static const AlignAxisCfg_t s_align_rescue = { 0, 1, 1, 0, FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM };
+static const AlignAxisCfg_t s_align_rescue = { 0, 1, 1, 0, FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM,
+                                               ALIGN_TOLERANCE };
 #else
 /* ---- 方案二: 前后左右都修(方向映射仍按上表); 桶的前后步长单独限小 ---- */
 static const AlignAxisCfg_t s_align_ball   = { 1, 1, 0, 0,
-                                               FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM };
+                                               FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM,
+                                               ALIGN_TOLERANCE };
 static const AlignAxisCfg_t s_align_bucket = { 1, 1, 0, 1,
                                                BUCKET_FB_SCALE_PCT,
                                                BUCKET_FB_MIN_MM,
-                                               BUCKET_FB_MAX_MM };
+                                               BUCKET_FB_MAX_MM,
+                                               ALIGN_TOLERANCE };
 #if MISSION_DEBUG_VISION_TASK
 static const AlignAxisCfg_t s_align_target = { 1, 1, 0, 0,
-                                               FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM };  /* 仅调试用 */
+                                               FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM,
+                                               TARGET_ALIGN_TOLERANCE };  /* 仅调试用 */
 #endif
 static const AlignAxisCfg_t s_align_rescue = { 1, 1, 1, 0,
-                                               FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM };
+                                               FB_SCALE_PCT, FB_MIN_MM, FB_MAX_MM,
+                                               ALIGN_TOLERANCE };
 #endif
 
 /**
@@ -1184,7 +1592,7 @@ static const AlignAxisCfg_t s_align_rescue = { 1, 1, 1, 0,
  */
 static int32_t Calculate_Move_Distance_FB(int pixel_error, const AlignAxisCfg_t *cfg)
 {
-    if (abs(pixel_error) < ALIGN_TOLERANCE) return 0;
+    if (abs(pixel_error) < (int)cfg->tol_px) return 0;          /* 本阶段自己的容差 */
     int32_t dist = (int32_t)(abs(pixel_error) * K_GAIN);
     dist = (dist * (int32_t)cfg->fb_scale_pct) / 100;   /* ① 前后整体缩小 */
     if (dist < (int32_t)cfg->fb_min_mm) dist = (int32_t)cfg->fb_min_mm;
@@ -1333,7 +1741,8 @@ static void Vision_SendTask(uint8_t task, const char *tag, uint32_t *p_last_send
 /**
  * @brief  进入精对准: 发 start_align 并复位计时/冷却
  */
-static void Vision_StartFineAlign(const char *tag, uint32_t *p_state_tick,
+static void Vision_StartFineAlign(const char *tag, const AlignAxisCfg_t *cfg,
+                                  uint32_t *p_state_tick,
                                   uint32_t *p_align_tick, uint32_t *p_cooldown)
 {
     MLOG("视觉[%s]: 请求精对准(发 start_align)", tag);
@@ -1348,7 +1757,7 @@ static void Vision_StartFineAlign(const char *tag, uint32_t *p_state_tick,
     Chassis_Stop();
     /* 把当前实际生效的参数打出来, 方便对照日志调参 */
     MLOG("视觉[%s][K标定] 本轮参数: K_GAIN=%.2f mm/px, MIN_MOVE=%dmm, MAX_MOVE=%dmm, 容差=%dpx",
-         tag, (double)K_GAIN, (int)MIN_MOVE_MM, (int)MAX_MOVE_MM, (int)ALIGN_TOLERANCE);
+         tag, (double)K_GAIN, (int)MIN_MOVE_MM, (int)MAX_MOVE_MM, (int)cfg->tol_px);
 }
 
 /**
@@ -1463,11 +1872,11 @@ static uint8_t Vision_FineAlignProcess(char *line, const char *tag,
             MLOG("视觉[%s][K标定] K230回传画面误差 x=%d y=%d | 换算到车体: 左右=%d 前后=%d px",
                  tag, err_x, err_y, lr_px, fb_px);
 
-            /* 是否已对准: 只看【允许修的那些轴】 */
-            if ((!cfg->allow_lr || abs(lr_px) < ALIGN_TOLERANCE) &&
-                (!cfg->allow_fb || abs(fb_px) < ALIGN_TOLERANCE)) {
+            /* 是否已对准: 只看【允许修的那些轴】(容差取本阶段自己的 tol_px) */
+            if ((!cfg->allow_lr || abs(lr_px) < (int)cfg->tol_px) &&
+                (!cfg->allow_fb || abs(fb_px) < (int)cfg->tol_px)) {
                 MLOG("视觉[%s]: 误差已在容差(%dpx)内 -> 停车稳定 %dms",
-                     tag, (int)ALIGN_TOLERANCE, (int)FINE_TUNE_SETTLE_MS);
+                     tag, (int)cfg->tol_px, (int)FINE_TUNE_SETTLE_MS);
                 KCal_PrintSummary(tag, "误差进容差");
                 Chassis_Stop();
                 *p_settle = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
@@ -1475,9 +1884,9 @@ static uint8_t Vision_FineAlignProcess(char *line, const char *tag,
             }
 
             /* ③ 串行修正: 先左右, 后前后 */
-            if (cfg->allow_lr && abs(lr_px) >= ALIGN_TOLERANCE) {
+            if (cfg->allow_lr && abs(lr_px) >= (int)cfg->tol_px) {
                 int32_t raw = (int32_t)((float)abs(lr_px) * K_GAIN);   /* 未限幅的原始步长 */
-                int32_t d   = Calculate_Move_Distance(lr_px);
+                int32_t d   = Calculate_Move_Distance(lr_px, (int)cfg->tol_px);
                 if (d > 0) {
                     /* ⭐ K_GAIN 标定: 标明这一步有没有被 MIN/MAX 夹住(夹住了就不能拿来算比例) */
                     const char *lim;
@@ -1502,7 +1911,7 @@ static uint8_t Vision_FineAlignProcess(char *line, const char *tag,
                          tag, (long)s_align_shift_strafe);
                     *p_cooldown = HAL_GetTick() + FINE_TUNE_COOLDOWN_MS;
                 }
-            } else if (cfg->allow_fb && abs(fb_px) >= ALIGN_TOLERANCE) {
+            } else if (cfg->allow_fb && abs(fb_px) >= (int)cfg->tol_px) {
                 int32_t d = Calculate_Move_Distance_FB(fb_px, cfg);   /* 前后用独立的小步长 */
                 if (d > 0) {
                     if (fb_px < 0) { Chassis_Move_Backward(d); s_align_shift_fwd -= d; }
@@ -1729,11 +2138,98 @@ static void Rescue_Id1Step(int32_t delta)
                 RESCUE_ID1_MOVE_MS, RESCUE_ID1_POS_MIN, RESCUE_ID1_POS_MAX);
 }
 
+/* =====================================================================
+ * ⭐ 救援搜目标: ID1 慢速巡视 (实现; 思路/调参见上面 RESCUE_SWEEP_* 处的注释)
+ * ===================================================================== */
+
+/* 巡视点位(相对 HOSTAGE_LOOK 的 ID1 偏移, 单位: 角度码)
+ * 顺序: 中间 → 右 → 左 → 中间
+ * “右”= ID1 数值增大的方向 = 与 RESCUE_ID1_LR_SIGN 相反,
+ * 所以写成 -LR_SIGN*A, 以后改 LR_SIGN 不用动这里 */
+static const int32_t s_rescue_sweep_off[4] = {
+    0,
+    (-(int32_t)RESCUE_ID1_LR_SIGN) * RESCUE_SWEEP_ANGLE,
+    (+(int32_t)RESCUE_ID1_LR_SIGN) * RESCUE_SWEEP_ANGLE,
+    0
+};
+
+/**
+ * @brief  把 ID1 挪到“HOSTAGE_LOOK 基准 + offset”处(只动 ID1, 不阻塞等待)
+ * @param  offset  相对基准的偏移(角度码)
+ * @param  move_ms 本步转动时间(巡视要慢, 所以可单独指定)
+ * @note   和 Rescue_Id1Step 的区别: 这个是【绝对点位】(内部反算 delta),
+ *         并且能指定本步转动时间。相对偏移量照样累加到 s_id1_offset,
+ *         所以巡视走完一圈回到中间时, 偏移正好回到 0。
+ */
+static void Rescue_Id1Goto(int32_t offset, uint16_t move_ms)
+{
+    int32_t want  = (int32_t)s_arm_pose_table[ARM_POSE_HOSTAGE_LOOK][0] + offset;
+    int32_t delta = want - (int32_t)s_id1_pos;
+
+    if (delta == 0) {
+        return;      /* 已经在位: 不用发指令(否则会多一次无意义的下发) */
+    }
+    Arm_Id1Step(ARM_POSE_HOSTAGE_LOOK, delta, move_ms,
+                RESCUE_ID1_POS_MIN, RESCUE_ID1_POS_MAX);
+}
+
+/**
+ * @brief  ID1 慢速巡视一圈(阻塞; 一旦收到 K230 数据就立刻停下来)
+ * @param  out_line 输出: 中止时收到的那一行
+ * @param  out_size out_line 的字节数
+ * @retval 1 = 巡视途中收到了 K230 数据(已写入 out_line)
+ *         0 = 扫完一圈啥都没收到(已回到中间)
+ * @note   ⚠️ 会阻塞约 3×(MOVE+HOLD) ≈ 7s; 期间用 Mission_Coop_Wait 等,
+ *         照刷陀螺仪 yaw、照收 K230 行(否则收不到中止条件)。
+ */
+static uint8_t Rescue_SweepOnce(char *out_line, uint16_t out_size)
+{
+    MLOG("[救援] ID1 巡视开始: 中间 -> 右(%+ld) -> 左(%+ld) -> 中间 "
+         "(每点转 %dms + 停 %dms, 只动 ID1)",
+         (long)s_rescue_sweep_off[1], (long)s_rescue_sweep_off[2],
+         (int)RESCUE_SWEEP_MOVE_MS, (int)RESCUE_SWEEP_HOLD_MS);
+
+    for (uint8_t k = 0; k < 4u; k++) {
+        uint32_t span = (uint32_t)RESCUE_SWEEP_MOVE_MS + (uint32_t)RESCUE_SWEEP_HOLD_MS;
+        uint32_t t0;
+
+        Rescue_Id1Goto(s_rescue_sweep_off[k], RESCUE_SWEEP_MOVE_MS);
+        t0 = HAL_GetTick();
+        while ((HAL_GetTick() - t0) < span) {
+            if (Mission_GetNewLine(out_line, out_size)) {
+                MLOG("[救援] 巡视到第 %u 个点(偏移 %+ld 码)时 K230 已有回应: %s "
+                     "-> 中止巡视, 转正常对准",
+                     (unsigned)(k + 1u), (long)s_rescue_sweep_off[k], out_line);
+                return 1;
+            }
+            Mission_Coop_Wait(20);
+        }
+    }
+    MLOG("[救援] ID1 巡视结束(一圈都没有回应), 已回到中间继续等 K230");
+    return 0;
+}
+
 /** @brief 打靶: ID4(腕部) 以 TARGET_LOOK 为基准转一步(修竖直误差 dy) */
 static void Target_Id4Step(int32_t delta)
 {
     Arm_Id4Step(ARM_POSE_TARGET_LOOK, delta,
                 TARGET_ID4_MOVE_MS, TARGET_ID4_POS_MIN, TARGET_ID4_POS_MAX);
+}
+
+/**
+ * @brief  按当前竖直误差大小选一个 ID4 步长(自适应, 与 ID1 同构)
+ * @param  err_y  K230 回的竖直误差(px)
+ * @retval 本步应该转的角度码(已含方向)
+ * @note   分档理由 / 实测反馈见上面 TARGET_ID4_STEP 处的注释。
+ */
+static int32_t Target_Id4StepFor(int err_y)
+{
+    int32_t a    = abs(err_y);
+    int32_t base = (a > TARGET_ID4_STEP_FAR_PX) ? TARGET_ID4_STEP_FAR : TARGET_ID4_STEP;
+
+    /* 方向与原来一致: y>0(目标偏画面下) → 按 DY_SIGN 转 */
+    return (err_y > 0) ? (base * (int32_t)TARGET_ID4_DY_SIGN)
+                       : (-base * (int32_t)TARGET_ID4_DY_SIGN);
 }
 
 #if 0   /* ⚠️ 2026-10-06 【已停用, 保留备用】摆激光发射位
@@ -1841,7 +2337,9 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
         TARGET_ID1_MOVING,      /* 刚转了一步 ID1, 等它走完(TARGET_ID1_MOVE_MS) */
         TARGET_FINE_IDLE,       /* 已发 start_align: 等 D:<x>,<y> / OK */
         TARGET_FINE_MOVING,     /* 刚按 D 挪了一步舵机(ID1 或 ID4), 等它走完 */
-        TARGET_PERFORM,         /* 收到 OK: 抬起大臂 → 收回手臂 */
+        TARGET_HOLD,            /* ⭐ 收到 OK: 保持当前对准姿态 TARGET_FIRE_HOLD_MS
+                                 *    (让 K230 的激光稳稳打在靶上), 再抬臂 */
+        TARGET_PERFORM,         /* 保持完: 抬起大臂 → 收回手臂 */
         TARGET_COMPLETE
     } TargetSubState_t;
 
@@ -1891,6 +2389,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
     static uint16_t target_id4_steps = 0;       /* ⭐ 精对准竖直(ID4)已微调了多少步(防卡死) */
     static int32_t  target_last_dy = 0;         /* ⭐ 上一步 ID4 动作后的竖直误差(用来算 ID4 步长) */
     static uint8_t  target_last_dy_valid = 0;
+    static int32_t  target_last_dy_step = 0;    /* ⭐ 上一步 ID4 【实际】转了多少码(步长自适应, 必须记实值) */
 
     /* ---- 救援专用(方案二): 底座 ID1 原地对准的状态量 ---- */
     static uint8_t  rescue_id1_inited = 0;      /* 0=本次救援还没开始 L/R 对准 */
@@ -1898,6 +2397,9 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
     static uint16_t rescue_id1_steps  = 0;      /* 本次已转了多少步(防卡死①) */
     static uint32_t rescue_id1_tick   = 0;      /* 本次 L/R 对准起始时刻(防卡死②) */
     static uint32_t rescue_id1_move_tick = 0;   /* 本步 ID1 开始转动时刻 */
+    static uint8_t  rescue_swept      = 0;      /* 0=本轮救援还没做 ID1 巡视 */
+    static uint8_t  rescue_have_first = 0;      /* 1=巡视截下了一行, 下一轮先用它 */
+    static char     rescue_first_line[K230_LINE_MAX]; /* 巡视中止时截下的那一行 */
 
     char line[K230_LINE_MAX];
 
@@ -1958,7 +2460,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                 settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
                 bomb_sub_state = BOMB_SETTLE;
 #else
-                Vision_StartFineAlign("BALL", &state_start_tick, &align_start_time, &cooldown_until);
+                Vision_StartFineAlign("BALL", &s_align_ball, &state_start_tick, &align_start_time, &cooldown_until);
                 bomb_sub_state = BOMB_WAIT_FINE_ALIGN;
 #endif
                 break;
@@ -2063,7 +2565,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                 settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
                 bomb_sub_state = BOMB_SETTLE_PLACE;
 #else
-                Vision_StartFineAlign("BUCKET", &state_start_tick, &align_start_time, &cooldown_until);
+                Vision_StartFineAlign("BUCKET", &s_align_bucket, &state_start_tick, &align_start_time, &cooldown_until);
                 bomb_sub_state = BOMB_WAIT_BUCKET_ALIGN;
 #endif
                 break;
@@ -2183,6 +2685,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                     target_fine_move_ms = TARGET_ID1_MOVE_MS;
                     target_id4_steps = 0;
                     target_last_dy_valid = 0;
+                    target_last_dy_step  = 0;
                     Arm_Id1Reset(ARM_POSE_TARGET_LOOK);    /* 横向轴(ID1)基准 */
                     Arm_Id4Reset(ARM_POSE_TARGET_LOOK);    /* ⭐ 竖直轴(ID4)基准 */
                     MLOG("[靶] 对准开始: 基准位置 ID1=%d, ID4=%d",
@@ -2271,9 +2774,9 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                  * 到点就当打靶完成, 免得白等到 TARGET_ID1_TIMEOUT_MS(20s) 才收尾。 */
                 if (target_fire_tick != 0 &&
                     (HAL_GetTick() - target_fire_tick) >= K230_FIRE_GRACE_MS) {
-                    MLOG("[靶] K230 发过 FIRE 但 %dms 内没等到 OK -> 当作打靶完成, 进入收尾",
+                    MLOG("[靶] K230 发过 FIRE 但 %dms 内没等到 OK -> 当作打靶完成",
                          (int)K230_FIRE_GRACE_MS);
-                    target_sub_state = TARGET_PERFORM;
+                    target_sub_state = TARGET_HOLD;
                     break;
                 }
 
@@ -2296,22 +2799,22 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                             target_fire_tick = HAL_GetTick();
                         }
                     } else if (strncmp(line, "OK", 2) == 0) {
-                        MLOG("[靶] 精对准完成(收到OK, 共微调%u步) -> 抬臂收尾",
-                             (unsigned)target_fine_steps);
-                        target_sub_state = TARGET_PERFORM;
+                        MLOG("[靶] 精对准完成(收到OK, 共微调%u步) -> 保持姿态 %dms 后抬臂",
+                             (unsigned)target_fine_steps, (int)TARGET_FIRE_HOLD_MS);
+                        target_sub_state = TARGET_HOLD;
                     } else {
                         char *pD = strstr(line, "D:");
                         if (pD != NULL) {
                             char *pComma = strchr(pD, ',');
                             int err_x = atoi(pD + 2);
                             int err_y = (pComma != NULL) ? atoi(pComma + 1) : 0;
-                            int32_t sgn;
 
                             /* ⭐ 两个轴分工: 横向(ID1 底座) / 竖直(ID4 腕部)。
                              *    K230 每帧只发一个轴(它挑绝对值大的那个), 所以正常只一个非 0;
                              *    这里按“先横向、后竖直”【串行】处理 —— 一次只动一个舵机,
-                             *    因为转腕部(ID4)会同时影响画面横向(横滚耦合), 同时发会互相干扰。 */
-                            if (abs(err_x) >= ALIGN_TOLERANCE) {
+                             *    因为转腕部(ID4)会同时影响画面横向(横滚耦合), 同时发会互相干扰。
+                             * ⚠️ 容差用 TARGET_ALIGN_TOLERANCE(20), 与 K230 新收紧的窗口一致 */
+                            if (abs(err_x) >= TARGET_ALIGN_TOLERANCE) {
                                 /* 画面偏左(err_x>0) 等价于接近阶段的 'L', 方向一致。
                                  * ⭐ 步长按误差大小自适应(见 Target_Id1StepFor) ——
                                  *    一律用 60 码会在容差窗口(±50px)里来回摆。 */
@@ -2327,24 +2830,30 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                                 target_sub_state = TARGET_FINE_MOVING;
                             }
 #if TARGET_FIX_DY_WITH_ID4
-                            else if (abs(err_y) >= ALIGN_TOLERANCE) {
+                            else if (abs(err_y) >= TARGET_ALIGN_TOLERANCE) {
                                 /* ⭐ 竖直: y>0 = 目标偏画面下, 用 ID4(腕部) 修。
-                                 *    ⚠️ 方向由 TARGET_ID4_DY_SIGN 决定(见宏注释), 实测反了就取反。 */
-                                sgn = (err_y > 0) ? 1 : -1;
+                                 *    ⚠️ 方向由 TARGET_ID4_DY_SIGN 决定(见宏注释), 实测反了就取反。
+                                 *    ⭐ 步长按误差大小自适应(见 Target_Id4StepFor):
+                                 *       |y| 大 → TARGET_ID4_STEP_FAR(快); 否则 → TARGET_ID4_STEP。 */
+                                int32_t d4 = Target_Id4StepFor(err_y);
 
-                                /* 标定 ID4 步长: 看“上一步 ID4 转了多少、y 变了多少” */
+                                /* 标定 ID4 步长: 看“上一步 ID4 转了多少码、y 变了多少 px”。
+                                 * ⚠️ 步长是自适应的, 所以必须打【上一步实际转的码数】,
+                                 *    打宏值会把“px/码”算错 */
                                 if (target_last_dy_valid && (target_last_dy != err_y)) {
-                                    MLOG("[靶][竖直轴变化] 上一步 ID4 转 %d 码后, |y| %ldpx -> %dpx "
+                                    MLOG("[靶][竖直轴变化] 上一步 ID4 转 %ld 码后, |y| %ldpx -> %dpx "
                                          "(变化 %+ldpx; 负=变小=方向对) —— 据此调 TARGET_ID4_STEP",
-                                         (int)TARGET_ID4_STEP, labs((long)target_last_dy), abs(err_y),
+                                         (long)target_last_dy_step, labs((long)target_last_dy), abs(err_y),
                                          labs((long)target_last_dy) - (long)abs(err_y));
                                 }
                                 target_last_dy       = err_y;
                                 target_last_dy_valid = 1;
+                                target_last_dy_step  = (d4 >= 0) ? d4 : -d4;
 
-                                MLOG("[靶] 精对准[竖直] y=%dpx (y>0=偏下) -> ID4 转 %+ld 码",
-                                     err_y, (long)(sgn * (int32_t)TARGET_ID4_DY_SIGN * TARGET_ID4_STEP));
-                                Target_Id4Step(sgn * (int32_t)TARGET_ID4_DY_SIGN * TARGET_ID4_STEP);
+                                MLOG("[靶] 精对准[竖直] y=%dpx (y>0=偏下) -> ID4 转 %+ld 码 [%s]",
+                                     err_y, (long)d4,
+                                     (abs(err_y) > TARGET_ID4_STEP_FAR_PX) ? "大步" : "小步");
+                                Target_Id4Step(d4);
                                 target_id4_steps++;
                                 target_fine_move_ms  = TARGET_ID4_MOVE_MS;
                                 target_id1_move_tick = HAL_GetTick();
@@ -2357,8 +2866,9 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                                  * 只提示一次, 免得刷屏。 */
                                 target_fine_xok_warned = 1;
                                 MLOG("[靶] 两轴都已在容差(%dpx)内 (x=%d, y=%d), 等 K230 回 OK/FIRE; "
-                                     "若一直不回, 就是 K230 那边判不通过(它要求 |dx| 和 |dy| 都 <50px)",
-                                     (int)ALIGN_TOLERANCE, err_x, err_y);
+                                     "若一直不回, 就是 K230 那边判不通过(它现在要求 |dx| 和 |dy| 都 <%dpx)",
+                                     (int)TARGET_ALIGN_TOLERANCE, err_x, err_y,
+                                     (int)TARGET_ALIGN_TOLERANCE);
                             }
                         } else {
                             char c = line[0];
@@ -2392,12 +2902,26 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                         }
                     }
                     if (ok_seen) {
-                        MLOG("[靶] 在挪舵机期间就收到OK -> 抬臂收尾");
-                        target_sub_state = TARGET_PERFORM;
+                        MLOG("[靶] 在挪舵机期间就收到OK -> 保持姿态 %dms 后抬臂",
+                             (int)TARGET_FIRE_HOLD_MS);
+                        target_sub_state = TARGET_HOLD;
                     } else if ((HAL_GetTick() - target_id1_move_tick) >= target_fine_move_ms) {
                         target_sub_state = TARGET_FINE_IDLE;
                     }
                 }
+                break;
+
+            case TARGET_HOLD:
+                /* ⭐ 收到 K230 的 OK 之后, 【保持当前对准姿态】TARGET_FIRE_HOLD_MS,
+                 * 让 K230 的激光稳稳打在靶上, 然后再抬臂收工。
+                 * 为什么不能收到 OK 就抬: 激光是 K230 在它判成功那一刻自己点亮的,
+                 *   而抬臂会立刻改变摄像头/激光朝向 → 激光就打偏/只闪一下。
+                 * 用 Mission_Coop_Wait 等这 3 秒: 期间照刷陀螺仪 yaw、照收 K230 行,
+                 * 且【不给舵机发任何指令】= 姿态真的保持不动。 */
+                MLOG("[靶] 保持当前对准姿态 %dms (让激光打在靶上), 之后抬臂收尾",
+                     (int)TARGET_FIRE_HOLD_MS);
+                Mission_Coop_Wait(TARGET_FIRE_HOLD_MS);
+                target_sub_state = TARGET_PERFORM;
                 break;
 
             case TARGET_PERFORM:
@@ -2458,6 +2982,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                 target_fire_tick  = 0;
                 target_id4_steps  = 0;
                 target_last_dy_valid = 0;
+                target_last_dy_step  = 0;
                 target_sub_state  = TARGET_IDLE;
                 g_vision_task_in_progress = 0;
                 /* ⭐ 打靶结束 → 右移 400mm(STATE_12_PART2_MOVE_A) → 航向校正 → 救援 */
@@ -2478,11 +3003,14 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
      *       再发 start_align 用 D:x,y 精对准(只修前后), 对准后抓取。
      * 两套共用的收尾:
      *   ⑥ RESCUE_SETTLE   停车稳定(FINE_TUNE_SETTLE_MS)
-     *   ⑦ RESCUE_PERFORM  抓取(HOSTAGE_PRE → CLOSE) + 抱起抬起(HOSTAGE_LIFT)
+     *   ⑦ RESCUE_PERFORM  抓取: 该侧 抓取位 → 抱紧位 → 抬起位 → 回程姿态
      *   ⑧ RESCUE_COMPLETE 回主状态机 → 后退 ROUTE_17_RIGHT_B_MM …
      *
      * 🛡 方案二防卡死: 转满 RESCUE_ID1_STEP_MAX 步 或 超过 RESCUE_ID1_TIMEOUT_MS
      *    仍未收到 C(含 K230 完全不回应) → 强制当作 C 处理, 保证能往下走
+     *
+     * ⭐ 方案二在开始对准前会先让 ID1 慢速巡视一圈(中间→右→左→中间),
+     *    期间一旦收到 K230 任何数据就中止巡视并转入正常对准 —— 见 RESCUE_SWEEP_*
      */
     else if (expected_task_number == 3) {
         switch (rescue_sub_state) {
@@ -2506,6 +3034,18 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                         Arm_Id1Reset(ARM_POSE_HOSTAGE_LOOK);
                         MLOG("[救援] 底座ID1对准开始, 基准位置=%d", (int)s_id1_pos);
                     }
+                    /* ⭐ 第一次进来先让 ID1 【慢速巡视一圈】(中间→右→左→中间,
+                     *    只动 ID1)。巡视途中一旦收到 K230 任何一行就中止,
+                     *    并把那一行留下来给下面的正常流程处理(见 Rescue_SweepOnce)。 */
+                    if (RESCUE_SWEEP_ENABLE && !rescue_swept) {
+                        rescue_swept = 1;
+                        if (Rescue_SweepOnce(rescue_first_line, sizeof(rescue_first_line))) {
+                            rescue_have_first = 1;
+                        }
+                        /* 巡视本身也花了好几秒: 把对准超时从此刻重新计, 免得一
+                         * 扫完就被判超时而盲抓 */
+                        rescue_id1_tick = HAL_GetTick();
+                    }
                     /* 🛡防卡死: 步数 或 时长 超限 → 强制当作已对准, 直接去抓 */
                     if (rescue_id1_steps >= RESCUE_ID1_STEP_MAX ||
                         (HAL_GetTick() - rescue_id1_tick) > RESCUE_ID1_TIMEOUT_MS) {
@@ -2518,39 +3058,82 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                         rescue_sub_state = RESCUE_SETTLE;
                         break;
                     }
-                    if (Mission_GetNewLine(line, sizeof(line))) {
-                        char dir;
-                        if (!Vision_IsDirLine(line, &dir)) {
-                            MLOG("[救援] 忽略无关行: %s (继续等 C/L/R)", line);
-                            break;   /* 无关行: 继续等 C/L/R */
+                    {
+                        uint8_t got = 0;
+
+                        /* ⭐ 巡视中止时截下的那一行优先处理(别把 K230 的第一次回应丢掉) */
+                        if (rescue_have_first) {
+                            rescue_have_first = 0;
+                            memcpy(line, rescue_first_line, sizeof(line));
+                            line[sizeof(line) - 1] = '\0';
+                            got = 1;
+                        } else if (Mission_GetNewLine(line, sizeof(line))) {
+                            got = 1;
                         }
-                        rescue_heard = 1;   /* 已联系上 K230: 之后不再定时重发 */
-                        rescue_path_taken = dir;
-                        MLOG("[救援] 接近方向: %c  (L=目标偏画面左 / C=居中 / R=偏右)", rescue_path_taken);
-                        if (rescue_path_taken == 'L') {
-                            Rescue_Id1Step((int32_t)RESCUE_ID1_LR_SIGN * RESCUE_ID1_STEP);
-                            rescue_id1_steps++;
-                            rescue_id1_move_tick = HAL_GetTick();
-                            rescue_sub_state = RESCUE_ID1_MOVING;
-                        } else if (rescue_path_taken == 'R') {
-                            Rescue_Id1Step(-(int32_t)RESCUE_ID1_LR_SIGN * RESCUE_ID1_STEP);
-                            rescue_id1_steps++;
-                            rescue_id1_move_tick = HAL_GetTick();
-                            rescue_sub_state = RESCUE_ID1_MOVING;
-                        } else {
-                            /* 'C'(或其它字符): 认为已对准 → 停稳后去抓
-                             * (不直接上 RESCUE_PERFORM, 而是绕一下 RESCUE_SETTLE,
-                             *  等 ID1 完全停稳再夹, 免得还在动就把人质抱歪) */
-                            MLOG("[救援] 收到C(共转%u步) -> 停稳后抓取",
-                                 (unsigned)rescue_id1_steps);
-                            Chassis_Stop();
-                            settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
-                            rescue_sub_state = RESCUE_SETTLE;
+
+                        if (got) {
+                            char dir;
+                            char *pD = strstr(line, "D:");
+
+                            if (Vision_IsDirLine(line, &dir)) {
+                                /* ---- C / L / R: 与以前完全一样 ---- */
+                                rescue_heard = 1;   /* 已联系上 K230: 之后不再定时重发 */
+                                rescue_path_taken = dir;
+                                MLOG("[救援] 接近方向: %c  (L=目标偏画面左 / C=居中 / R=偏右)", rescue_path_taken);
+                                if (rescue_path_taken == 'L') {
+                                    Rescue_Id1Step((int32_t)RESCUE_ID1_LR_SIGN * RESCUE_ID1_STEP);
+                                    rescue_id1_steps++;
+                                    rescue_id1_move_tick = HAL_GetTick();
+                                    rescue_sub_state = RESCUE_ID1_MOVING;
+                                } else if (rescue_path_taken == 'R') {
+                                    Rescue_Id1Step(-(int32_t)RESCUE_ID1_LR_SIGN * RESCUE_ID1_STEP);
+                                    rescue_id1_steps++;
+                                    rescue_id1_move_tick = HAL_GetTick();
+                                    rescue_sub_state = RESCUE_ID1_MOVING;
+                                } else {
+                                    /* 'C': 认为已对准 → 停稳后去抓
+                                     * (不直接上 RESCUE_PERFORM, 而是绕一下 RESCUE_SETTLE,
+                                     *  等 ID1 完全停稳再夹, 免得还在动就把人质抱歪) */
+                                    MLOG("[救援] 收到C(共转%u步) -> 停稳后抓取",
+                                         (unsigned)rescue_id1_steps);
+                                    Chassis_Stop();
+                                    settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
+                                    rescue_sub_state = RESCUE_SETTLE;
+                                }
+                            } else if (pD != NULL) {
+                                /* ---- ⭐ D:<x>,<y> —— 认为“已发现目标”, 用 x 小步修 ID1 ----
+                                 * 和打靶同构: K230 的 x = 画面中 - 目标x, x>0 = 目标偏画面左,
+                                 * 与接近阶段的 'L' 同向 ⇒ 直接用 RESCUE_ID1_LR_SIGN 定方向。
+                                 * |x| < RESCUE_ID1_ALIGN_TOL 就算对准 → 停稳后抓取。 */
+                                int err_x = atoi(pD + 2);
+
+                                rescue_heard = 1;
+                                if (abs(err_x) >= RESCUE_ID1_ALIGN_TOL) {
+                                    int32_t d = (err_x > 0)
+                                              ? ((int32_t)RESCUE_ID1_LR_SIGN * RESCUE_ID1_STEP)
+                                              : (-(int32_t)RESCUE_ID1_LR_SIGN * RESCUE_ID1_STEP);
+
+                                    MLOG("[救援] 收到误差 D:x=%dpx (x>0=偏画面左) -> ID1 转 %+ld 码",
+                                         err_x, (long)d);
+                                    Rescue_Id1Step(d);
+                                    rescue_id1_steps++;
+                                    rescue_id1_move_tick = HAL_GetTick();
+                                    rescue_sub_state = RESCUE_ID1_MOVING;
+                                } else {
+                                    MLOG("[救援] 误差已进容差(x=%dpx < %dpx) -> 停稳后抓取",
+                                         err_x, (int)RESCUE_ID1_ALIGN_TOL);
+                                    Chassis_Stop();
+                                    settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
+                                    rescue_sub_state = RESCUE_SETTLE;
+                                }
+                            } else {
+                                MLOG("[救援] 忽略无关行: %s (继续等 C/L/R 或 D:x,y)", line);
+                            }
+                        } else if (!rescue_heard &&
+                                   (!g_vision_task_in_progress ||
+                                    HAL_GetTick() - vision_cmd_tick >= VISION_CMD_RESEND_MS)) {
+                            Vision_SendTask(K230_TASK_RESCUE, "SHAPE", &vision_cmd_tick);
                         }
-                    } else if (!rescue_heard &&
-                               (!g_vision_task_in_progress ||
-                                HAL_GetTick() - vision_cmd_tick >= VISION_CMD_RESEND_MS)) {
-                        Vision_SendTask(K230_TASK_RESCUE, "SHAPE", &vision_cmd_tick);
                     }
                 } else {
                     /* ============ 方案一: 动底盘(前进/后退) + D:x,y 精对准 ============ */
@@ -2567,7 +3150,8 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                          *   L → 前进;  R → 后退;  C → 已在中心, 不动 */
                         if (rescue_path_taken == 'C') {
                             /* 已在中心: 不移动, 直接进精对准(此时只修前后) */
-                            Vision_StartFineAlign("SHAPE", &state_start_tick, &align_start_time, &cooldown_until);
+                            Vision_StartFineAlign("SHAPE", &s_align_rescue,
+                                                  &state_start_tick, &align_start_time, &cooldown_until);
                             rescue_sub_state = RESCUE_WAIT_ALIGN;
                         } else if (rescue_path_taken == 'L') {
                             if (RESCUE_ADJUST_MM) Chassis_Move_Forward(RESCUE_ADJUST_MM);
@@ -2607,7 +3191,8 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
 
             case RESCUE_WAIT_ADJUST:
                 if (Chassis_Task_Is_Complete()) {
-                    Vision_StartFineAlign("SHAPE", &state_start_tick, &align_start_time, &cooldown_until);
+                    Vision_StartFineAlign("SHAPE", &s_align_rescue,
+                                          &state_start_tick, &align_start_time, &cooldown_until);
                     rescue_sub_state = RESCUE_WAIT_ALIGN;
                 }
                 break;
@@ -2636,9 +3221,10 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                 break;
 
             case RESCUE_PERFORM:
-                MLOG("阶段: 救援抓取(准备抱→抱紧→抬起)");
-                Arm_Start_Rescue_Grab();      /* HOSTAGE_PRE(准备抱) → HOSTAGE_CLOSE(抱紧) */
-                Arm_Start_Rescue_Retract();   /* HOSTAGE_LIFT(抱起后抬起) */
+                MLOG("阶段: 救援抓取(抓取位→抱紧→抬起→回程)");
+                Arm_Start_Rescue_Grab();      /* ① 该侧抓取位 → ② 该侧抱紧位 */
+                Arm_Start_Rescue_Retract();   /* ③ 该侧抬起位 */
+                Arm_Start_Rescue_Return();    /* ④ 回程姿态(收臂, 准备后退) */
                 rescue_sub_state = RESCUE_COMPLETE;
                 break;
 
@@ -2648,6 +3234,8 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                  * 让后面的视觉任务重新走 “Vision Start + 换任务静默期” */
                 rescue_id1_inited = 0;
                 rescue_heard      = 0;
+                rescue_swept      = 0;
+                rescue_have_first = 0;
                 rescue_sub_state  = RESCUE_IDLE;
                 g_vision_task_in_progress = 0;
                 /* ⭐ 抓取完成 → ⑥ 抓完后第 1 段后退(STATE_17_RESCUE_RIGHT_B) */
@@ -2716,6 +3304,8 @@ static int32_t  s_tc_last_dx = 0;    /* 上一步动作前的横向误差(看变
 static uint8_t  s_tc_last_dx_valid = 0;
 static int32_t  s_tc_last_dy = 0;
 static uint8_t  s_tc_last_dy_valid = 0;
+static int32_t  s_tc_last_i1_delta = 0;  /* 上一步 ID1 【实际】转的码数(步长自适应) */
+static int32_t  s_tc_last_i4_delta = 0;  /* 上一步 ID4 【实际】转的码数 */
 static uint32_t s_tc_settle_tick = 0;
 static uint32_t s_tc_fire_tick = 0;      /* 收到 FIRE 的时刻(0=还没收到) */
 static uint8_t  s_tc_xignore_warned = 0; /* [只标竖直] 模式下“请把靶子横向摆正”提示只打一次 */
@@ -2762,11 +3352,14 @@ static void TargetCalib_Update(void)
             K230_FlushAll();
             Chassis_Stop();
             MLOG("打靶两轴标定[K标定] 基准位置: ID1=%d, ID4=%d; 本轮参数: "
-                 "ID1 步长=%d 符号=%d (%ums) / ID4 步长=%d 符号=%d (%ums), 容差=%dpx",
+                 "ID1 步长 小%d/中%d/大%d 符号=%d (%ums) / "
+                 "ID4 步长 小%d/远%d 符号=%d (%ums), 容差=%dpx",
                  (int)s_id1_pos, (int)s_id4_pos,
-                 (int)TARGET_ID1_STEP, (int)TARGET_ID1_LR_SIGN, (unsigned)TARGET_ID1_MOVE_MS,
-                 (int)TARGET_ID4_STEP, (int)TARGET_ID4_DY_SIGN, (unsigned)TARGET_ID4_MOVE_MS,
-                 (int)ALIGN_TOLERANCE);
+                 (int)TARGET_ID1_STEP_FINE, (int)(TARGET_ID1_STEP / 2), (int)TARGET_ID1_STEP,
+                 (int)TARGET_ID1_LR_SIGN, (unsigned)TARGET_ID1_MOVE_MS,
+                 (int)TARGET_ID4_STEP, (int)TARGET_ID4_STEP_FAR,
+                 (int)TARGET_ID4_DY_SIGN, (unsigned)TARGET_ID4_MOVE_MS,
+                 (int)TARGET_ALIGN_TOLERANCE);
             MLOG("打靶两轴标定[K标定]: 靶子要【故意放偏】, 正中间 K230 会直接回 OK 没东西可标");
             s_tc_tick = HAL_GetTick();
             s_tc_sub = 1;
@@ -2836,51 +3429,58 @@ static void TargetCalib_Update(void)
                     char *pComma = strchr(pD, ',');
                     int err_x = atoi(pD + 2);
                     int err_y = (pComma != NULL) ? atoi(pComma + 1) : 0;
-                    int32_t sgn;
 
                     /* 串行修正: 先横向(ID1), 后竖直(ID4)。转腕部会耦合画面横向,
-                     * 同时动两个会互相干扰。K230 每帧只发一个轴(它挑大的那个)。 */
-                    if (abs(err_x) >= ALIGN_TOLERANCE && !TCAL_ONLY_Y) {
+                     * 同时动两个会互相干扰。K230 每帧只发一个轴(它挑大的那个)。
+                     * ⚠️ 容差用 TARGET_ALIGN_TOLERANCE(20), 与 K230 新窗口一致 */
+                    if (abs(err_x) >= TARGET_ALIGN_TOLERANCE && !TCAL_ONLY_Y) {
+                        int32_t d1 = Target_Id1StepFor(err_x);
+
                         if (s_tc_last_dx_valid && s_tc_last_dx != err_x) {
-                            MLOG("打靶两轴标定[横向轴变化] 上一步 ID1 转 %d 码后, |x| %ldpx -> %dpx "
+                            MLOG("打靶两轴标定[横向轴变化] 上一步 ID1 转 %ld 码后, |x| %ldpx -> %dpx "
                                  "(变化 %+ldpx; 负=变小=方向对) —— 据此调 TARGET_ID1_STEP",
-                                 (int)TARGET_ID1_STEP, labs((long)s_tc_last_dx), abs(err_x),
+                                 (long)s_tc_last_i1_delta, labs((long)s_tc_last_dx), abs(err_x),
                                  labs((long)s_tc_last_dx) - (long)abs(err_x));
                         }
                         s_tc_last_dx = err_x;
                         s_tc_last_dx_valid = 1;
+                        s_tc_last_i1_delta = (d1 >= 0) ? d1 : -d1;
 
-                        sgn = (err_x > 0) ? 1 : -1;
-                        MLOG("打靶两轴标定[横向] x=%dpx (x>0=偏左) -> ID1 转 %+ld 码",
-                             err_x, (long)(sgn * (int32_t)TARGET_ID1_LR_SIGN * TARGET_ID1_STEP));
-                        Target_Id1Step(sgn * (int32_t)TARGET_ID1_LR_SIGN * TARGET_ID1_STEP);
+                        MLOG("打靶两轴标定[横向] x=%dpx (x>0=偏左) -> ID1 转 %+ld 码 [%s]",
+                             err_x, (long)d1,
+                             (abs(err_x) > TARGET_ID1_STEP_BIG_PX) ? "大步" :
+                             (abs(err_x) > TARGET_ID1_STEP_MID_PX) ? "中步" : "小步");
+                        Target_Id1Step(d1);
                         s_tc_i1_steps++;
                         s_tc_move_ms   = TARGET_ID1_MOVE_MS;
                         s_tc_move_tick = HAL_GetTick();
                         s_tc_sub = 3;
                     }
 #if TARGET_FIX_DY_WITH_ID4
-                    else if (abs(err_y) >= ALIGN_TOLERANCE) {
+                    else if (abs(err_y) >= TARGET_ALIGN_TOLERANCE) {
+                        int32_t d4 = Target_Id4StepFor(err_y);
+
                         if (s_tc_last_dy_valid && s_tc_last_dy != err_y) {
-                            MLOG("打靶两轴标定[竖直轴变化] 上一步 ID4 转 %d 码后, |y| %ldpx -> %dpx "
+                            MLOG("打靶两轴标定[竖直轴变化] 上一步 ID4 转 %ld 码后, |y| %ldpx -> %dpx "
                                  "(变化 %+ldpx; 负=变小=方向对) —— 据此调 TARGET_ID4_STEP",
-                                 (int)TARGET_ID4_STEP, labs((long)s_tc_last_dy), abs(err_y),
+                                 (long)s_tc_last_i4_delta, labs((long)s_tc_last_dy), abs(err_y),
                                  labs((long)s_tc_last_dy) - (long)abs(err_y));
                         }
                         s_tc_last_dy = err_y;
                         s_tc_last_dy_valid = 1;
+                        s_tc_last_i4_delta = (d4 >= 0) ? d4 : -d4;
 
-                        sgn = (err_y > 0) ? 1 : -1;
-                        MLOG("打靶两轴标定[竖直] y=%dpx (y>0=偏下) -> ID4 转 %+ld 码",
-                             err_y, (long)(sgn * (int32_t)TARGET_ID4_DY_SIGN * TARGET_ID4_STEP));
-                        Target_Id4Step(sgn * (int32_t)TARGET_ID4_DY_SIGN * TARGET_ID4_STEP);
+                        MLOG("打靶两轴标定[竖直] y=%dpx (y>0=偏下) -> ID4 转 %+ld 码 [%s]",
+                             err_y, (long)d4,
+                             (abs(err_y) > TARGET_ID4_STEP_FAR_PX) ? "大步" : "小步");
+                        Target_Id4Step(d4);
                         s_tc_i4_steps++;
                         s_tc_move_ms   = TARGET_ID4_MOVE_MS;
                         s_tc_move_tick = HAL_GetTick();
                         s_tc_sub = 3;
                     }
 #endif
-                    else if (TCAL_ONLY_Y && abs(err_x) >= ALIGN_TOLERANCE) {
+                    else if (TCAL_ONLY_Y && abs(err_x) >= TARGET_ALIGN_TOLERANCE) {
                         /* 只标竖直模式: K230 现在报的是横向(它每帧只发误差大的那个轴),
                          * 而我们又不许动 ID1 → 只能提示人工把靶子横向摆正 */
                         if (!s_tc_xignore_warned) {
@@ -2888,14 +3488,15 @@ static void TargetCalib_Update(void)
                             MLOG("打靶两轴标定[只标竖直]: 现在 K230 报的是横向 x=%dpx"
                                  " (它每帧只发误差大的那个轴); 请把靶子【横向】挪到画面中间"
                                  "(|x|<%dpx), 它才会改报竖直误差 y",
-                                 err_x, (int)ALIGN_TOLERANCE);
+                                 err_x, (int)TARGET_ALIGN_TOLERANCE);
                         }
                     }
                     else if (!s_tc_tol_warned) {
                         s_tc_tol_warned = 1;
                         MLOG("打靶两轴标定: 两轴都已在容差(%dpx)内 (x=%d, y=%d), 等 K230 回 OK/FIRE; "
-                             "若一直不回, 就是 K230 那边判不通过(它要求 |dx| 和 |dy| 都 <50px)",
-                             (int)ALIGN_TOLERANCE, err_x, err_y);
+                             "若一直不回, 就是 K230 那边判不通过(它现在要求 |dx| 和 |dy| 都 <%dpx)",
+                             (int)TARGET_ALIGN_TOLERANCE, err_x, err_y,
+                             (int)TARGET_ALIGN_TOLERANCE);
                     }
                 } else if (Vision_IsDirLine(line, &path)) {
                     /* K230 还在发接近指令 → 说明它没切进 ALIGN(可能 start_align 丢了),
@@ -3063,7 +3664,7 @@ void Mission_DebugVisionUpdate(void)
                 s_dbg_settle = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
                 s_dbg_sub = 3;
 #else
-                Vision_StartFineAlign(tag, &s_dbg_state_tick, &s_dbg_align_tick, &s_dbg_cooldown);
+                Vision_StartFineAlign(tag, cfg, &s_dbg_state_tick, &s_dbg_align_tick, &s_dbg_cooldown);
                 s_dbg_sub = 2;
 #endif
             }
@@ -3255,8 +3856,11 @@ void Mission_Update(void)
         switch (g_mission_state) {
             /* ---------- 阶段一: 扫码并前往排爆区 ---------- */
             case STATE_1_MOVING_TO_QR_SCAN:   Chassis_Move_Forward(ROUTE_1_TO_QR_MM); break;  /* 起点→扫码点(直行) */
-            /* 扫码: 车停稳后机械臂先摆到“扫码姿态”(207,425,1988,2135,2542)再让 K230 扫 */
-            case STATE_2_PERFORMING_QR_SCAN:  Chassis_Stop(); Arm_GotoPose(ARM_POSE_SCAN); break;
+            /* 扫码: 车停稳后机械臂先摆到“扫码姿态”再让 K230 扫。
+             * ⭐ 2026-10-06: 改成【多角度扫描】—— Arm_Scan_Begin() 先把整张
+             *    ARM_POSE_SCAN 姿态摆到位, 之后由转移检查里的 Arm_Scan_Poll()
+             *    用 ID4 轮换 3 个角度, 提高二维码命中率(见该函数注释)。 */
+            case STATE_2_PERFORMING_QR_SCAN:  Chassis_Stop(); Arm_Scan_Begin(); break;
 
             case STATE_3_MOVE_LEFT_A:         Chassis_Move_Left(ROUTE_3_LEFT_A_MM); break;    /* 扫码后左移 A 段 */
             case STATE_3A_HEADING_CORRECT:    Turn_Angle_Compat(0.1f); break;                 /* 左移后航向校正到 0° */
@@ -3301,8 +3905,46 @@ void Mission_Update(void)
              *    之后 MOVE_B 继续右移, CORRECT_B 停车, MOVE_C 才摆臂。 */
             case STATE_12_PART1_CORRECT_A:    Turn_Angle_Compat(0.1f);break;
             case STATE_12_PART1_MOVE_B:       Chassis_Move_Right(ROUTE_12_P1_B_MM); break;  
-            case STATE_12_PART1_CORRECT_B:    Chassis_Stop(); s_target_stop_tick = HAL_GetTick(); break;  
-            case STATE_12_PART1_MOVE_C:       Arm_GotoPose(ARM_POSE_TARGET_LOOK);break;   
+            case STATE_12_PART1_CORRECT_B:
+                /* ⭐ 2026-10-06: 原来这里【只停车、不校正航向】—— 实测右移 850mm
+                 *    之后车头偏了约 5°(日志 I/HDG err=-5.0), 下一步 MOVE_C 就把
+                 *    机械臂/摄像头伸出去识别靶子 → “车是斜的就开始识别”。
+                 *    这里先粗校正一次(第 2 道保险在 MOVE_C 里, 见那里的注释)。
+                 * ⚠️ 不要先调 Chassis_Stop(): 它会 chassis_freeze() + 清 s_turn_open,
+                 *    紧接着 Rotate_To 又开转向 —— 两个状态混在同一拍里容易让
+                 *    Chassis_Task_Is_Complete() 的判定提前成立(转一半就判“完成”)。
+                 *    转向结束时它自己会调 Chassis_Stop()。 */
+                Chassis_Rotate_To(0.0f);
+                s_target_stop_tick = HAL_GetTick();
+                break;  
+            /* ⭐⭐ 打靶摆臂/识别之前: 【阻塞式】把车头摆正再伸臂
+             * 用户实测反馈:“航向纠正到一半就进了视觉状态机, 车身斜着打靶”。
+             * 所以这里不能只发个转向指令就往下走, 必须【同步等它转完】:
+             *   ① 发转向指令(转到绝对 0°);
+             *   ② 阻塞等 Chassis_Task_Is_Complete() (转向环自己判到位);
+             *   ③ 再停稳 TARGET_STOP_SETTLE_MS;
+             *   ④ 打印实际 yaw 供核对, 然后才 Arm_GotoPose(TARGET_LOOK)。
+             * ⚠️ 用 Mission_Coop_Wait 等(不是 HAL_Delay): 期间照刷陀螺仪 yaw、
+             *    照收 K230 行, 否则转向环读不到新角度会“转不完”。
+             * ⚠️ 5s 超时兜底: 万一陀螺仪/转向环异常也不卡死在这里。
+             * 摆完臂后转移条件 Chassis_Task_Is_Complete() 已为真 → 直接进 STATE_13,
+             * 也就是说【进视觉状态机时车头一定是正的】。 */
+            case STATE_12_PART1_MOVE_C:
+                {
+                    uint32_t t_turn = HAL_GetTick();
+
+                    Chassis_Rotate_To(0.0f);
+                    while (!Chassis_Task_Is_Complete() &&
+                           (HAL_GetTick() - t_turn) < 5000u) {
+                        Mission_Coop_Wait(20);
+                    }
+                    Mission_Coop_Wait(TARGET_STOP_SETTLE_MS);
+                    MLOG("打靶摆臂前: 航向校正完成, 当前 yaw=%.1f° (目标 0°), 校正耗时 %lums",
+                         (double)Chassis_GetYaw(),
+                         (unsigned long)(HAL_GetTick() - t_turn));
+                }
+                Arm_GotoPose(ARM_POSE_TARGET_LOOK);
+                break;
 
             /* ⚠️ TURN_A/TURN_B 已不在流程里(不可达): 上面 MOVE_C 摆完臂直接跳 STATE_13。
              *    这里置空, 免得万一被进入时车突然跑 400mm */
@@ -3395,6 +4037,12 @@ void Mission_Update(void)
 #else
             {
                 char line[K230_LINE_MAX];
+
+                /* ⭐ 多角度扫码: 每周期试一下能不能换下一个角度。
+                 *    收到 SCAN_OK 时本状态马上就会结束, 所以这里多跑一次无害
+                 *    (后续的 Arm_GotoPose(SCAN_RESET) 会直接覆盖 ID4)。 */
+                Arm_Scan_Poll();
+
                 if (Mission_GetNewLine(line, sizeof(line))) {
                     g_vision_task_in_progress = 0;
                     if (strncmp(line, "SCAN_OK", 7) == 0) {
@@ -3467,7 +4115,10 @@ void Mission_Update(void)
          * 再进 MOVE_C 摆臂, 免得底盘还在晃就把臂/摄像头伸出去。
          * (TARGET_STOP_SETTLE_MS 填 0 就回到原来的“直接穿过”行为) */
         case STATE_12_PART1_CORRECT_B:
-            if ((HAL_GetTick() - s_target_stop_tick) >= TARGET_STOP_SETTLE_MS) {
+            /* ⭐ 现在这里包含了“停车 + 航向校正到 0°”: 要等校正转到位
+             *    (Chassis_Task_Is_Complete) 且额外停稳 TARGET_STOP_SETTLE_MS。 */
+            if (Chassis_Task_Is_Complete() &&
+                (HAL_GetTick() - s_target_stop_tick) >= TARGET_STOP_SETTLE_MS) {
                 g_mission_state++;
             }
             break;
