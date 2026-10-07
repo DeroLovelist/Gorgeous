@@ -120,8 +120,9 @@ typedef enum {
      *           → STATE_13 视觉
      *   视觉对准(任务2): 底盘完全不动, 根据 K230 回的 C/L/R 原地小步转底座 ID1;
      *           收到 C 后依次摆 FIRE → LIFT → SCAN_RESET。
-     *   收尾: 出了 STATE_13 后走 PART2_MOVE_A(右移) → PART2_CORRECT_A(航向校正)
-     *         → 直接进入 STATE_14 救援。
+     *   收尾: 出了 STATE_13 后走 PART2_MOVE_A(右移 ROUTE_12_P2_A_MM=614)
+     *         → PART2_MOVE_BACKWARD(后退 ROUTE_12_P2_BACK_MM=50)
+     *         → PART2_CORRECT_A(航向校正到 0°) → 直接进入 STATE_14 救援。
      * ⚠️ TURN_A/TURN_B 与 PART2_MOVE_B/CORRECT_B/MOVE_C 不在流程里(不可达),
      *    PART1_MOVE_B/CORRECT_B/MOVE_C 是【在用】的, 别当废弃删掉。 */
     STATE_12_PART1_MOVE_A,
@@ -132,28 +133,36 @@ typedef enum {
     STATE_12_TURN_A,
     STATE_12_TURN_B,
     STATE_12_PART2_MOVE_A,
+    STATE_12_PART2_MOVE_BACKWARD,            // ⭐ 2026-10-07 新增: 右移 614 之后再后退 50mm
     STATE_12_PART2_CORRECT_A,
     STATE_12_PART2_MOVE_B,
     STATE_12_PART2_CORRECT_B,
     STATE_12_PART2_MOVE_C,
     STATE_13_PERFORMING_TARGETING,          // 视觉: 原地转底座 ID1 对准靶子, 然后摆 FIRE/LIFT/SCAN_RESET
 
-    /* 阶段四: 救援 (2026-10-05 重新定义)
-     * 流程: ①后退 → ②航向校准 → ③停下等 3s → ④摆 HOSTAGE_LOOK
-     *      → ⑤视觉对准 + 抓取 → ⑥后退 600 → ⑦航向校准
-     *      → ⑧后退 600 → ⑨航向校准 → ⑩停下(任务完成) */
-    STATE_14_MOVE_FORWARD_B,                 // ① 后退 ROUTE_14_TO_HOSTAGE_MM
-    STATE_15_TURN_FOR_HOSTAGE,               // ② 航向校准
-    STATE_15A_RESCUE_STOP_WAIT,              // ③ 原地停等 RESCUE_STOP_WAIT_MS(3000ms)
-    STATE_16_RESCUE_RIGHT_A,                 // ④ 摆 ARM_POSE_HOSTAGE_LOOK(看人质)
+    /* 阶段四: 救援 (2026-10-07 改为「先掉头, 再横移进救援区」)
+     * 流程: ①车头右转 90°(RESCUE_HEADING_DEG) → ②航向校准到 -90°(并设航向基准)
+     *      → ③校准【到位】后原地停稳 RESCUE_ALIGN_SETTLE_MS(3s)
+     *      → ④右移 ROUTE_14_TO_HOSTAGE_MM → ⑤停下等 3s → ⑥摆 HOSTAGE_LOOK
+     *      → ⑦视觉对准 + 抓取 → ⑧右移 ROUTE_17_RIGHT_B_MM → ⑨航向校准
+     *      → ⑩右移 ROUTE_18_RIGHT_C_MM → ⑪航向校准 → ⑫停下(任务完成)
+     * ⭐ 为什么“后退”全改成“右移”: 车头右转 90°(顺时针)之后, 车体的【右】方向
+     *    正好等于原来的【后】方向 ⇒ 轨迹完全不变, 只是车身姿态转了 90°
+     *    (机械臂/摄像头的朝向随之改变)。 */
+    STATE_14_MOVE_FORWARD_B,                 // ① 车头右转 90°(名字沿用历史: 原来是“后退”)
+    STATE_15_TURN_FOR_HOSTAGE,               // ② 航向校准到 RESCUE_HEADING_DEG(-90°) + 同步航向基准
+    STATE_15C_RESCUE_ALIGN_SETTLE,           // ③ ⭐新增: 校准到位后原地停稳 RESCUE_ALIGN_SETTLE_MS(3s)
+    STATE_15B_RESCUE_APPROACH_RIGHT,         // ④ 右移 ROUTE_14_TO_HOSTAGE_MM
+    STATE_15A_RESCUE_STOP_WAIT,              // ⑤ 原地停等 RESCUE_STOP_WAIT_MS(3000ms)
+    STATE_16_RESCUE_RIGHT_A,                 // ⑥ 摆 ARM_POSE_HOSTAGE_LOOK(看人质)
     STATE_16A_RESCUE_HEADING_CORRECT,        // (未使用) 备用航向校正
-    STATE_17_RESCUE_RIGHT_B,                 // ⑥ 抓完后第 1 段后退 ROUTE_17_RIGHT_B_MM
-    STATE_17A_RESCUE_HEADING_CORRECT,        // ⑦ 航向校准
-    STATE_18_RESCUE_RIGHT_C,                 // ⑧ 抓完后第 2 段后退 ROUTE_18_RIGHT_C_MM
-    STATE_18A_RESCUE_HEADING_CORRECT,        // ⑨ 航向校正
-    STATE_19_RESCUE_RIGHT_D,                 // ⑩ 停下 → MISSION_STATE_COMPLETE
+    STATE_17_RESCUE_RIGHT_B,                 // ⑧ 抓完后第 1 段右移 ROUTE_17_RIGHT_B_MM
+    STATE_17A_RESCUE_HEADING_CORRECT,        // ⑨ 航向校准到 -90°
+    STATE_18_RESCUE_RIGHT_C,                 // ⑩ 抓完后第 2 段右移 ROUTE_18_RIGHT_C_MM
+    STATE_18A_RESCUE_HEADING_CORRECT,        // ⑪ 航向校准到 -90°
+    STATE_19_RESCUE_RIGHT_D,                 // ⑫ 停下 → MISSION_STATE_COMPLETE
     STATE_19A_RESCUE_HEADING_CORRECT,        // (未使用)
-    STATE_20_PERFORMING_HOSTAGE_RESCUE,      // ⑤ 底盘不动, 交给视觉子状态(任务 3=救援)
+    STATE_20_PERFORMING_HOSTAGE_RESCUE,      // ⑦ 底盘不动, 交给视觉子状态(任务 3=救援)
     STATE_21_RESCUE_RIGHT_E,                 // (未使用)
     STATE_21A_RESCUE_HEADING_CORRECT,        // (未使用)
     STATE_22_RESCUE_RIGHT_F,                 // (未使用)
