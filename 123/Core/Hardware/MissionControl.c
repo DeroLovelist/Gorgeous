@@ -824,12 +824,26 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 #define ROUTE_17_RIGHT_B_MM         650    /* ⭐ 抓完后第 1 段右移(mm)(原来叫“后退”) */
 #define ROUTE_18_RIGHT_C_MM         /* 890 */  916    /* ⭐ 抓完后第 2 段右移(mm)(原来叫“后退”) */
 
+/* ⭐⭐ 救援段(阶段四): ① 【转完 90° 之后】的这一小段【车头前进】 ------------------
+ *  作用状态 = STATE_15_TURN_FOR_HOSTAGE(即“①转完 90° → ②校准”里的 ②),
+ *  位置在“转完 → 校准 → 停稳 → 右移进救援区”之间, 也就是:
+ *      ①转90° → 【本步: 车头前进 N mm】 → ②航向校准 → ③停稳 → ④右移进救援区
+ *  为什么要前进这一段: 转完 90° 后车头朝 -90°, 车体【前方】= 场地“右”方向
+ *      (与 ④⑧⑩ 的右移同向) ⇒ 这一步实际是把车往“进救援区那一侧”先送一段,
+ *      用来补“原地转 90° 时车心位置偏了/离救援区入口还差一点”的差。
+ *  取值: 底盘到位死区 ≈ CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm ⇒
+ *      【实际位移 ≈ 本值 − 4.5mm】(填 50 → 实际约 45mm)。
+ *      ⚠️ 别小于 6 —— 会被死区吃掉、等于没动(还白等一次); 0 = 关掉这一步。
+ *  ⭐ 2026-10-07 实车调整: 用户要求“旋转后再前进 50mm” ⇒ 单独给 ② 用这个宏(50),
+ *      不再和 ⑨ 共用 ROUTE_RESCUE_FWD_MM。 */
+#define ROUTE_RESCUE_AFTER_TURN_MM   50    /* ②(转完90°后): 车头前进 50mm(实际约 45mm) */
+
 /* ⭐ 救援段(阶段四): 每次【航向纠正】之前, 先“挪最小一步”(mm)
- * 作用状态 = 阶段四的 3 处航向纠正(这是从“进救援区”到“终点”全部的纠正次数):
- *      ② STATE_15_TURN_FOR_HOSTAGE        (校准到 RESCUE_HEADING_DEG) → 用 ROUTE_RESCUE_FWD_MM
- *      ⑨ STATE_17A_RESCUE_HEADING_CORRECT                            → 用 ROUTE_RESCUE_FWD_MM
- *      ⑪ STATE_18A_RESCUE_HEADING_CORRECT (最后一次)                 → 用 ROUTE_RESCUE_LAST_STEP_MM
- * 符号约定(两个宏一样): >0 = 车头【前进】 | <0 = 车头【后退】 | 0 = 关掉这一步。
+ * 作用状态 = 阶段四剩下的 2 处航向纠正:
+ *      ⑨ STATE_17A_RESCUE_HEADING_CORRECT            → 用 ROUTE_RESCUE_FWD_MM
+ *      ⑪ STATE_18A_RESCUE_HEADING_CORRECT (最后一次) → 用 ROUTE_RESCUE_LAST_STEP_MM
+ *      (② STATE_15_TURN_FOR_HOSTAGE 改用上面那个 ROUTE_RESCUE_AFTER_TURN_MM=50)
+ * 符号约定(三个宏一样): >0 = 车头【前进】 | <0 = 车头【后退】 | 0 = 关掉这一步。
  * 为什么要先挪一步(与打靶走位的 ROUTE_12_P1_BACK_MM 同一个道理):
  *      一段平移跑完车是【停死】的, 麦轮停死时原地转正本来就容易转不到位
  *      (见 Chassis.h 的“卡住”检测); 先让轮子滚起来, 紧接的那次转向更容易到目标角。
@@ -840,8 +854,8 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * ⚠️ 底盘到位死区 ≈ CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm ⇒
  *      【实际位移 ≈ |本值| − 4.5mm】: 填 10 → 实际约 5.5mm; 填 8 → 实际约 3.5mm。
  *      ⚠️ 绝对值别小于 6 —— 会被死区吃掉、等于没动(还白等一次)。
- * ⭐ 2026-10-07 实车调整: 最后一次(⑪)方向反了 + 要小一点 ⇒ 单独用下面第二个宏(-8)。 */
-#define ROUTE_RESCUE_FWD_MM         -10    /* ②⑨: 车头前进 10mm(实际约 5.5mm) */
+ * ⭐ 2026-10-07 实车调整: 最后一次(⑪)方向反了 + 要小一点 ⇒ 单独用第二个宏(-8)。 */
+#define ROUTE_RESCUE_FWD_MM         -10    /* ⑨: 车头后退 10mm(实际约 5.5mm) */
 #define ROUTE_RESCUE_LAST_STEP_MM   (-8)  /* ⑪(最后一次): 车头【后退】8mm(实际约 3.5mm)。
                                            * 负数 = 后退; 想改回前进就去掉负号(填 8),
                                            * 想再小就填 -6(再小会被死区吃掉)。 */
@@ -1585,7 +1599,7 @@ static void Route_BackMinStep(void)
 /**
  * @brief  救援段: 航向纠正【之前】的“挪最小一步”(阻塞版, 可正可负)
  * @param  mm >0 = 车头前进 | <0 = 车头后退 | 0 = 直接返回(关闭这一步)
- * @note   ⭐ 2026-10-07 新增, 动机/取值/方向见 ROUTE_RESCUE_FWD_MM 处的说明。
+ * @note   ⭐ 2026-10-07 新增, 动机/取值/方向见 ROUTE_RESCUE_AFTER_TURN_MM / ROUTE_RESCUE_FWD_MM 处的说明。
  *         作用状态(阶段四的 3 处航向纠正): STATE_15_TURN_FOR_HOSTAGE /
  *         STATE_17A_RESCUE_HEADING_CORRECT / STATE_18A_RESCUE_HEADING_CORRECT。
  *         只做“挪一步”这一段, 【不发】转向指令 —— 转向仍由调用方紧接着发,
@@ -4882,16 +4896,20 @@ void Mission_Update(void)
              *    那段右移到位后小车正好到车场【拐角】, 只有在那儿原地转 90° 余量才充足;
              *    把转提前(或把那段右移改得太短)会让车在余量不足处转 → 扫出界。
              * 完整流程:
-             *   ①车头右转 90°(RESCUE_HEADING_DEG) → ②航向校准到 -90° + 设航向基准
+             *   ①车头右转 90°(RESCUE_HEADING_DEG) + 设航向基准
+             * → ①'【车头前进 ROUTE_RESCUE_AFTER_TURN_MM=50mm】(转完之后先送一段,
+             *       再校准/停稳/右移进救援区 —— 用户 2026-10-07 要求)
+             * → ②航向校准到 -90°
              * → ③校准【到位】后原地停稳 RESCUE_ALIGN_SETTLE_MS(3s)
              * → ④右移 ROUTE_14_TO_HOSTAGE_MM → ⑤停下等 RESCUE_STOP_WAIT_MS
              * → ⑥摆 ARM_POSE_HOSTAGE_LOOK → ⑦视觉对准 + 抓取(子状态机)
              * → ⑧右移 ROUTE_17_RIGHT_B_MM → ⑨航向校准
              * → ⑩右移 ROUTE_18_RIGHT_C_MM → ⑪航向校准 → ⑫停下(任务完成)
-             * ⭐ 2026-10-07 新增: 本阶段 3 处【航向纠正】(②⑨⑪) 之前都先做一次
-             *    “挪最小一步” Route_MinStep(): ②⑨ 用 ROUTE_RESCUE_FWD_MM(正数=车头前进),
-             *    最后一次 ⑪ 用 ROUTE_RESCUE_LAST_STEP_MM(负数=车头后退, 实车实测反过一次);
-             *    车停死后原地转正容易转不到位, 先让轮子滚起来更好转。
+             * ⭐ 2026-10-07: ②⑨⑪ 三处【航向纠正】之前都先挪一小步(Route_MinStep),
+             *    车停死后原地转正容易转不到位, 先让轮子滚起来更好转:
+             *      ② 用 ROUTE_RESCUE_AFTER_TURN_MM = 50  (转完后【车头前进 50mm】)
+             *      ⑨ 用 ROUTE_RESCUE_FWD_MM         = -10 (车头后退 10mm)
+             *      ⑪ 用 ROUTE_RESCUE_LAST_STEP_MM   = -8  (车头后退 8mm, 实车实测反过一次)
              *    ⚠️ 这 3 处就是“进救援区 → 终点”全部的航向纠正次数(共 3 次)。
              * ⭐ 为什么“后退”全改成“右移”: 车头右转 90°(顺时针)之后, 车体的
              *    【右】方向正好等于原来的【后】方向 ⇒ 轨迹不变、只是车身姿态转了 90°。
@@ -4911,8 +4929,8 @@ void Mission_Update(void)
             /* ② 航向校准: 转到绝对 -90°(顺带再确认一次航向基准)。
              *    转移条件 = 转向环自己判“到位”(Chassis_Task_Is_Complete) */
             case STATE_15_TURN_FOR_HOSTAGE:
-                /* ⭐ 2026-10-07: 航向纠正前先“挪最小一步”(见 ROUTE_RESCUE_FWD_MM) */
-                Route_MinStep(ROUTE_RESCUE_FWD_MM);
+                /* ⭐ 2026-10-07: 转完 90° 后先【车头前进 50mm】再校准(见 ROUTE_RESCUE_AFTER_TURN_MM) */
+                Route_MinStep(ROUTE_RESCUE_AFTER_TURN_MM);
                 Heading_AlignTo(RESCUE_HEADING_DEG);
                 break;
             /* ③ ⭐ 2026-10-07 新增: 校准【到位】之后原地停车再等
@@ -4939,7 +4957,7 @@ void Mission_Update(void)
              * (原来是“后退 ×2”; 车头已右转 90°, 所以右移 = 原来的后退方向) */
             case STATE_17_RESCUE_RIGHT_B:          Chassis_Move_Right(ROUTE_17_RIGHT_B_MM); break;
             case STATE_17A_RESCUE_HEADING_CORRECT:
-                Route_MinStep(ROUTE_RESCUE_FWD_MM);   /* ⭐ 转正前先挪一步(车头前进) */
+                Route_MinStep(ROUTE_RESCUE_FWD_MM);   /* ⭐ 转正前先挪一步(-10 = 车头后退) */
                 Heading_AlignTo(RESCUE_HEADING_DEG);
                 break;
             case STATE_18_RESCUE_RIGHT_C:          Chassis_Move_Right(ROUTE_18_RIGHT_C_MM); break;
