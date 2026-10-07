@@ -297,7 +297,9 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *    (旧版底座是 1190 ≈ 多转 90°, 那时才是“前后”; 2026-10-07 重新标定后改了)
  *    ⚠️ 2026-10-07: 救援前车头已【右转 90°】, 车体“前后”在场地里 = 车体“左右”:
  *      方案一: L → 小车前进;  R → 小车右移(原来是“后退”);  C → 不动
- *      方案二: L → ID1 朝一个方向转一步; R → 反向; C → 对准
+ *      方案二: L → ID1 朝一个方向转一步; R → 反向;
+ *              C → ⭐ 发 start_align 进【D 精对准】(见 RESCUE_USE_FINE_ALIGN),
+ *                  再用 D:x,y 的幅值自适应收敛到 ±RESCUE_ID1_ALIGN_TOL 后抓取
  *    ⚠️ 若以后改用【方案一】, 按上面表格它应当是 L→左移 / R→右移,
  *       并把 s_align_rescue 的 x_is_fb 改成 0(该分支当前没用到, 所以没动它)
  */
@@ -344,20 +346,26 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
                                          * 7 步, 都在 RESCUE_ID1_STEP_MAX 之内 */
 /* ⭐⭐ 救援精调(D:x,y)的【自适应步长】 (2026-10-07 新增, 与打靶同构) ------
  * 为什么: 收到 D:x,y 时如果一律用 RESCUE_ID1_STEP(60 码) 去修, 一步可能改掉
- *   上百像素, 而判定窗口只有 ±RESCUE_ID1_ALIGN_TOL(30px) ⇒ 会在窗口两边
+ *   上百像素, 而判定窗口只有 ±RESCUE_ID1_ALIGN_TOL(20px) ⇒ 会在窗口两边
  *   来回摆(打靶当初就是这个毛病, 见 TARGET_ID1_STEP_FINE 处的注释)。
  * 分档(误差大走大步求快, 误差小走小步求稳):
  *      |x| > RESCUE_ID1_STEP_BIG_PX(200) → RESCUE_ID1_STEP(60 码)
  *      |x| > RESCUE_ID1_STEP_MID_PX(60)  → RESCUE_ID1_STEP/2(30 码)
- *      否则                            → RESCUE_ID1_STEP_FINE(15 码)
- * ⚠️ 硬约束: 小步换算出的 px 必须 < 窗口半宽(30px), 否则永远跨过中心来回摆。
- *      按打靶实测的 1 码 ≈ 1.78px 估: 15 码 ≈ 27px < 30 ✓
+ *      否则                            → RESCUE_ID1_STEP_FINE(10 码)
+ * ⚠️ 硬约束: 小步换算出的 px 必须 < 窗口半宽(20px), 否则永远跨过中心来回摆。
+ *      按打靶实测的 1 码 ≈ 1.78px 估: 10 码 ≈ 18px < 20 ✓
  * ⭐ 怎么定准: 看日志 [救援][ID1步长标定] 那行“上一步 ID1 转 X 码, |x| a->b”:
  *      一步改的 px: < 10 → 太小(加大 FINE); 15~25 → 正合适; > 30 → 太大(必须减)。
  * 不想分档就把 FINE 改成和 RESCUE_ID1_STEP 一样即可。 */
 #define RESCUE_ID1_STEP_BIG_PX   200    /* 超过这么多 px 才用大步(= RESCUE_ID1_STEP) */
 #define RESCUE_ID1_STEP_MID_PX   60     /* 超过这么多 px 用中步(= RESCUE_ID1_STEP/2) */
-#define RESCUE_ID1_STEP_FINE     15     /* 小步(误差小时用, 决定能否收敛进 ±30px) */
+#define RESCUE_ID1_STEP_FINE     10     /* 小步(误差小时用, 决定能否收敛进 ±20px)。
+                                         * ⭐ 2026-10-07: 15 → 10, 是跟着
+                                         *    RESCUE_ID1_ALIGN_TOL(30 → 20) 一起改的:
+                                         *    按 1 码 ≈ 1.78px 估, 15 码 ≈ 27px > 窗口半宽
+                                         *    20px ⇒ 会跨过中心来回摆、永远收敛不了。
+                                         * ⚠️ 若日志 [救援][ID1步长标定] 显示 10 码改的 px
+                                         *    仍 ≥ 20, 就继续减(8 → 6)。 */
 #define RESCUE_ID1_LR_SIGN    (-1)      /* “收到 L”时 ID1 的增量符号:
                                          *  -1 = 数值减小 = 往【左】(与 RESCUE_ID1_LEFT_OFF
                                          *       的符号一致) ★当前实测值
@@ -404,11 +412,40 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *         嫌慢 → 减 MOVE/HOLD; 不要这个功能 → RESCUE_SWEEP_ENABLE = 0
  * ⭐ 2026-10-07: 巡视点位不再用固定 ±RESCUE_SWEEP_ANGLE, 而是直接用
  *    【实测的两个对准极限】(左 3827 / 右 651) —— 也就是把人质可能出现的
- *    整段范围都扫一遍, 命中率最高(见下面 s_rescue_sweep_code)。 */
-#define RESCUE_SWEEP_ENABLE     1
+ *    整段范围都扫一遍, 命中率最高(见下面 s_rescue_sweep_code)。
+ * ⭐⭐ 2026-10-07 用户要求: 关掉巡视(= 0), 省下那 ~11.5s。
+ *    ⚠️ 代价: 人质【完全不在】摄像头画面里时, K230 一行都不会回 —— 巡视本来是
+ *       “扫一圈去找它”的兜底, 关掉后就只能等 RESCUE_ID1_TIMEOUT_MS(20s) 超时
+ *       然后盲抓。人质在画面里(哪怕偏一边)时没影响: K230 会回 L/R 让 ID1 自己
+ *       转过去, 后面的“C → start_align → D 精对准”照旧。
+ *    想恢复: 把本行改回 1(点位/速度就是下面这两行, 不用改别的)。 */
+#define RESCUE_SWEEP_ENABLE     0
 #define RESCUE_SWEEP_MOVE_MS    1500    /* 挪到下一个角度的转动时间(值大 = 慢 = 画面不糊) */
 #define RESCUE_SWEEP_HOLD_MS    800     /* 每个角度停多久给 K230 识别 */
-#define RESCUE_ID1_ALIGN_TOL    30      /* 收到 D:x,y 时, |x| < 它就算对准(像素容差) */
+
+/* ⭐⭐ 2026-10-07 新增: 救援也走【D 精对准】(收到 C 之后再发 start_align)。
+ * 【为什么要加 —— “机械臂识别时一直转圈”的根因】
+ *   接近阶段 K230 只回 C/L/R, 【没有幅值】, 所以粗对准只能固定一步 60 码
+ *   (RESCUE_ID1_STEP ≈ 5.3° ≈ 107px)。而 K230 判“居中”的窗口只有 ±50px
+ *   ⇒ 一步就跨过整个窗口 → 它报反方向 → 再跨回来 → 一直来回摆,
+ *     直到 20 步 / 20s 兜底才盲抓(用户看到的就是“一直转圈”)。
+ *   发了 start_align 之后 K230 进 ALIGN、回 D:<x>,<y>(带幅值), 就能用
+ *   Rescue_Id1StepFor() 的【自适应步长】收敛(误差大走大步、小走小步)。
+ * 1 = 开启(默认); 0 = 关闭(回到“收到 C 就停稳抓取”的老行为)。
+ * ⚠️ 兜底(不会卡死): 发完 start_align 后
+ *    ① K230 一直不回任何数据(K230 端该任务没实现 ALIGN) → 等
+ *       VISION_RESPONSE_TIMEOUT_MS 就按“已对准”去抓;
+ *    ② 它还在回 C(仍在接近模式) → 收到 C 也照样去抓。 */
+#define RESCUE_USE_FINE_ALIGN   1
+
+/* 收到 D:x,y 时, |x| < 它就算对准(像素容差)。
+ * ⚠️⚠️ 必须与 RESCUE_ID1_STEP_FINE 配套(硬约束): 小步换算出的 px 必须 < 本窗口
+ *    的半宽, 否则永远跨过中心来回摆 —— 原来 30 配 FINE=15(≈27px < 30 ✓);
+ *    2026-10-07 用户要求收紧到 20 ⇒ FINE 同步改成 10(≈18px < 20 ✓)。
+ * ⚠️ 精度还有一层上限: K230 在 ALIGN 里判成功(回 OK)用的是【它自己的】容差
+ *    (形状/救援任务仍是 50px, 只有打靶被它收紧到 20px), 而它判成功后就停发误差
+ *    ⇒ 想真做到 20px, K230 端(yolo_main.py)也得改。 */
+#define RESCUE_ID1_ALIGN_TOL    20
 
 /* ---- ⭐ 救援“抓取位三选一” (2026-10-06 新增) -------------------------
  * 背景: 救援时底盘【完全不动】(HOSTAGE_LOOK 姿态下, 车和臂正好在三个目标
@@ -682,17 +719,18 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
                              /*正式地图*//*自己地图*/
 #define ROUTE_1_TO_QR_MM           656      /* 起点 → 二维码扫描点(直行) */
 #define ROUTE_3_LEFT_A_MM          557    /* 扫码后左移 A 段 */
-#define ROUTE_4_DIAG_FWD_MM        145      /* 左上斜跑: 前进分量(≈45°斜走) */
-#define ROUTE_4_DIAG_LEFT_MM       145     /* 左上斜跑: 左移分量(≈45°斜走) */
+#define ROUTE_4_DIAG_FWD_MM        125      /* 左上斜跑: 前进分量(≈45°斜走) */
+#define ROUTE_4_DIAG_LEFT_MM       125     /* 左上斜跑: 左移分量(≈45°斜走) */
 
 /* ---------- 过斜坡段 ---------- */
 #define ROUTE_5_TO_RAMP_MM         /*890*/   894    /* 斜坡前直行距离 */
-#define ROUTE_7_LEFT_B_MM          /*885 */  870 /* 左移 B 段 */
-#define ROUTE_7_LEFT_C_MM           413    /* 左移 C 段 */
+#define ROUTE_7_LEFT_B_MM          /*885 */  859 /* 左移 B 段 */
+#define ROUTE_7_LEFT_C_MM           408    /* 左移 C 段 */
 
 /* ---------- 排爆区走位 ---------- */
 #define ROUTE_8_TO_BOMB_AREA_MM     /* 990 */  998  /* 直行进入排爆区 */
-#define ROUTE_8B_RIGHT_MM           /* 672 */  672    /* 右移微调 */
+#define ROUTE_8B_RIGHT_MM           /* 672 */  722    /* 右移微调: 672 → 702 (+30mm)
+                                                      * 实测排爆区差一点到中心观看点; 每次 ±10~20mm 微调 */
 #define ROUTE_9_TURN_DEG            (0.1)  /* 转向排爆点(相对角度, 负=右转) */
 #define ROUTE_9A_LEFT_MM            0      /* 转向后左移微调 */
 #define ROUTE_10_APPROACH_MM        0     /* 接近炸弹最后一段直行 */
@@ -701,17 +739,40 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 #define ROUTE_12_P1_A_MM           /* 850 */  864    /* ⭐ 打靶第 1 段右移(mm): 排爆结束后从桶边右移这么多,
                                             * 然后做一个航向校正 */
 #define ROUTE_12_P1_B_MM            /*860 */  844    /* ⭐ 打靶第 2 段右移(mm): 航向校正完再右移这么多 */
+
+/* ⭐⭐ 2026-10-07 新增: 打靶走位途中, 【每次航向校正之前】的“后退最小一步”距离(mm)。
+ * 作用状态 = STATE_12_PART1_CORRECT_A / _CORRECT_B, 两个状态做法完全一样:
+ *      右移到位(车已停) → 后退 ROUTE_12_P1_BACK_MM → 再原地转正到 0°
+ * 为什么要退这一步:
+ *   ① 这段路每右移一次都攒一点航向误差(日志 HDG err 一路涨), 右移方向就被带歪,
+ *      走出来的路径会往【前】偏(实测“平移路程偏上”)—— 退一步就是把这个前偏掰回来;
+ *   ② 车完全停死时靠四轮差速原地转正本来就容易转不到位(见 Chassis.h 的“卡住”检测),
+ *      退一步让轮子先滚起来, 后面那次转向更容易到位。
+ * ⚠️ 后退发生在“右移段结束、车身已转回 0°”的时刻, 方向是车的【后方】:
+ *      它【不改】右移的左右行程(864 / 844 一点不动), 只改前后偏移 —— 正好就是“偏上”那个方向。
+ * 取值: 底盘到位死区 = CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm, 所以
+ *       【实际位移 ≈ 本值 − 4.5mm】: 填 10 → 实际退约 5.5mm, 两步合计约 11mm。
+ *       想退多点每次加 5~10；⚠️ 不要小于 6 —— 会被死区吃掉、等于没动。
+ *       0 = 关闭(回到“右移到位直接转正”的老行为)。
+ * ⭐ 2026-10-07 实车调整: 8 → 10(那两次航向校正前稍微退多一点)。 */
+#define ROUTE_12_P1_BACK_MM         13
+
 #define ROUTE_12_P1_C_MM            400    /* (未使用: MOVE_C 改成只摆 TARGET_LOOK, 不再走位) */
 #define ROUTE_12_TURN_A_DEG         400    /* (未使用: TURN_A/TURN_B 已不在流程里) */
-#define ROUTE_12_P2_A_MM           /* 602 */  590   /* ⭐ 打靶结束后的收尾右移距离(mm):
-                                            * 打完靶、手臂收回 SCAN_RESET 之后右移这么多
-                                            * (2026-10-07 实测确认 614) */
+#define ROUTE_12_P2_A_MM           /* 602 */  541   /* ⭐ 打靶收尾第 1 段 = 右移到【拐角】(mm):
+                                            * ⚠️ 2026-10-07 实测: 这段右移到位后小车正好到车场
+                                            * 拐角, 那里原地转 90° 的余量才充足(转就紧跟在它后面)。
+                                            * 590 → 560: 原来会略微冲过拐角, 减 20mm 让它停在
+                                            * 余量最足的位置。想微调就改这一个数(每次 ±10mm)。 */
 
-/* ⭐⭐ 2026-10-07 新增: 收尾右移 614mm 之后的【后退】距离(mm)
- * 作用状态 = STATE_12_PART2_MOVE_BACKWARD。
- * 顺序: 右移 ROUTE_12_P2_A_MM → 后退 ROUTE_12_P2_BACK_MM → 航向校正到 0°
- *      → 进救援阶段(车头右转 90° → 航向校准到位 → 原地停稳 3s → 右移进救援区)。
- * ⚠️ 此时车头还是 0° 方向, 所以这一段用的是“后退”(Chassis_Move_Backward)。 */
+/* ⭐ 打靶收尾第 2 段(mm) —— 作用状态 = STATE_12_PART2_MOVE_BACKWARD。
+ * 完整顺序(⚠️ 转 90° 必须排在最后, 理由见上):
+ *      打靶视觉结束 → ①右移 ROUTE_12_P2_A_MM(到【拐角】)
+ *      → ②后退 ROUTE_12_P2_BACK_MM
+ *      → ③航向校正到 0°
+ *      → ④进救援阶段: 右转90° → 校准到 -90° → 原地停稳 3s
+ *      → ⑤右移 ROUTE_14_TO_HOSTAGE_MM(进救援区) → 停等3s → 摆 HOSTAGE_LOOK
+ * ⚠️ 走到②时车头还是 0° ⇒ 用的是“后退”(Chassis_Move_Backward)。 */
 #define ROUTE_12_P2_BACK_MM         50
                                            
 #define ROUTE_12_P2_B_MM            200    /* (已废弃) */
@@ -762,6 +823,29 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 #define ROUTE_16_RIGHT_A_MM         300    /* (未使用: 该状态已改成“只摆 HOSTAGE_LOOK”) */
 #define ROUTE_17_RIGHT_B_MM         650    /* ⭐ 抓完后第 1 段右移(mm)(原来叫“后退”) */
 #define ROUTE_18_RIGHT_C_MM         /* 890 */  916    /* ⭐ 抓完后第 2 段右移(mm)(原来叫“后退”) */
+
+/* ⭐ 救援段(阶段四): 每次【航向纠正】之前, 先“挪最小一步”(mm)
+ * 作用状态 = 阶段四的 3 处航向纠正(这是从“进救援区”到“终点”全部的纠正次数):
+ *      ② STATE_15_TURN_FOR_HOSTAGE        (校准到 RESCUE_HEADING_DEG) → 用 ROUTE_RESCUE_FWD_MM
+ *      ⑨ STATE_17A_RESCUE_HEADING_CORRECT                            → 用 ROUTE_RESCUE_FWD_MM
+ *      ⑪ STATE_18A_RESCUE_HEADING_CORRECT (最后一次)                 → 用 ROUTE_RESCUE_LAST_STEP_MM
+ * 符号约定(两个宏一样): >0 = 车头【前进】 | <0 = 车头【后退】 | 0 = 关掉这一步。
+ * 为什么要先挪一步(与打靶走位的 ROUTE_12_P1_BACK_MM 同一个道理):
+ *      一段平移跑完车是【停死】的, 麦轮停死时原地转正本来就容易转不到位
+ *      (见 Chassis.h 的“卡住”检测); 先让轮子滚起来, 紧接的那次转向更容易到目标角。
+ * ⚠️ 方向: 走到这三处时车头【已经是】RESCUE_HEADING_DEG(-90°)(① 已经转过),
+ *      而 Chassis_Move_Forward 是【车体坐标系】的“朝车头”(见 Chassis.c 的 add_move),
+ *      所以“车头前进”挪的是【场地“右”】方向(与 ④⑧⑩ 的右移同向),
+ *      “车头后退”就是相反那一侧 —— 别按字面理解成“朝场地前方”。
+ * ⚠️ 底盘到位死区 ≈ CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm ⇒
+ *      【实际位移 ≈ |本值| − 4.5mm】: 填 10 → 实际约 5.5mm; 填 8 → 实际约 3.5mm。
+ *      ⚠️ 绝对值别小于 6 —— 会被死区吃掉、等于没动(还白等一次)。
+ * ⭐ 2026-10-07 实车调整: 最后一次(⑪)方向反了 + 要小一点 ⇒ 单独用下面第二个宏(-8)。 */
+#define ROUTE_RESCUE_FWD_MM         -10    /* ②⑨: 车头前进 10mm(实际约 5.5mm) */
+#define ROUTE_RESCUE_LAST_STEP_MM   (-8)  /* ⑪(最后一次): 车头【后退】8mm(实际约 3.5mm)。
+                                           * 负数 = 后退; 想改回前进就去掉负号(填 8),
+                                           * 想再小就填 -6(再小会被死区吃掉)。 */
+
 #define ROUTE_19_RIGHT_D_MM         800    /* (未使用) */
 #define ROUTE_21_RIGHT_E_MM         0//300    /* (未使用) */
 #define ROUTE_22_RIGHT_F_MM         0//500    /* (未使用) */
@@ -1459,6 +1543,87 @@ static void Heading_AlignTo(float heading_deg)
 {
     Chassis_SetHeadingRef(heading_deg);
     Chassis_Rotate_To(heading_deg);
+}
+
+/**
+ * @brief  打靶走位途中: 航向校正【之前】的“停-后退最小一步”(阻塞版)
+ * @note   ⭐ 2026-10-07 新增, 动机/取值见 ROUTE_12_P1_BACK_MM 处的说明。
+ *         只做“后退”这一段, 【不发】转向指令 —— 转向仍由调用方紧接着发,
+ *         这样 CORRECT_A/B 各自原来的“非阻塞发转向 + 转移条件里等
+ *         Chassis_Task_Is_Complete()”写法完全不变, 只是前面多退了一小步。
+ *         ⚠️ 必须【阻塞等到位】才返回: 后退还没走完就发转向, 转向会把这一段
+ *            覆盖掉(Chassis_Rotate 内部 s_moving=false)。
+ *         ⚠️ 用 Mission_Coop_Wait 等(不是 HAL_Delay): 期间照刷陀螺仪 yaw、照收 K230 行,
+ *            否则航向保持/转向环读到冻结角度。3.5s 超时兜底(与底盘自己的单段超时对齐)。
+ */
+static void Route_BackMinStep(void)
+{
+    uint32_t t0;
+    float yaw_before;
+
+    if (ROUTE_12_P1_BACK_MM <= 0) {
+        return;   /* 关掉这一步: 直接回“到位就转正”的老行为 */
+    }
+    yaw_before = Chassis_GetYaw();   /* 横移那段攒下的航向偏差(后退之前) */
+    t0 = HAL_GetTick();
+    Chassis_Move_Backward(ROUTE_12_P1_BACK_MM);
+    while (!Chassis_Task_Is_Complete() && (HAL_GetTick() - t0) < 3500u) {
+        Mission_Coop_Wait(20);
+    }
+    /* 这一步【必须】自己打日志: 底盘的 MOVE 行是中断里攒、由
+     * Chassis_FlushPendingLog() 打印的, 而那个函数本工程【没有任何地方调用】
+     * (既有问题, 不是这次改的) ⇒ 那段后退的距离不会自己出现在日志里。
+     * 读这两个 yaw:
+     *   后退前 = 这段右移一共攒了多少航向偏差(判断“偏上”的根因, 期望越小越好);
+     *   后退后 = 后退这一步自己又把车头带偏/纠回了多少(航向保持一直在纠, 所以
+     *            它通常已经吃掉一部分) —— 剩下的就交给紧接着的转正动作。 */
+    MLOG("打靶走位: 校正前先后退 %dmm (耗时 %lums; yaw 后退前 %.1f° -> 后退后 %.1f°)",
+         (int)ROUTE_12_P1_BACK_MM, (unsigned long)(HAL_GetTick() - t0),
+         (double)yaw_before, (double)Chassis_GetYaw());
+}
+
+/**
+ * @brief  救援段: 航向纠正【之前】的“挪最小一步”(阻塞版, 可正可负)
+ * @param  mm >0 = 车头前进 | <0 = 车头后退 | 0 = 直接返回(关闭这一步)
+ * @note   ⭐ 2026-10-07 新增, 动机/取值/方向见 ROUTE_RESCUE_FWD_MM 处的说明。
+ *         作用状态(阶段四的 3 处航向纠正): STATE_15_TURN_FOR_HOSTAGE /
+ *         STATE_17A_RESCUE_HEADING_CORRECT / STATE_18A_RESCUE_HEADING_CORRECT。
+ *         只做“挪一步”这一段, 【不发】转向指令 —— 转向仍由调用方紧接着发,
+ *         这样各状态原来的“非阻塞发转向 + 转移条件里等
+ *         Chassis_Task_Is_Complete()”写法完全不变, 只是前面多走了一小步。
+ *         ⚠️ 必须【阻塞等到位】才返回: 这一步还没走完就发转向, 转向会把它
+ *            覆盖掉(Chassis_Rotate 内部 s_moving=false)。
+ *         ⚠️ 用 Mission_Coop_Wait 等(不是 HAL_Delay): 期间照刷陀螺仪 yaw、照收 K230 行,
+ *            否则航向保持/转向环读到冻结角度。3.5s 超时兜底(与底盘自己的单段超时对齐)。
+ */
+static void Route_MinStep(int32_t mm)
+{
+    uint32_t t0;
+    float yaw_before;
+
+    if (mm == 0) {
+        return;   /* 关掉这一步: 直接回“到位就直接转正”的老行为 */
+    }
+    yaw_before = Chassis_GetYaw();   /* 平移那段攒下的航向偏差(挪之前) */
+    t0 = HAL_GetTick();
+    if (mm > 0) {
+        Chassis_Move_Forward(mm);
+    } else {
+        Chassis_Move_Backward(-mm);
+    }
+    while (!Chassis_Task_Is_Complete() && (HAL_GetTick() - t0) < 3500u) {
+        Mission_Coop_Wait(20);
+    }
+    /* 这一步【必须】自己打日志: 底盘的 MOVE 行是中断里攒、由
+     * Chassis_FlushPendingLog() 打印的, 而那个函数本工程【没有任何地方调用】
+     * (既有问题, 不是这次改的) ⇒ 这一段挪的距离不会自己出现在日志里。
+     * 读这两个 yaw: 挪之前 = 这段平移攒了多少航向偏差; 挪之后 = 这一步
+     * 被航向保持纠掉/带偏了多少(剩下的交给紧接着的转正动作)。
+     * ⭐ 日志里带“车头前进/车头后退”字样, 实车一眼就能核对方向有没有给反。 */
+    MLOG("救援: 纠正前先挪 %dmm(%s; 耗时 %lums; yaw %.1f° -> %.1f°)",
+         (int)mm, (mm > 0) ? "车头前进" : "车头后退",
+         (unsigned long)(HAL_GetTick() - t0),
+         (double)yaw_before, (double)Chassis_GetYaw());
 }
 
 /* ================= 机械臂动作序列 ================= */
@@ -3008,6 +3173,8 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
     static uint32_t rescue_id1_tick   = 0;      /* 本次 L/R 对准起始时刻(防卡死②) */
     static uint32_t rescue_id1_move_tick = 0;   /* 本步 ID1 开始转动时刻 */
     static uint8_t  rescue_swept      = 0;      /* 0=本轮救援还没做 ID1 巡视 */
+    static uint8_t  rescue_fine_req   = 0;      /* 1=已发 start_align(进入 D 精对准阶段),
+                                                 *   见 RESCUE_USE_FINE_ALIGN */
     static uint8_t  rescue_have_first = 0;      /* 1=巡视截下了一行, 下一轮先用它 */
     static char     rescue_first_line[K230_LINE_MAX]; /* 巡视中止时截下的那一行 */
     /* ⭐ 救援精调(ID1)步长标定用: 与打靶的 target_last_dy* 同构 */
@@ -3622,7 +3789,11 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                 target_last_dy_step  = 0;
                 target_sub_state  = TARGET_IDLE;
                 g_vision_task_in_progress = 0;
-                /* ⭐ 打靶结束 → 右移 400mm(STATE_12_PART2_MOVE_A) → 航向校正 → 救援 */
+                /* ⭐ 打靶结束 → 右移 ROUTE_12_P2_A_MM(到【拐角】) → 后退 → 校 0° → 救援(转90°)
+                 * ⚠️⚠️ 2026-10-07 实测结论 —— 【别再把转提前】:
+                 *    这段右移到位后小车正好到车场【拐角】, 那里原地转 90° 的余量才充足;
+                 *    把转提前到打靶位、或把这段右移改得太短, 都会在余量不足的地方转 → 扫出界。
+                 *    (11:39 曾试过“打靶一结束就转”, 按这条结论已改回) */
                 g_mission_state = STATE_12_PART2_MOVE_A;
                 break;
 
@@ -3748,15 +3919,46 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                                     rescue_id1_move_tick = HAL_GetTick();
                                     rescue_sub_state = RESCUE_ID1_MOVING;
                                 } else {
-                                    /* 'C': 认为已对准 → 停稳后去抓
+                                    /* 'C': 粗对准完成(K230 说目标已居中)
                                      * (不直接上 RESCUE_PERFORM, 而是绕一下 RESCUE_SETTLE,
                                      *  等 ID1 完全停稳再夹, 免得还在动就把人质抱歪) */
+                                    if (RESCUE_USE_FINE_ALIGN && !rescue_fine_req) {
+                                        /* ⭐ 2026-10-07: C 之后再发 start_align, 让 K230 从
+                                         *    接近(只回 C/L/R, 没有幅值)切到 ALIGN(回 D:x,y,
+                                         *    带幅值) —— 只有拿到幅值, ID1 才能用“按误差大小
+                                         *    自适应”的小步收进 ±RESCUE_ID1_ALIGN_TOL;
+                                         *    否则固定 60 码一步会一直跨过窗口来回摆, 也就是
+                                         *    用户看到的“机械臂识别时一直转圈”。
+                                         *    ⚠️ rescue_heard 已为 1 ⇒ 不会再重发 run_task:4,
+                                         *       否则会把 K230 从 ALIGN 拽回 APPROACH。
+                                         *    (与打靶 TARGET_FINE_IDLE 的处理完全一致) */
+                                        rescue_fine_req = 1;
+                                        MLOG("[救援] 收到C(共粗转%u步) -> 发 start_align 进入精对准(D:x,y)",
+                                             (unsigned)rescue_id1_steps);
+                                        K230_Start_Align();
+                                        K230_FlushAll();
+                                        break;   /* 留在本状态: 由下面的 D 分支小步微调 */
+                                    }
+                                    /* 已发过 start_align 又收到 C: K230 那边可能没实现 ALIGN
+                                     * (还在用接近模式回 C/L/R) → 按 C 处理, 别干等 */
                                     MLOG("[救援] 收到C(共转%u步) -> 停稳后抓取",
                                          (unsigned)rescue_id1_steps);
                                     Chassis_Stop();
                                     settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
                                     rescue_sub_state = RESCUE_SETTLE;
                                 }
+                            } else if (strncmp(line, "OK", 2) == 0) {
+                                /* ⭐ 2026-10-07: K230 在 ALIGN 里判“对准成功”会回 OK
+                                 *    (打靶那边还会先发 FIRE)。它判成功后就停发误差了,
+                                 *    所以收到就直接去抓, 不要再干等 D 帧。
+                                 *    ⚠️ 它用的是【K230 自己的】容差(形状/救援仍是 50px),
+                                 *       要真做到 ±RESCUE_ID1_ALIGN_TOL(20px) 得改 K230 端。 */
+                                rescue_heard = 1;
+                                MLOG("[救援] 精对准完成(收到 OK, 共微调%u步) -> 停稳后抓取",
+                                     (unsigned)rescue_id1_steps);
+                                Chassis_Stop();
+                                settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
+                                rescue_sub_state = RESCUE_SETTLE;
                             } else if (pD != NULL) {
                                 /* ---- ⭐ D:<x>,<y> —— 认为“已发现目标”, 用 x 小步修 ID1 ----
                                  * 和打靶同构: K230 的 x = 画面中 - 目标x, x>0 = 目标偏画面左,
@@ -3768,7 +3970,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                                 if (abs(err_x) >= RESCUE_ID1_ALIGN_TOL) {
                                     /* ⭐ 步长按误差大小自适应(与打靶同构, 见
                                      *    Rescue_Id1StepFor): 一律 60 码一步会跨过
-                                     *    ±30px 的窗口来回摆, 收敛不了 */
+                                     *    ±RESCUE_ID1_ALIGN_TOL 的窗口来回摆, 收敛不了 */
                                     int32_t d = Rescue_Id1StepFor(err_x);
 
                                     /* 标定步长用: 打“上一步 ID1 【实际】转了多少码、|x| 变了多少” */
@@ -3800,6 +4002,17 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                             } else {
                                 MLOG("[救援] 忽略无关行: %s (继续等 C/L/R 或 D:x,y)", line);
                             }
+                        } else if (rescue_fine_req &&
+                                   K230_RxSilenceMs() > VISION_RESPONSE_TIMEOUT_MS) {
+                            /* ⭐ 兜底: 发完 start_align 后 K230 一直没回任何数据
+                             *    (K230 端该任务没实现 ALIGN / 它自己卡住) → 按“已对准”
+                             *    去抓, 不在这里干等到 RESCUE_ID1_TIMEOUT_MS(20s)。 */
+                            MLOG("[救援] 已发 start_align 但 %lums 没收到任何数据"
+                                 "(K230 该任务可能没实现精对准) -> 按已对准兜底去抓取",
+                                 (unsigned long)K230_RxSilenceMs());
+                            Chassis_Stop();
+                            settle_until = HAL_GetTick() + FINE_TUNE_SETTLE_MS;
+                            rescue_sub_state = RESCUE_SETTLE;
                         } else if (!rescue_heard &&
                                    (!g_vision_task_in_progress ||
                                     HAL_GetTick() - vision_cmd_tick >= VISION_CMD_RESEND_MS)) {
@@ -3920,6 +4133,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                 rescue_id1_inited = 0;
                 rescue_heard      = 0;
                 rescue_swept      = 0;
+                rescue_fine_req   = 0;      /* 下次救援重新走“C → start_align → D 精对准” */
                 rescue_have_first = 0;
                 rescue_last_dx_valid = 0;   /* 步长标定统计也清掉(下次救援重新开始) */
                 rescue_last_dx_step  = 0;
@@ -4578,9 +4792,9 @@ void Mission_Update(void)
             case STATE_11_PERFORMING_BOMB_DISPOSAL: Chassis_Stop(); break;                    /* 停下, 交给视觉子状态机 */
 
             /* ---------- 阶段二: 打靶 ----------
-             * 走位链(2026-10-05 定稿):
-             *   MOVE_A(右移 ROUTE_12_P1_A_MM) →  CORRECT_A(航向校正到 0°)
-             * → MOVE_B(再右移 ROUTE_12_P1_B_MM) →  CORRECT_B(停车)
+             * 走位链(2026-10-07 加“后退最小一步”):
+             *   MOVE_A(右移 ROUTE_12_P1_A_MM) →  CORRECT_A(后退 ROUTE_12_P1_BACK_MM → 航向校正到 0°)
+             * → MOVE_B(再右移 ROUTE_12_P1_B_MM) →  CORRECT_B(后退 ROUTE_12_P1_BACK_MM → 转正 + 停稳)
              * → MOVE_C(摆 ARM_POSE_TARGET_LOOK) →  STATE_13 打靶视觉对准
              * 打完靶收尾: PART2_MOVE_A(右移) → PART2_CORRECT_A(航向校正) → 救援
              *
@@ -4593,7 +4807,11 @@ void Mission_Update(void)
             case STATE_12_PART1_MOVE_A:       Chassis_Move_Right(ROUTE_12_P1_A_MM); break;  /* ⭐ 第1段右移 */
             /* ⭐ 右移到位后先做航向校正(转到给对 0°), 防止两次右移的累积误差。
              *    之后 MOVE_B 继续右移, CORRECT_B 停车, MOVE_C 才摆臂。 */
-            case STATE_12_PART1_CORRECT_A:    Turn_Angle_Compat(0.1f);break;
+            case STATE_12_PART1_CORRECT_A:
+                /* ⭐ 2026-10-07: 先停-后退最小一步, 再原地转正(见 ROUTE_12_P1_BACK_MM) */
+                Route_BackMinStep();
+                Turn_Angle_Compat(0.1f);
+                break;
             case STATE_12_PART1_MOVE_B:       Chassis_Move_Right(ROUTE_12_P1_B_MM); break;  
             case STATE_12_PART1_CORRECT_B:
                 /* ⭐ 2026-10-06: 原来这里【只停车、不校正航向】—— 实测右移 850mm
@@ -4604,6 +4822,7 @@ void Mission_Update(void)
                  *    紧接着 Rotate_To 又开转向 —— 两个状态混在同一拍里容易让
                  *    Chassis_Task_Is_Complete() 的判定提前成立(转一半就判“完成”)。
                  *    转向结束时它自己会调 Chassis_Stop()。 */
+                Route_BackMinStep();   /* ⭐ 2026-10-07: 先停-后退最小一步, 再原地转正 */
                 Chassis_Rotate_To(0.0f);
                 s_target_stop_tick = HAL_GetTick();
                 break;  
@@ -4641,16 +4860,14 @@ void Mission_Update(void)
             case STATE_12_TURN_A:             break;//Chassis_Move_Right(ROUTE_12_TURN_A_DEG);
             case STATE_12_TURN_B:             break;//Turn_Angle_Compat(0.1f);
 
-            /* ⭐ 打靶收尾 (2026-10-07 新增一段“后退”):
-             *   手臂收回 SCAN_RESET 之后: ①右移 ROUTE_12_P2_A_MM(614)
-             *   → ②后退 ROUTE_12_P2_BACK_MM(50) → ③航向校正到 0°
-             *   → ④进救援阶段(车头右转 90°)。
-             *   ⚠️ 此时车头还是 0° 方向, 所以②用的是“后退”(Chassis_Move_Backward)。
-             *   (后面的 MOVE_B/CORRECT_B/MOVE_C 未使用) */
-            case STATE_12_PART2_MOVE_A:       Chassis_Move_Right(ROUTE_12_P2_A_MM); break;  /* ⭐ 打靶后右移 ROUTE_12_P2_A_MM */
-            /* ⭐ 2026-10-07 新增: 右移 614 之后再后退 ROUTE_12_P2_BACK_MM */
+            /* ⭐ 打靶收尾三段 —— 顺序: 右移(到拐角) → 后退 → 校0° → 才进救援阶段转 90°。
+             * ⚠️⚠️ 2026-10-07 实测: 这三段【必须在转 90° 之前】走完 —— 右移到位后小车
+             *    正好到车场【拐角】, 只有在那儿原地转 90° 的余量才充足。
+             *    ⇒ 此时车头还是 0°, 所以②用的是“后退”(Chassis_Move_Backward)。
+             * (后面的 MOVE_B/CORRECT_B/MOVE_C 未使用) */
+            case STATE_12_PART2_MOVE_A:       Chassis_Move_Right(ROUTE_12_P2_A_MM); break;   /* ⭐ 右移到【拐角】 */
             case STATE_12_PART2_MOVE_BACKWARD: Chassis_Move_Backward(ROUTE_12_P2_BACK_MM); break;
-            case STATE_12_PART2_CORRECT_A:    Turn_Angle_Compat(0.1f); break;               /* ⭐ 航向校正 → 救援 */
+            case STATE_12_PART2_CORRECT_A:    Turn_Angle_Compat(0.1f); break;                /* ⭐ 校 0° → 进救援阶段转 90° */
             case STATE_12_PART2_MOVE_B:       break;   /* 已废弃 */
             case STATE_12_PART2_CORRECT_B:    break;//Turn_Angle_Compat(0.1f); break;                 /* 航向校正 */
             case STATE_12_PART2_MOVE_C:       break; //Chassis_Move_Right(ROUTE_12_P2_C_MM); break;  /* Part2 第3段 */
@@ -4661,6 +4878,9 @@ void Mission_Update(void)
             case STATE_13_PERFORMING_TARGETING: break;
 
             /* ---------- 阶段四: 救援 (2026-10-07 改为“先掉头, 再横移”) ----------
+             * ⭐⭐ 2026-10-07 实测(顺序不能颠倒): ①~③【必须】跑在打靶收尾那三段平移之后 ——
+             *    那段右移到位后小车正好到车场【拐角】, 只有在那儿原地转 90° 余量才充足;
+             *    把转提前(或把那段右移改得太短)会让车在余量不足处转 → 扫出界。
              * 完整流程:
              *   ①车头右转 90°(RESCUE_HEADING_DEG) → ②航向校准到 -90° + 设航向基准
              * → ③校准【到位】后原地停稳 RESCUE_ALIGN_SETTLE_MS(3s)
@@ -4668,11 +4888,18 @@ void Mission_Update(void)
              * → ⑥摆 ARM_POSE_HOSTAGE_LOOK → ⑦视觉对准 + 抓取(子状态机)
              * → ⑧右移 ROUTE_17_RIGHT_B_MM → ⑨航向校准
              * → ⑩右移 ROUTE_18_RIGHT_C_MM → ⑪航向校准 → ⑫停下(任务完成)
+             * ⭐ 2026-10-07 新增: 本阶段 3 处【航向纠正】(②⑨⑪) 之前都先做一次
+             *    “挪最小一步” Route_MinStep(): ②⑨ 用 ROUTE_RESCUE_FWD_MM(正数=车头前进),
+             *    最后一次 ⑪ 用 ROUTE_RESCUE_LAST_STEP_MM(负数=车头后退, 实车实测反过一次);
+             *    车停死后原地转正容易转不到位, 先让轮子滚起来更好转。
+             *    ⚠️ 这 3 处就是“进救援区 → 终点”全部的航向纠正次数(共 3 次)。
              * ⭐ 为什么“后退”全改成“右移”: 车头右转 90°(顺时针)之后, 车体的
              *    【右】方向正好等于原来的【后】方向 ⇒ 轨迹不变、只是车身姿态转了 90°。
              * ⚠️ ⑦ 的对准方式由 RESCUE_SCHEME_ID1 切换(1=转 ID1 车不动 / 0=动底盘)。
              * ------------------------------------------------------------------ */
-            /* ① 车头【右转 90°】
+            /* ① 车头【右转 90°】—— 位置由打靶收尾那三段平移决定:
+             *    右移(到【拐角》) → 后退50 → 校0° 之后才轮到它(见 STATE_12_PART2_*);
+             *    只有在那儿转的余量才够, 别提前。
              *    ⚠️ 必须同时把【航向基准】改成 -90°: 下面④的 Chassis_Move_Right
              *       是靠“航向保持”走直线的, 基准还是 0° 的话车会被一路拽回原朝向。 */
             case STATE_14_MOVE_FORWARD_B:
@@ -4683,9 +4910,13 @@ void Mission_Update(void)
                 break;
             /* ② 航向校准: 转到绝对 -90°(顺带再确认一次航向基准)。
              *    转移条件 = 转向环自己判“到位”(Chassis_Task_Is_Complete) */
-            case STATE_15_TURN_FOR_HOSTAGE:        Heading_AlignTo(RESCUE_HEADING_DEG); break;
+            case STATE_15_TURN_FOR_HOSTAGE:
+                /* ⭐ 2026-10-07: 航向纠正前先“挪最小一步”(见 ROUTE_RESCUE_FWD_MM) */
+                Route_MinStep(ROUTE_RESCUE_FWD_MM);
+                Heading_AlignTo(RESCUE_HEADING_DEG);
+                break;
             /* ③ ⭐ 2026-10-07 新增: 校准【到位】之后原地停车再等
-             *    RESCUE_ALIGN_SETTLE_MS(3s) 才允许右移。
+             *    RESCUE_ALIGN_SETTLE_MS(3s) 才允许右移进救援区。
              *    目的: 防止“车头刚转到 90° 上下、角速度/车身还在晃”就横移
              *    (那时横移的航向保持会拿残余角当基准 → 越走越斜)。
              *    ⚠️ 顺序是“先到位、后计时”, 不是“最多等 3 秒”。 */
@@ -4707,9 +4938,16 @@ void Mission_Update(void)
             /* ⑧⑨⑩⑪ 抓完后的撒退: 右移650 → 航向 → 右移890 → 航向
              * (原来是“后退 ×2”; 车头已右转 90°, 所以右移 = 原来的后退方向) */
             case STATE_17_RESCUE_RIGHT_B:          Chassis_Move_Right(ROUTE_17_RIGHT_B_MM); break;
-            case STATE_17A_RESCUE_HEADING_CORRECT: Heading_AlignTo(RESCUE_HEADING_DEG); break;
+            case STATE_17A_RESCUE_HEADING_CORRECT:
+                Route_MinStep(ROUTE_RESCUE_FWD_MM);   /* ⭐ 转正前先挪一步(车头前进) */
+                Heading_AlignTo(RESCUE_HEADING_DEG);
+                break;
             case STATE_18_RESCUE_RIGHT_C:          Chassis_Move_Right(ROUTE_18_RIGHT_C_MM); break;
-            case STATE_18A_RESCUE_HEADING_CORRECT: Heading_AlignTo(RESCUE_HEADING_DEG); break;
+            case STATE_18A_RESCUE_HEADING_CORRECT:
+                /* ⭐ 最后一次纠正: 方向给反过一次 ⇒ 用 ROUTE_RESCUE_LAST_STEP_MM(负数=车头后退) */
+                Route_MinStep(ROUTE_RESCUE_LAST_STEP_MM);
+                Heading_AlignTo(RESCUE_HEADING_DEG);
+                break;
             /* ⑫ 停下 → 结束(转移里置 MISSION_STATE_COMPLETE) */
             case STATE_19_RESCUE_RIGHT_D:          break;
 
@@ -4851,13 +5089,12 @@ void Mission_Update(void)
         case STATE_12_TURN_A:             break;   /* 未使用 */
         case STATE_12_TURN_B:             break;   /* 未使用 */
         case STATE_12_PART2_MOVE_A:       if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        /* ⭐ 2026-10-07 新增: 右移 614 到位 → 后退 ROUTE_12_P2_BACK_MM */
         case STATE_12_PART2_MOVE_BACKWARD: if (Chassis_Task_Is_Complete()) g_mission_state++; break;
-        /* ⭐ 打靶收尾: 右移614 + 后退50 到位, 且航向校正完成后, 直接跳进救援阶段 */
+        /* ⭐ 打靶收尾: 右移(到拐角) + 后退50 到位, 且校完 0° 后, 进救援阶段去转 90° */
         case STATE_12_PART2_CORRECT_A:    if (Chassis_Task_Is_Complete()) g_mission_state = STATE_14_MOVE_FORWARD_B; break;
         case STATE_12_PART2_MOVE_B:       break;   /* 已废弃 */
         case STATE_12_PART2_CORRECT_B:    break;   /* 已废弃 */
-        /* 打靶: 进入视觉辅助子状态机(内部处理完会自己跳到 STATE_12_PART2_MOVE_A) */
+        /* 打靶: 进入视觉辅助子状态机(内部处理完会跳到 STATE_12_PART2_MOVE_A 走打靶收尾) */
         case STATE_12_PART2_MOVE_C:       break;   /* 已废弃 */
         case STATE_13_PERFORMING_TARGETING: Handle_Vision_Alignment(2); break;
 
@@ -4869,7 +5106,8 @@ void Mission_Update(void)
             }
             break;
 
-        /* ③ 校准到位后原地停稳 RESCUE_ALIGN_SETTLE_MS, 时间到 → ④ 右移进救援区 */
+        /* ③ 校准到位后原地停稳 RESCUE_ALIGN_SETTLE_MS, 时间到 → ④ 右移进救援区
+         *    (打靶收尾那三段平移已经在转之前走完了, 见 STATE_12_PART2_*) */
         case STATE_15C_RESCUE_ALIGN_SETTLE:
             if ((HAL_GetTick() - s_rescue_align_tick) >= RESCUE_ALIGN_SETTLE_MS) {
                 g_mission_state++;
