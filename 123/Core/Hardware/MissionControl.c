@@ -126,7 +126,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
                                         * 太大→对准变慢 */
 #define FINE_TUNE_SETTLE_MS     500    /* 判“已对准/停稳”后额外停车等待时间,
                                         * 等惯性晃动结束再执行(抓/打)。建议 300~800 */
-#define FORCE_GRAB_AFTER_MS     15000  /* 精对准开始后超过该时长(ms)仍未对准:
+#define FORCE_GRAB_AFTER_MS     20000  /* 精对准开始后超过该时长(ms)仍未对准:
                                         * 放弃继续对准, 直接执行任务(防超时卡死) */
 #define QR_SIM_WAIT_MS          1000   /* 测试模式: 到扫码点后停车等待多久才模拟扫到码 */
 
@@ -528,39 +528,71 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * 实测换算: 60 码 ≈ 107px(日志: x=-57px 转 +60 码后 下一帧变成 x=+50px)
  *          ⇒ 1 码 ≈ 1.78px
  * ⚠️ 为什么必须自适应: 60 码一步就能改 107px, 而判定窗口只有 ±TARGET_ALIGN_TOLERANCE
- *    (K230 已从 ±50px 收紧到 ±20px, 总宽只剩 40px) —— 一律用 60 码会在窗口两边
- *    来回摆(旧日志里 393/333 反复 7 次就是这个原因), 根本收敛不了。
+ *    (窗口先收到 ±20px, 2026-10-08 又跟着 K230 收到 ±11px; 本机用 10px) ——
+ *    一律用 60 码会在窗口两边来回摆(旧日志里 393/333 反复 7 次就是这个原因),
+ *    根本收敛不了。
  * 分档(误差大走大步求快, 误差小走小步求稳):
  *    |x| > TARGET_ID1_STEP_BIG_PX(200) → TARGET_ID1_STEP(60 码 ≈ 107px)
  *    |x| > TARGET_ID1_STEP_MID_PX(50)  → 一半(30 码 ≈ 53px)
- *    否则                              → TARGET_ID1_STEP_FINE(10 码 ≈ 18px)
- * ⚠️ 硬约束: TARGET_ID1_STEP_FINE 换算出的 px(≈18px) 必须 < 窗口半宽(20px),
- *    否则永远跨过中心来回摆。想再稳就继续减 FINE, 想再快就加大 BIG/MID 两档。 */
+ *    否则                              → TARGET_ID1_STEP_FINE(5 码 ≈ 9px)
+ * ⚠️ 硬约束: TARGET_ID1_STEP_FINE 换算出的 px 必须 < 窗口半宽
+ *    (窗口已收紧到 TARGET_ALIGN_TOLERANCE=10px ⇒ FINE 必须 ≤ 9px)
+ *    ⭐ 2026-10-08: 10 码(≈18px) 是按"窗口 20px"定的; 窗口改 10px 后
+ *    18px 一步就会跨过中心来回摆 ⇒ FINE 同步改成 5 码(≈9px)。
+ *    想再稳就继续减 FINE, 想再快就加大 BIG/MID 两档。 */
 #define TARGET_ID1_STEP_BIG_PX   200    /* 超过这么多 px 才用大步 */
 #define TARGET_ID1_STEP_MID_PX   50     /* 超过这么多 px 用中步(原来 100, 随窗口收紧改小) */
-#define TARGET_ID1_STEP_FINE     10     /* 小步(≈18px < 20px, 一定落进容差) */
+#define TARGET_ID1_STEP_FINE     5      /* 小步(≈9px < 10px, 一定落进容差) */
 
 /* =====================================================================
- * ⭐⭐ 打靶专用判定容差 (2026-10-06 新增, 适配 K230 收紧到 ±20px)
+ * ⭐⭐ 打靶专用判定容差 (2026-10-06 新增; 2026-10-08 跟着 K230 再收紧)
  * ---------------------------------------------------------------------
- * K230(yolo_main.py) 把【任务2 打靶】的对准判定从 |dx|,|dy| < 50px 改成了
- * < 20px; 2026-10-07 起 球/桶/救援 的窗口也收紧到 20px
- * (本机侧对应 ALIGN_TOLERANCE, 已同步从 50 改成 20)。
- * ⚠️ 所以本机也必须跟着改成 20:
- *    本机是靠“|误差| ≥ 容差就再动一步”来推进的。若本机还用 50, 则误差在
- *    20~50px 这段时本机认为“已经够准了、不再动舵机”, 而 K230 认为还没对准、
- *    一直在发 D 帧 —— 两边干等到 K230 的 12s 自超时, 它只回 OK 不点激光。
- * ⚠️ 容差收紧后【步长也必须跟着变小】: 窗口总宽只有 40px, 一步改 100px 就会
- *    在窗口两边来回摆。所以同时改了 TARGET_ID1_STEP_MID_PX / _FINE 和
- *    TARGET_ID4_STEP(见各自注释)。
+ * K230(yolo_main.py) 判"打靶对准成功"用的是它自己的窗口
+ * `TARGET_ALIGN_TOL_PIX`(现在 = 11px): |dx| 和 |dy| 都 < 11 才回 OK/FIRE。
+ * ⚠️⚠️ 硬约束: 本机这个值【必须 ≤ K230 的窗口】。
+ *    本机是靠"|误差| ≥ 容差就再动一步"推进的, 本机容差比 K230 大 ⇒
+ *    误差落在两者之间时(例如 y=15px)本机认为"够准了、不再动舵机",
+ *    而 K230 认为没对准、一直发 D 帧 ⇒ 两边干等到它的 12s 自超时
+ *    (它才发 OK+FIRE, 激光带着这十几像素的偏差打出去)。
+ *    ⭐ 2026-10-08 实测就是"打靶 ID4 误差 15 时纠正不了" —— 原来本机是 20px。
+ * ⚠️ 容差收紧后【步长也必须跟着变小】, 否则一步就跨过中心来回摆:
+ *    窗口总宽现在只有 20px ⇒ 已同步把 TARGET_ID1_STEP_FINE 减到 5 码(≈9px)、
+ *    并给 ID4 加了 TARGET_ID4_STEP_FINE(15 码)。
  * ===================================================================== */
-#define TARGET_ALIGN_TOLERANCE  20      /* 打靶: |dx|,|dy| 都 < 它才算对准(与 K230 一致) */
+#define TARGET_ALIGN_TOLERANCE  10      /* 打靶: |dx|,|dy| 都 < 它才算对准
+                                         * (必须 ≤ K230 的 TARGET_ALIGN_TOL_PIX=11px) */
 
 #define TARGET_ID1_STEP         60      /* 每收到一次 L/R, 底座 ID1 转多少角度码。
                                          * 4096 码 = 360°, 所以 1° ≈ 11.4 码,
                                          * 60 码 ≈ 5.3°。建议 30~120:
                                          *   太大 → 一步冲过头、来回摆;
-                                         *   太小 → 对准慢、步数多 */
+                                         *   太小 → 对准慢、步数多
+                                         * ⚠️ 粗对准【不再用它】: 见下面 TARGET_COARSE_STEP
+                                         *    (60 码 ≈ 107px 一步, 比 K230 的 ±40px 窗口
+                                         *     还大 2 倍多 ⇒ 只会在窗口两边来回摆)。
+                                         *    现在只有【精对准】的大步档(|x|>200px)用它 */
+
+/* ⭐⭐ 打靶【粗对准】(C/L/R 阶段)的步长 + “过冲”检测 (2026-10-08 新增) --------
+ * 【为什么原来不收敛 —— 实测“打靶粗定位没有收敛”的根因】
+ *   K230 在接近阶段只回 C/L/R, 【没有幅值】, 所以本机只能固定一步转
+ *   TARGET_ID1_STEP(60 码 ≈ 107px)。而 K230 判“居中”的窗口是
+ *   DIR_THRESHOLD = ±40px:
+ *       误差 45px → 收到 L → 转 107px → 变成 -62px → 收到 R → 又转回来 …
+ *   一步跨过的距离(107px) > 2×窗口半宽×2(80px) ⇒ 误差在窗口两边来回摆,
+ *   永远不会落进 ±40px, 直到转满 TARGET_ID1_STEP_MAX(20 步)或超
+ *   TARGET_ID1_TIMEOUT_MS(20s) 被“强制当作已对准”, 带着几十~上百像素的偏差
+ *   进精对准(那时容差只有 10px, 更难收敛)。
+ * 【怎么修】
+ *   ① 常规步长压到 30 码(≈53px): 只要【步长 < 2 × 窗口半宽(80px)】, 按
+ *      “每步把 |误差| 减掉一个步长”的规律, 误差一定单调变小、必然进窗口;
+ *   ② 再加一层“过冲检测”: 连续两次方向【相反】= 上一步跨过了中心
+ *      ⇒ 立刻换细步(12 码 ≈ 21px), 这样即使 px/码 的估算不准也不会再摆。
+ * ⚠️ 硬约束: TARGET_COARSE_STEP 必须 < 2 × K230 的 DIR_THRESHOLD(40px);
+ *    细步要明显更小(≈ 半个窗口)。想更快可加大常规步长, 但别超过 ~70px。
+ * ⚠️ 出现日志 `[靶] 粗对准: ⚠ 方向翻转(第N次…) -> 改用细步` 就说明确实在摆,
+ *    那时看 N 的大小: N 很小(1~2)是正常的“最后一步跨过中心”, N 很大就是步长仍偏大。 */
+#define TARGET_COARSE_STEP      30      /* 粗对准常规步长(码) ≈ 53px (< 80px 才不摆) */
+#define TARGET_COARSE_STEP_MIN  12      /* 检测到过冲后用的细步(码) ≈ 21px */
 #define TARGET_ID1_LR_SIGN    (-1)      /* “收到 L”时 ID1 的增量符号:
                                          *  -1 = 数值减小 = 向左(当前实测值)
                                          *  +1 = 数值增大 = 向左(装反了就改这个) */
@@ -572,7 +604,8 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 #define TARGET_ID1_POS_MIN      0       /* ID1 行程限幅下限(角度码), 防越界堵转 */
 #define TARGET_ID1_POS_MAX      4095    /* ID1 行程限幅上限(角度码) */
 #define TARGET_ID1_STEP_MAX     20      /* 🛡防卡死①: 最多转这么多步就强制认为已对准。
-                                         * 20 步 × 60 码 = 1200 码 ≈ 105° */
+                                         * (粗对准 20 步 × 30 码 = 600 码 ≈ 53°;
+                                         *  精对准 20 步 × 最多 60 码 = 1200 码 ≈ 105°) */
 #define TARGET_ID1_TIMEOUT_MS   20000   /* 🛡防卡死②: L/R 调整环节最长等这么久(ms),
                                          * 超时强制走 C 流程(摆 FIRE→LIFT→SCAN_RESET);
                                          * 也兜住“K230 一条都不回”的情况。
@@ -616,21 +649,27 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * 现象: 用户实测“横向 ID1 动得很合适, 但 ID4 动少了” —— 说明 ID4 的
  *       【px/码】比 ID1 小(转同样的码数, 画面竖直方向变位更小),
  *       所以小误差时一步改不了多少, 要转很多步; 而 K230 只有 12s 自超时。
- * 做法: 和 ID1 一样分两档 —— 误差大走大步(快), 误差小走小步(稳):
- *      |y| > TARGET_ID4_STEP_FAR_PX(100) → TARGET_ID4_STEP_FAR(40 码)
- *      否则                              → TARGET_ID4_STEP(25 码)
- * ⚠️ 唯一必须守的硬约束: 小步换算出的 px 必须 < 窗口半宽(20px),
- *    否则会永远跨过中心来回摆。—— 实测 20 码“动少了” ⇒ 20 码改的 px
- *    明显小于 20px ⇒ 改成 25 码同样安全(2026-10-06 已按此改), 可以放心用。
+ * 做法: 和 ID1 一样分档 —— 误差大走大步(快), 误差小走小步(稳):
+ *      |y| > TARGET_ID4_STEP_FAR_PX(100)  → TARGET_ID4_STEP_FAR(40 码)
+ *      |y| > TARGET_ID4_STEP_FINE_PX(40)  → TARGET_ID4_STEP(30 码)
+ *      否则                                → TARGET_ID4_STEP_FINE(15 码)
+ * ⚠️ 唯一必须守的硬约束: 小步换算出的 px 必须 < 窗口半宽, 否则会永远跨过中心
+ *    来回摆。窗口 2026-10-08 已收紧到 TARGET_ALIGN_TOLERANCE=10px ⇒ 15 码
+ *    换算出的一步必须 ≤10px(实测 20 码"动少了" ⇒ ID4 的 px/码 本来就小,
+ *    15 码大约 5~12px, 落在安全区)。
  * 怎么定准(跑一次看这行日志):
- *   [靶][竖直轴变化] 上一步 ID4 转 25 码后, |y| ..px -> ..px (变化 ..px)
- *    一步改的 px:  < 8px → 太小, 继续加大(30~40)
- *                  10~25px → 正合适
- *                  > 30px → 太大(接近整个窗口), 必须减到 20 以下
+ *   [靶][竖直轴变化] 上一步 ID4 转 NN 码后, |y| ..px -> ..px (变化 ..px)
+ *    一步改的 px:  < 5px → 太小, 继续加大(20~30)
+ *                  5~9px → 正合适
+ *                  > 12px → 太大(超过窗口半径), 必须减到 10 码
  * 不想分档就把 TARGET_ID4_STEP_FAR 改成和 TARGET_ID4_STEP 一样即可。 */
-#define TARGET_ID4_STEP         30      /* 小步(误差小时用, 决定能否收敛进 ±20px) */
+#define TARGET_ID4_STEP         30      /* 中步(误差中等时用) */
 #define TARGET_ID4_STEP_FAR_PX  100     /* 超过这么多 px 算“离得远”, 换大步 */
 #define TARGET_ID4_STEP_FAR     40      /* 大步(仅大误差时用; 目的是少走几步赶在 12s 内) */
+#define TARGET_ID4_STEP_FINE_PX 40      /* ⭐ 小于这么多 px 才用【细步】(≈窗口的 4 倍) */
+#define TARGET_ID4_STEP_FINE    15      /* ⭐ 细步: 决定能否收敛进 ±10px 容差
+                                         *   (原来最小只有 30 码, 误差 15px 时
+                                         *    一步就跨过 ±10px 窗口 ⇒ 来回摆/收敛不了) */
 #define TARGET_ID4_DY_SIGN    (-1)      /* dy>0(目标偏画面下)时 ID4 的增量符号:
                                          *  -1 = 数值减小(往下低) ★正确值
                                          *  +1 = 数值增大(往上抬) —— 装配反了才用 */
@@ -672,9 +711,10 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *    ID1 = 底座(左右转)      ID4 = 腕部(俯仰): 数值【小=往下低 / 大=往上抬】
  *    K230 误差定义:  x = 画面中 - 目标x  → x>0 = 目标偏【画面左】
  *                   y = 目标y - 画面中  → y>0 = 目标偏【画面下】
- *    K230 判“对准成功”的条件: |dx|<20px 且 |dy|<20px(两者都要满足!),
+ *    K230 判“对准成功”的条件: |dx|<11px 且 |dy|<11px(两者都要满足!),
  *    只有判成功它才会 fire_start() 点激光并发一行 "FIRE"。
- *    (2026-10-06 从 50px 收紧; 单片机侧对应 TARGET_ALIGN_TOLERANCE)
+ *    (K230 侧常量 TARGET_ALIGN_TOL_PIX; 单片机侧用 TARGET_ALIGN_TOLERANCE=10,
+ *     ⚠️ 必须 ≤ 它, 否则本机先"认为够准了"不再动舵机 → 两边干等到 12s 自超时)
  * =====================================================================
  * ① 竖直轴 ID4 —— 方向(TARGET_ID4_DY_SIGN)
  *    推导: y>0(目标偏下) → 视线要往下低 → ID4 减小 → 增量取负 ⇒ 符号 = -1
@@ -684,13 +724,13 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *          判定: |y| 越修越小 = 方向对; 越修越大(-120→-200) 就把符号取反。
  *    ★当前 TARGET_ID4_DY_SIGN = -1 就是正确值。
  * ---------------------------------------------------------------------
- * ② 竖直轴 ID4 —— 步长(TARGET_ID4_STEP / _FAR / _FAR_PX)
+ * ② 竖直轴 ID4 —— 步长(TARGET_ID4_STEP / _FINE / _FAR / _FAR_PX)
  *    看上面那行“变化 xx px”, 它打的是【上一步实际转的码数】:
- *      一步只改很少像素(如 25 码才改 8px) → 两步都加大(小步 30~40, 远步 50~60)
- *      一步就冲过头(如 -120 变成 +150)      → 减小, 且【小步必须 < 20px】
- *    经验: 大误差用大步(快), 小误差用大步会在 ±20px 窗口里来回摆 ——
- *    所以“能否收敛”只看【小步】的 px, “快不快”看【远步】。
- *    目标手感: 让“小步的 px 变化 ≈ 10~25px”, 2~4 步内收敛。
+ *      一步只改很少像素(如 15 码才改 3px) → 两步都加大(细步 20~25, 远步 50~60)
+ *      一步就冲过头(如 -15 变成 +20)      → 减小, 且【细步必须 ≤ 10px】
+ *    经验: 大误差用大步(快), 小误差用大步会在 ±10px 窗口里来回摆 ——
+ *    所以“能否收敛”只看【细步】的 px, “快不快”看【远步】。
+ *    目标手感: 让“细步的 px 变化 ≈ 5~9px”, 2~4 步内收敛。
  * ---------------------------------------------------------------------
  * ③ 水平轴 ID1 —— 方向(TARGET_ID1_LR_SIGN)
  *    看日志: [靶] 精对准[横向] x=-80px (x>0=偏左) -> ID1 转 +60 码
@@ -705,7 +745,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * ---------------------------------------------------------------------
  * 【标定成功的标志】日志按顺序出现:
  *      [靶] 精对准[横向] x=..px -> ID1 转 ..码      (或 [竖直] ID4)
- *      [靶] 两轴都已在容差(20px)内 (x=.., y=..), 等 K230 回 OK/FIRE
+ *      [靶] 两轴都已在容差(10px)内 (x=.., y=..), 等 K230 回 OK/FIRE
  *      [靶] K230 已发射激光(FIRE)                    ← 激光真亮了
  *      [靶] 精对准完成(收到OK, 共微调N步) -> 摆发射位
  *      [靶] 打靶收尾(收到OK -> 抬起大臂 -> 收回手臂)
@@ -749,22 +789,22 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
                                             * 然后做一个航向校正 */
 #define ROUTE_12_P1_B_MM            /*860 */  844    /* ⭐ 打靶第 2 段右移(mm): 航向校正完再右移这么多 */
 
-/* ⭐⭐ 2026-10-07 新增: 打靶走位途中, 【每次航向校正之前】的“后退最小一步”距离(mm)。
+/* ⭐⭐ 打靶走位途中, 【每次航向校正之前】的“挪最小一步”(mm)。
  * 作用状态 = STATE_12_PART1_CORRECT_A / _CORRECT_B, 两个状态做法完全一样:
- *      右移到位(车已停) → 后退 ROUTE_12_P1_BACK_MM → 再原地转正到 0°
- * 为什么要退这一步:
+ *      右移到位(车已停) → 挪一步 → 再原地转正到 0°
+ * 为什么要挪这一步:
  *   ① 这段路每右移一次都攒一点航向误差(日志 HDG err 一路涨), 右移方向就被带歪,
- *      走出来的路径会往【前】偏(实测“平移路程偏上”)—— 退一步就是把这个前偏掰回来;
+ *      走的路径会往一侧偏(实测“平移路程偏上”)—— 挪一步就是把这个偏移掰回来;
  *   ② 车完全停死时靠四轮差速原地转正本来就容易转不到位(见 Chassis.h 的“卡住”检测),
- *      退一步让轮子先滚起来, 后面那次转向更容易到位。
- * ⚠️ 后退发生在“右移段结束、车身已转回 0°”的时刻, 方向是车的【后方】:
- *      它【不改】右移的左右行程(864 / 844 一点不动), 只改前后偏移 —— 正好就是“偏上”那个方向。
- * 取值: 底盘到位死区 = CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm, 所以
- *       【实际位移 ≈ 本值 − 4.5mm】: 填 10 → 实际退约 5.5mm, 两步合计约 11mm。
- *       想退多点每次加 5~10；⚠️ 不要小于 6 —— 会被死区吃掉、等于没动。
- *       0 = 关闭(回到“右移到位直接转正”的老行为)。
- * ⭐ 2026-10-07 实车调整: 8 → 10(那两次航向校正前稍微退多一点)。 */
-#define ROUTE_12_P1_BACK_MM         13
+ *      先让轮子滚一下, 后面那次转向更容易到位。
+ * ⭐ 2026-10-08 实车调整: 原来这里是【后退】(8 → 10 → 13), 现在改成【-6】(车头后退
+ *      6mm); 符号约定与 Route_MinStep 相同: >0 = 车头前进 | <0 = 车头后退 | 0 = 关掉。
+ * ⚠️ 6 是【底盘能停稳的最小值】: 到位死区 = CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm
+ *      ⇒ 实际位移 ≈ 6 − 4.5 ≈ 1.5mm。再小(< 6)会被死区整个吃掉、等于没动还白等一次。
+ * ⭐ 2026-10-08 实车定值 = -6(负数 = 车头【后退】6mm); 想改前进就去掉负号(填 6)。
+ * ⚠️ 这一步发生在“右移段结束、车身已转回 0°”的时刻, 方向是车的【前后】:
+ *      它【不改】右移的左右行程(864 / 844 一点不动), 只改前后偏移。 */
+#define ROUTE_12_P1_BACK_MM         -6
 
 #define ROUTE_12_P1_C_MM            400    /* (未使用: MOVE_C 改成只摆 TARGET_LOOK, 不再走位) */
 #define ROUTE_12_TURN_A_DEG         400    /* (未使用: TURN_A/TURN_B 已不在流程里) */
@@ -833,25 +873,27 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 #define ROUTE_17_RIGHT_B_MM         650    /* ⭐ 抓完后第 1 段右移(mm)(原来叫“后退”) */
 #define ROUTE_18_RIGHT_C_MM         /* 890 */  916    /* ⭐ 抓完后第 2 段右移(mm)(原来叫“后退”) */
 
-/* ⭐⭐ 救援段(阶段四): ① 【转完 90° 之后】的这一小段【车头前进】 ------------------
+/* ⭐⭐ 救援段(阶段四): ② 【转完 90° 之后】航向校准前的“挪最小一步”(mm) ----------
  *  作用状态 = STATE_15_TURN_FOR_HOSTAGE(即“①转完 90° → ②校准”里的 ②),
- *  位置在“转完 → 校准 → 停稳 → 右移进救援区”之间, 也就是:
- *      ①转90° → 【本步: 车头前进 N mm】 → ②航向校准 → ③停稳 → ④右移进救援区
- *  为什么要前进这一段: 转完 90° 后车头朝 -90°, 车体【前方】= 场地“右”方向
- *      (与 ④⑧⑩ 的右移同向) ⇒ 这一步实际是把车往“进救援区那一侧”先送一段,
- *      用来补“原地转 90° 时车心位置偏了/离救援区入口还差一点”的差。
+ *  位置在“转完 → 挪一步 → 校准 → 停稳 → 右移进救援区”之间, 也就是:
+ *      ①转90° → 【本步】 → ②航向校准 → ③停稳 → ④右移进救援区
+ * ⭐ 2026-10-08 实车调整: 这个宏可以正可负(符号约定同 Route_MinStep),
+ *      实车最后定的是 75 —— 即“转完 90° 后先往救援区那一侧送 75mm”。
+ *  ⚠️ 与 ⑨⑪ 那两个宏现在是【各自独立】的值(⑨⑪ = 6), 不再统一。
+ *  方向: 转完 90° 后车头朝 -90°, 车体【前方】= 场地“右”方向(与 ④⑧⑩ 的右移同向)。
  *  取值: 底盘到位死区 ≈ CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm ⇒
- *      【实际位移 ≈ 本值 − 4.5mm】(填 50 → 实际约 45mm)。
- *      ⚠️ 别小于 6 —— 会被死区吃掉、等于没动(还白等一次); 0 = 关掉这一步。
- *  ⭐ 2026-10-07 实车调整: 用户要求“旋转后再前进 50mm” ⇒ 单独给 ② 用这个宏(50),
- *      不再和 ⑨ 共用 ROUTE_RESCUE_FWD_MM。 */
-#define ROUTE_RESCUE_AFTER_TURN_MM   50    /* ②(转完90°后): 车头前进 50mm(实际约 45mm) */
+ *      【实际位移 ≈ |本值| − 4.5mm】(填 75 → 实际约 70mm; 填 6 → 实际约 1.5mm)。
+ *      ⚠️ 绝对值别小于 6 —— 会被死区吃掉、等于没动(还白等一次); 0 = 关掉这一步。 */
+#define ROUTE_RESCUE_AFTER_TURN_MM   75     /* ②(转完90°后): 车头前进 75mm(实际约 70mm) */
 
 /* ⭐ 救援段(阶段四): 每次【航向纠正】之前, 先“挪最小一步”(mm)
- * 作用状态 = 阶段四剩下的 2 处航向纠正:
+ * 作用状态 = 阶段四的 3 处航向纠正:
+ *      ② STATE_15_TURN_FOR_HOSTAGE                   → 用 ROUTE_RESCUE_AFTER_TURN_MM
  *      ⑨ STATE_17A_RESCUE_HEADING_CORRECT            → 用 ROUTE_RESCUE_FWD_MM
  *      ⑪ STATE_18A_RESCUE_HEADING_CORRECT (最后一次) → 用 ROUTE_RESCUE_LAST_STEP_MM
- *      (② STATE_15_TURN_FOR_HOSTAGE 改用上面那个 ROUTE_RESCUE_AFTER_TURN_MM=50)
+ * ⭐ 2026-10-08 实车调整: ⑨⑪ 两处改成【+6】(车头前进, 底盘能停稳的最小一步);
+ *      ② 仍用它自己的 ROUTE_RESCUE_AFTER_TURN_MM(现在 75, 见上面的说明)。
+ *      打靶走位那两处(ROUTE_12_P1_BACK_MM)也改成了同量级的 ±6。
  * 符号约定(三个宏一样): >0 = 车头【前进】 | <0 = 车头【后退】 | 0 = 关掉这一步。
  * 为什么要先挪一步(与打靶走位的 ROUTE_12_P1_BACK_MM 同一个道理):
  *      一段平移跑完车是【停死】的, 麦轮停死时原地转正本来就容易转不到位
@@ -861,13 +903,11 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *      所以“车头前进”挪的是【场地“右”】方向(与 ④⑧⑩ 的右移同向),
  *      “车头后退”就是相反那一侧 —— 别按字面理解成“朝场地前方”。
  * ⚠️ 底盘到位死区 ≈ CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm ⇒
- *      【实际位移 ≈ |本值| − 4.5mm】: 填 10 → 实际约 5.5mm; 填 8 → 实际约 3.5mm。
- *      ⚠️ 绝对值别小于 6 —— 会被死区吃掉、等于没动(还白等一次)。
- * ⭐ 2026-10-07 实车调整: 最后一次(⑪)方向反了 + 要小一点 ⇒ 单独用第二个宏(-8)。 */
-#define ROUTE_RESCUE_FWD_MM         -10    /* ⑨: 车头后退 10mm(实际约 5.5mm) */
-#define ROUTE_RESCUE_LAST_STEP_MM   (-8)  /* ⑪(最后一次): 车头【后退】8mm(实际约 3.5mm)。
-                                           * 负数 = 后退; 想改回前进就去掉负号(填 8),
-                                           * 想再小就填 -6(再小会被死区吃掉)。 */
+ *      【实际位移 ≈ |本值| − 4.5mm】: 填 6 → 实际约 1.5mm。
+ *      ⚠️ 绝对值别小于 6 —— 会被死区吃掉、等于没动(还白等一次)。 */
+#define ROUTE_RESCUE_FWD_MM         6     /* ⑨: 车头前进 6mm */
+#define ROUTE_RESCUE_LAST_STEP_MM   6     /* ⑪(最后一次): 车头前进 6mm。
+                                           * 负数 = 后退; 0 = 关掉这一步。 */
 
 #define ROUTE_19_RIGHT_D_MM         800    /* (未使用) */
 #define ROUTE_21_RIGHT_E_MM         0//300    /* (未使用) */
@@ -1574,12 +1614,14 @@ static void Heading_AlignTo(float heading_deg)
 }
 
 /**
- * @brief  打靶走位途中: 航向校正【之前】的“停-后退最小一步”(阻塞版)
+ * @brief  打靶走位途中: 航向校正【之前】的“挪最小一步”(阻塞版, 可正可负)
  * @note   ⭐ 2026-10-07 新增, 动机/取值见 ROUTE_12_P1_BACK_MM 处的说明。
- *         只做“后退”这一段, 【不发】转向指令 —— 转向仍由调用方紧接着发,
+ *         ⭐ 2026-10-08: 改成可正可负(与 Route_MinStep 同一套符号约定):
+ *            >0 = 车头前进 | <0 = 车头后退 | 0 = 关掉这一步。
+ *         只做“挪一步”这一段, 【不发】转向指令 —— 转向仍由调用方紧接着发,
  *         这样 CORRECT_A/B 各自原来的“非阻塞发转向 + 转移条件里等
- *         Chassis_Task_Is_Complete()”写法完全不变, 只是前面多退了一小步。
- *         ⚠️ 必须【阻塞等到位】才返回: 后退还没走完就发转向, 转向会把这一段
+ *         Chassis_Task_Is_Complete()”写法完全不变, 只是前面多挪了一小步。
+ *         ⚠️ 必须【阻塞等到位】才返回: 这一步还没走完就发转向, 转向会把这一段
  *            覆盖掉(Chassis_Rotate 内部 s_moving=false)。
  *         ⚠️ 用 Mission_Coop_Wait 等(不是 HAL_Delay): 期间照刷陀螺仪 yaw、照收 K230 行,
  *            否则航向保持/转向环读到冻结角度。3.5s 超时兜底(与底盘自己的单段超时对齐)。
@@ -1588,25 +1630,32 @@ static void Route_BackMinStep(void)
 {
     uint32_t t0;
     float yaw_before;
+    int32_t mm = ROUTE_12_P1_BACK_MM;
 
-    if (ROUTE_12_P1_BACK_MM <= 0) {
+    if (mm == 0) {
         return;   /* 关掉这一步: 直接回“到位就转正”的老行为 */
     }
-    yaw_before = Chassis_GetYaw();   /* 横移那段攒下的航向偏差(后退之前) */
+    yaw_before = Chassis_GetYaw();   /* 横移那段攒下的航向偏差(挪之前) */
     t0 = HAL_GetTick();
-    Chassis_Move_Backward(ROUTE_12_P1_BACK_MM);
+    if (mm > 0) {
+        Chassis_Move_Forward(mm);
+    } else {
+        Chassis_Move_Backward(-mm);
+    }
     while (!Chassis_Task_Is_Complete() && (HAL_GetTick() - t0) < 3500u) {
         Mission_Coop_Wait(20);
     }
     /* 这一步【必须】自己打日志: 底盘的 MOVE 行是中断里攒、由
      * Chassis_FlushPendingLog() 打印的, 而那个函数本工程【没有任何地方调用】
-     * (既有问题, 不是这次改的) ⇒ 那段后退的距离不会自己出现在日志里。
+     * (既有问题, 不是这次改的) ⇒ 这段挪的距离不会自己出现在日志里。
      * 读这两个 yaw:
-     *   后退前 = 这段右移一共攒了多少航向偏差(判断“偏上”的根因, 期望越小越好);
-     *   后退后 = 后退这一步自己又把车头带偏/纠回了多少(航向保持一直在纠, 所以
-     *            它通常已经吃掉一部分) —— 剩下的就交给紧接着的转正动作。 */
-    MLOG("打靶走位: 校正前先后退 %dmm (耗时 %lums; yaw 后退前 %.1f° -> 后退后 %.1f°)",
-         (int)ROUTE_12_P1_BACK_MM, (unsigned long)(HAL_GetTick() - t0),
+     *   挪之前 = 这段右移一共攒了多少航向偏差(判断“偏上”的根因, 期望越小越好);
+     *   挪之后 = 这一步自己又把车头带偏/纠回了多少(航向保持一直在纠, 所以
+     *            它通常已经吃掉一部分) —— 剩下的就交给紧接着的转正动作。
+     * ⭐ 日志里带“车头前进/车头后退”字样, 实车一眼就能核对方向有没有给反。 */
+    MLOG("打靶走位: 校正前先挪 %dmm(%s; 耗时 %lums; yaw %.1f° -> %.1f°)",
+         (int)mm, (mm > 0) ? "车头前进" : "车头后退",
+         (unsigned long)(HAL_GetTick() - t0),
          (double)yaw_before, (double)Chassis_GetYaw());
 }
 
@@ -3028,7 +3077,15 @@ static void Target_Id4Step(int32_t delta)
 static int32_t Target_Id4StepFor(int err_y)
 {
     int32_t a    = abs(err_y);
-    int32_t base = (a > TARGET_ID4_STEP_FAR_PX) ? TARGET_ID4_STEP_FAR : TARGET_ID4_STEP;
+    int32_t base;
+
+    if (a > TARGET_ID4_STEP_FAR_PX) {
+        base = TARGET_ID4_STEP_FAR;             /* 大步: 快 */
+    } else if (a > TARGET_ID4_STEP_FINE_PX) {
+        base = TARGET_ID4_STEP;                 /* 中步 */
+    } else {
+        base = TARGET_ID4_STEP_FINE;            /* 细步: 不会再跨过中心 */
+    }
 
     /* 方向与原来一致: y>0(目标偏画面下) → 按 DY_SIGN 转 */
     return (err_y > 0) ? (base * (int32_t)TARGET_ID4_DY_SIGN)
@@ -3166,6 +3223,11 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
 #if !MISSION_TEST_NO_VISION
     static char target_path_taken = ' ';
     static char rescue_path_taken = ' ';
+    /* ⭐ 打靶粗对准(C/L/R)的“过冲”检测: 上一步的方向(+1=L / -1=R / 0=还没有)
+     *   和“方向翻转”次数 —— 翻转 = 上一步跨过了画面中心。
+     *   用途: 翻转后改用细步 TARGET_COARSE_STEP_MIN, 见那段宏的说明。 */
+    static int8_t   target_coarse_dir  = 0;
+    static uint16_t target_coarse_flip = 0;
 #endif
     static uint32_t state_start_tick = 0;
     static uint32_t align_start_time = 0;
@@ -3449,8 +3511,11 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
      *   ① TARGET_IDLE        发 run_task:2 → K230 回 C / L / R
      *                        (run_task 只在“还没收到过任何回应”前每 1s 重发,
      *                         收到回应后就不再打扰 K230)
-     *                        L → 底座 ID1 向【左】转 TARGET_ID1_STEP 码
-     *                        R → 底座 ID1 向【右】转 TARGET_ID1_STEP 码
+     *                        L → 底座 ID1 向【左】转 TARGET_COARSE_STEP 码
+     *                        R → 底座 ID1 向【右】转 TARGET_COARSE_STEP 码
+     *                        (⭐ 2026-10-08: 原来固定 60 码 ≈ 107px 一步, 比 K230 的
+     *                         ±40px 窗口还大 ⇒ 在窗口两边来回摆、永不收敛;
+     *                         现在常规 30 码 ≈ 53px, 并且检测到方向翻转时换细步 12 码)
      *                        C → 粗对准完成, 按下页 TARGET_USE_FINE_ALIGN 选择:
      *                            =1(当前): 发 start_align 进 ②/③ 精对准
      *                            =0       : 直接认为对准, 去 TARGET_PERFORM
@@ -3508,6 +3573,8 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                     target_id4_steps = 0;
                     target_last_dy_valid = 0;
                     target_last_dy_step  = 0;
+                    target_coarse_dir  = 0;    /* ⭐ 粗对准过冲检测复位 */
+                    target_coarse_flip = 0;
                     Arm_Id1Reset(ARM_POSE_TARGET_LOOK);    /* 横向轴(ID1)基准 */
                     Arm_Id4Reset(ARM_POSE_TARGET_LOOK);    /* ⭐ 竖直轴(ID4)基准 */
                     MLOG("[靶] 对准开始: 基准位置 ID1=%d, ID4=%d",
@@ -3537,14 +3604,27 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                     MLOG("[靶] 接近方向: %c  (L=目标偏画面左 / C=居中 / R=偏右)", target_path_taken);
                     /* 画面偏差 → 底座 ID1 小步偏转(车不动):
                      *   L → ID1 数值减小(向左) ; R → ID1 数值增大(向右)
-                     * (方向由 TARGET_ID1_LR_SIGN 统管, 实测反了只改那个宏) */
-                    if (target_path_taken == 'L') {
-                        Target_Id1Step((int32_t)TARGET_ID1_LR_SIGN * TARGET_ID1_STEP);
-                        target_id1_steps++;
-                        target_id1_move_tick = HAL_GetTick();
-                        target_sub_state = TARGET_ID1_MOVING;
-                    } else if (target_path_taken == 'R') {
-                        Target_Id1Step(-(int32_t)TARGET_ID1_LR_SIGN * TARGET_ID1_STEP);
+                     * (方向由 TARGET_ID1_LR_SIGN 统管, 实测反了只改那个宏)
+                     * ⭐⭐ 2026-10-08: 步长改用 TARGET_COARSE_STEP(30 码 ≈ 53px),
+                     *   不再用 60 码(≈107px) —— 那是“粗定位不收敛”的根因:
+                     *   一步跨过整个 ±40px 窗口 ⇒ 只会在两边来回摆。
+                     *   另外做“过冲检测”: 方向翻转 = 上一步跨过了中心 ⇒ 换细步。 */
+                    if (target_path_taken == 'L' || target_path_taken == 'R') {
+                        int8_t  dir_sign = (target_path_taken == 'L') ? 1 : -1;
+                        int32_t step     = TARGET_COARSE_STEP;
+                        if (target_coarse_dir != 0 && dir_sign != target_coarse_dir) {
+                            target_coarse_flip++;
+                            step = TARGET_COARSE_STEP_MIN;
+                            MLOG("[靶] 粗对准: ⚠ 方向翻转(第%u次, 上一步跨过中心) -> 改用细步 %ld 码",
+                                 (unsigned)target_coarse_flip, (long)step);
+                        }
+                        target_coarse_dir = dir_sign;
+
+                        Target_Id1Step((int32_t)dir_sign *
+                                       (int32_t)TARGET_ID1_LR_SIGN * step);
+                        MLOG("[靶] 粗对准: 转 ID1 %+ld 码 (%c, 第%u步)",
+                             (long)((int32_t)dir_sign * (int32_t)TARGET_ID1_LR_SIGN * step),
+                             target_path_taken, (unsigned)(target_id1_steps + 1u));
                         target_id1_steps++;
                         target_id1_move_tick = HAL_GetTick();
                         target_sub_state = TARGET_ID1_MOVING;
@@ -3683,7 +3763,8 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
 
                                 MLOG("[靶] 精对准[竖直] y=%dpx (y>0=偏下) -> ID4 转 %+ld 码 [%s]",
                                      err_y, (long)d4,
-                                     (abs(err_y) > TARGET_ID4_STEP_FAR_PX) ? "大步" : "小步");
+                                     (abs(err_y) > TARGET_ID4_STEP_FAR_PX) ? "大步" :
+                                     (abs(err_y) > TARGET_ID4_STEP_FINE_PX) ? "中步" : "细步");
                                 Target_Id4Step(d4);
                                 target_id4_steps++;
                                 target_fine_move_ms  = TARGET_ID4_MOVE_MS;
@@ -4836,7 +4917,7 @@ void Mission_Update(void)
             /* ⭐ 右移到位后先做航向校正(转到给对 0°), 防止两次右移的累积误差。
              *    之后 MOVE_B 继续右移, CORRECT_B 停车, MOVE_C 才摆臂。 */
             case STATE_12_PART1_CORRECT_A:
-                /* ⭐ 2026-10-07: 先停-后退最小一步, 再原地转正(见 ROUTE_12_P1_BACK_MM) */
+                /* ⭐ 2026-10-08: 先挪最小一步(+6 = 车头前进), 再原地转正(见 ROUTE_12_P1_BACK_MM) */
                 Route_BackMinStep();
                 Turn_Angle_Compat(0.1f);
                 break;
@@ -4850,7 +4931,7 @@ void Mission_Update(void)
                  *    紧接着 Rotate_To 又开转向 —— 两个状态混在同一拍里容易让
                  *    Chassis_Task_Is_Complete() 的判定提前成立(转一半就判“完成”)。
                  *    转向结束时它自己会调 Chassis_Stop()。 */
-                Route_BackMinStep();   /* ⭐ 2026-10-07: 先停-后退最小一步, 再原地转正 */
+                Route_BackMinStep();   /* ⭐ 2026-10-08: 先挪最小一步(+6), 再原地转正 */
                 Chassis_Rotate_To(0.0f);
                 s_target_stop_tick = HAL_GetTick();
                 break;  
@@ -4943,7 +5024,7 @@ void Mission_Update(void)
             /* ② 航向校准: 转到绝对 -90°(顺带再确认一次航向基准)。
              *    转移条件 = 转向环自己判“到位”(Chassis_Task_Is_Complete) */
             case STATE_15_TURN_FOR_HOSTAGE:
-                /* ⭐ 2026-10-07: 转完 90° 后先【车头前进 50mm】再校准(见 ROUTE_RESCUE_AFTER_TURN_MM) */
+                /* ⭐ 2026-10-08: 转完 90° 后先挪一步(+75mm 前进)再校准(见 ROUTE_RESCUE_AFTER_TURN_MM) */
                 Route_MinStep(ROUTE_RESCUE_AFTER_TURN_MM);
                 Heading_AlignTo(RESCUE_HEADING_DEG);
                 break;
@@ -4971,12 +5052,12 @@ void Mission_Update(void)
              * (原来是“后退 ×2”; 车头已右转 90°, 所以右移 = 原来的后退方向) */
             case STATE_17_RESCUE_RIGHT_B:          Chassis_Move_Right(ROUTE_17_RIGHT_B_MM); break;
             case STATE_17A_RESCUE_HEADING_CORRECT:
-                Route_MinStep(ROUTE_RESCUE_FWD_MM);   /* ⭐ 转正前先挪一步(-10 = 车头后退) */
+                Route_MinStep(ROUTE_RESCUE_FWD_MM);   /* ⭐ 转正前先挪一步(+6 = 车头前进) */
                 Heading_AlignTo(RESCUE_HEADING_DEG);
                 break;
             case STATE_18_RESCUE_RIGHT_C:          Chassis_Move_Right(ROUTE_18_RIGHT_C_MM); break;
             case STATE_18A_RESCUE_HEADING_CORRECT:
-                /* ⭐ 最后一次纠正: 方向给反过一次 ⇒ 用 ROUTE_RESCUE_LAST_STEP_MM(负数=车头后退) */
+                /* ⭐ 2026-10-08: 统一成 +6 最小一步(原来这里是 -8 = 车头后退) */
                 Route_MinStep(ROUTE_RESCUE_LAST_STEP_MM);
                 Heading_AlignTo(RESCUE_HEADING_DEG);
                 break;
