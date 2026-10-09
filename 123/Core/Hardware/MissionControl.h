@@ -113,11 +113,23 @@ typedef enum {
     STATE_9A_ADJUST_LEFT,                   // 左移微调
     STATE_10_APPROACH_BOMB,                 // 接近炸弹
     STATE_11_PERFORMING_BOMB_DISPOSAL,      // 视觉对准并抓取/放置炸弹
+    STATE_11A_HEADING_CORRECT,              // ⭐新增: 排爆做完进打靶走位之前: 挪 ROUTE_BOMB_AFTER_STEP_MM 再校到 0°
 
-    /* 阶段三: 打靶 (2026-10-05 定稿)
-     *   走位链: MOVE_A(右移850) → CORRECT_A(挪最小一步 ROUTE_12_P1_BACK_MM → 航向校正) → MOVE_B(右移850)
-     *           → CORRECT_B(挪最小一步 ROUTE_12_P1_BACK_MM → 航向校正 + 停稳 TARGET_STOP_SETTLE_MS)
-     *           → MOVE_C(摆 TARGET_LOOK) → STATE_13 视觉
+    /* 阶段三: 打靶 (2026-10-05 定稿; ⭐ 2026-10-09 航向校正定为 2 次)
+     *   走位链 —— 每段右移【对半拆开走】, 但航向校正只做【2 次】(每段末尾各一次):
+     *      MOVE_A (右移前半) → MOVE_A2(右移后半) → CORRECT_A2(航向校正)
+     *   → MOVE_B (右移前半) → MOVE_B2(右移后半) → CORRECT_B2(航向校正 + 停稳)
+     *   → MOVE_C(摆 TARGET_LOOK) → STATE_13 视觉
+     *   ⚠️ 进这条链【之前】还会在 STATE_11A_HEADING_CORRECT 校一次(排爆做完那次),
+     *      所以从排爆结束到打靶一共 3 次校正 + MOVE_C 摆臂前那次阻塞式摆正。
+     *   ⚠️ CORRECT_A / CORRECT_B 仍留在枚举与状态机里, 但已【不在流程里】
+     *      (被 MOVE_A / MOVE_B 直接跳过, 见 MissionControl.c 的转移检查);
+     *      想恢复 4 次校: 把那两行跳转改回 g_mission_state++ 即可。
+     *   ⚠️ 航向校正前是否先“挪一小步”: 总开关 = MissionControl.c 的
+     *      ROUTE_12_MINSTEP_ENABLE(当前 = 1)。每处还有两个方案、各自独立
+     *      (ROUTE_12_A2_STEP_MODE / ROUTE_12_B2_STEP_MODE):
+     *        ★当前: CORRECT_A2 = 方案二(按偏航角: 偏出 ±1.1° 才挪, 方向相反补);
+     *                CORRECT_B2 = 方案一(固定 ROUTE_12_P1_BACK2_MM = -6)。
      *   视觉对准(任务2): 底盘完全不动, 根据 K230 回的 C/L/R 原地小步转底座 ID1;
      *           收到 C 后依次摆 FIRE → LIFT → SCAN_RESET。
      *   收尾(⭐ 2026-10-07 实测: 顺序不能颠倒): 出了 STATE_13 先走三段平移 ——
@@ -127,12 +139,20 @@ typedef enum {
      *         → 才进救援阶段: STATE_14/15/15C(右转90° + 校准到-90° + 停稳3s)。
      *         ⚠️ 转 90° 必须排在这三段之后: 只有拐角那儿的转弯余量才够。
      * ⚠️ TURN_A/TURN_B 与 PART2_MOVE_B/CORRECT_B/MOVE_C 不在流程里(不可达),
-     *    PART1_MOVE_B/CORRECT_B/MOVE_C 是【在用】的, 别当废弃删掉。 */
-    STATE_12_PART1_MOVE_A,
-    STATE_12_PART1_CORRECT_A,
-    STATE_12_PART1_MOVE_B,
-    STATE_12_PART1_CORRECT_B,
-    STATE_12_PART1_MOVE_C,
+     *    PART1_MOVE_A/A2/B/B2、CORRECT_A/A2/B/B2、MOVE_C 全是【在用】的,
+     *    别当废弃删掉。
+     * ⚠️ 这几个状态是【顺序推进】的(g_mission_state++), 枚举顺序不可打乱:
+     *    MOVE_A → MOVE_A2 → CORRECT_A2 → MOVE_B → MOVE_B2 → CORRECT_B2 → MOVE_C
+     *    (CORRECT_A / CORRECT_B 夹在中间, 但已被跳过 ⇒ 顺序保持这样才能用 ++) */
+    STATE_12_PART1_MOVE_A,                   // 第1段右移 前半
+    STATE_12_PART1_CORRECT_A,                // 航向校正(可按宏决定是否先挪一小步)
+    STATE_12_PART1_MOVE_A2,                  // ⭐新增: 第1段右移 后半
+    STATE_12_PART1_CORRECT_A2,               // ⭐新增: 航向校正
+    STATE_12_PART1_MOVE_B,                   // 第2段右移 前半
+    STATE_12_PART1_CORRECT_B,                // 航向校正
+    STATE_12_PART1_MOVE_B2,                  // ⭐新增: 第2段右移 后半
+    STATE_12_PART1_CORRECT_B2,               // ⭐新增: 航向校正 + 停稳 TARGET_STOP_SETTLE_MS
+    STATE_12_PART1_MOVE_C,                   // 摆 ARM_POSE_TARGET_LOOK
     STATE_12_TURN_A,
     STATE_12_TURN_B,
     STATE_12_PART2_MOVE_A,
@@ -151,25 +171,32 @@ typedef enum {
      *      → ①'【挪一步 ROUTE_RESCUE_AFTER_TURN_MM = 75mm(车头前进)】, 再校准/停稳/右移进救援区
      *      → ②航向校准到 -90°
      *      → ③校准【到位】后原地停稳 RESCUE_ALIGN_SETTLE_MS(3s)
-     *      → ④右移 ROUTE_14_TO_HOSTAGE_MM → ⑤停下等 3s → ⑥摆 HOSTAGE_LOOK
+     *      → ③'⭐2026-10-09: 右移前【再纯校一次航向】(不挪步 —— 原地右转 90°
+     *         可能把车身带偏, 横移前按绝对角再校一次; 见 ROUTE_RESCUE_PRE_RIGHT_STEP_MM)
+     *      → ④右移进救援区(⭐ 2026-10-09: 拆成两段 ROUTE_14_MID_MM + ROUTE_14_MID2_MM,
+     *         中途插一次“挪一步 + 航向校准到 -90°”) → ⑤停下等 3s → ⑥摆 HOSTAGE_LOOK
      *      → ⑦视觉对准 + 抓取(⭐ 2026-10-07: 粗对准 C 之后还要发 start_align,
      *         走 D:x,y 自适应精对准, 收敛到 ±RESCUE_ID1_ALIGN_TOL=20px 再抓;
      *         见 RESCUE_USE_FINE_ALIGN)
      *      → ⑧右移 ROUTE_17_RIGHT_B_MM → ⑨航向校准
      *      → ⑩右移 ROUTE_18_RIGHT_C_MM → ⑪航向校准 → ⑫停下(任务完成)
-     * ⭐ 2026-10-08: ②⑨⑪ 三处航向纠正之前都先挪一小步(Route_MinStep, 见宏):
-     *    ② = ROUTE_RESCUE_AFTER_TURN_MM(75, 转完后车头前进 75mm)
-     *    ⑨ = ROUTE_RESCUE_FWD_MM(+6)   ⑪ = ROUTE_RESCUE_LAST_STEP_MM(+6)
-     *    (打靶走位那两处 ROUTE_12_P1_BACK_MM 也一起改成了 ±6, 现在是 -6 = 后退)
+     * ⭐ 航向纠正之前都先挪一小步(Route_MinStep, 见宏):
+     *    ② = ROUTE_RESCUE_AFTER_TURN_MM(转完后车头前进)
+     *    ④' = ROUTE_RESCUE_MID_STEP_MM (★2026-10-09: 右移中途新加的那处, +10 = 前进)
+     *    ⑨ = ROUTE_RESCUE_FWD_MM   ⑪ = ROUTE_RESCUE_LAST_STEP_MM
      *    ⚠️ 走到这几处时车头已经是 -90° ⇒ 这里的“车头前进”挪的是【场地“右”】方向
-     *       (与④⑧⑩的右移同向), 不是朝场地前方。
+     *       (与④⑧⑩的右移同向), 不是朝场地前方; 所以在 ④' 那一步 +10 等于把这段
+     *       右移距离再加约 10mm。
      * ⭐ 为什么“后退”全改成“右移”: 车头右转 90°(顺时针)之后, 车体的【右】方向
      *    正好等于原来的【后】方向 ⇒ 轨迹完全不变, 只是车身姿态转了 90°
      *    (机械臂/摄像头的朝向随之改变)。 */
     STATE_14_MOVE_FORWARD_B,                 // ① 车头右转 90°(名字沿用历史: 原来是“后退”)
     STATE_15_TURN_FOR_HOSTAGE,               // ①'先挪 ROUTE_RESCUE_AFTER_TURN_MM(75mm 前进), 再②航向校准到 -90° + 同步航向基准
     STATE_15C_RESCUE_ALIGN_SETTLE,           // ③ ⭐新增: 校准到位后原地停稳 RESCUE_ALIGN_SETTLE_MS(3s)
-    STATE_15B_RESCUE_APPROACH_RIGHT,         // ④ 右移 ROUTE_14_TO_HOSTAGE_MM
+    STATE_15D_RESCUE_RECORRECT,              // ⭐新增: ③' 停稳后再【纯校一次】(不挪步, 见 ROUTE_RESCUE_PRE_RIGHT_STEP_MM)
+    STATE_15B_RESCUE_APPROACH_RIGHT,         // ④ 右移【第一段】ROUTE_14_MID_MM(到中途校准点)
+    STATE_15B2_RESCUE_MID_CORRECT,           // ⭐新增: 中途一次“挪 ROUTE_RESCUE_MID_STEP_MM + 航向校准到 -90°”
+    STATE_15B3_RESCUE_APPROACH_RIGHT2,       // ⭐新增: 右移【第二段】ROUTE_14_MID2_MM(走完就进救援区)
     STATE_15A_RESCUE_STOP_WAIT,              // ⑤ 原地停等 RESCUE_STOP_WAIT_MS(3000ms)
     STATE_16_RESCUE_RIGHT_A,                 // ⑥ 摆 ARM_POSE_HOSTAGE_LOOK(看人质)
     STATE_16A_RESCUE_HEADING_CORRECT,        // (未使用) 备用航向校正

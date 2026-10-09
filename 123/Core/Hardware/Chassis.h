@@ -502,6 +502,21 @@ void Chassis_Move_Right(int32_t distance_mm);
  */
 void Chassis_Move_Diagonal(int32_t fwd_mm, int32_t strafe_mm);
 
+/**
+ * @brief 右移 + 沿整段路径摊一个固定的“向后分量”(把前后偏置补偿从“段末挪一步”
+ *        改成“全程按比例斜着走”)
+ * @param  distance_mm 右移距离(mm, 正数 = 向右)
+ * @param  back_comp   向后分量比例(无量纲): 每右移 1mm 同时后退 back_comp mm。
+ *                     正 = 向【后】补, 负 = 向【前】补, 0 = 退化成普通右移。
+ * @note   ⭐ 2026-10-09 新增(用途见 MissionControl.c 的 ROUTE_12_RIGHT_BACK_COMP):
+ *            一次性的“段末挪一小步”是折线补偿, 补偿量随段长变化就飘;
+ *            这里改成全程按固定比例斜着走 ⇒ 右移多远就补多少, 路径是直的。
+ *         ⚠️ 内部【强制用平移参数集】(s_cfg_strafe), 不走 Chassis_Move_Diagonal:
+ *            后者按“含前后分量 = 直行”选参数, 会把这套按横移标定的
+ *            航向保持/trim 参数整个换掉。
+ */
+void Chassis_Move_Right_WithBack(int32_t distance_mm, float back_comp);
+
 /* ---------------- 转向指令 (角度, 单位: 度) ---------------- */
 
 /**

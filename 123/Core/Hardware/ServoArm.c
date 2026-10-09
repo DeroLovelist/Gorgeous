@@ -72,7 +72,7 @@ static volatile int32_t s_read_pos[SERVO_COUNT] = {-1, -1, -1, -1, -1};
 /* 初始姿态(0~4095): 底座3926 / 大臂2479 / 辅助752 / 辅助1287 / 夹爪800(张开)
  * ⚠️ 非 const: 示教标定 HOME 时通过 Servos_SetHomePositions() 更新 */
 //id2限幅（350~1900）id3限幅（900~3100）id4限幅（1050~3010）id5限幅（746张开~1397闭合）
-static uint16_t SERVO_POS_HOME[SERVO_COUNT] = {  227, 2274, 810, 1413, 93};
+static uint16_t SERVO_POS_HOME[SERVO_COUNT] = {  2052, 2274, 810, 1413, 93 };
 
 /**
  * @brief  由运动距离与时间换算舵机速度(步/秒)

@@ -156,7 +156,7 @@ static const ChassisPidCfg_t s_cfg_strafe = {
      * ⚠️ 若改完发现横移中车头偏得不能接受: 先把 hd_dead 退回 0.4, 再加大
      *   CH_HEADING_TRIM_MAX; 千万不要再给 hd_Ki(那就是回到双积分)。 */
     .hd_Kp = 1.60f,   .hd_Ki = 0.0f,     .hd_Kd = 1.5f,
-    .hd_max = 16.0f, .hd_imax = 50.0f, .hd_dead = 0.4f,
+    .hd_max = 16.0f, .hd_imax = 50.0f, .hd_dead = 0.5f,
     /* ⭐ 2026-10-06 修正: hd_trim 恢复成上面注释里写的设计值 1.0
      *   —— 它被误改成 0.0, 等于把“平移纠偏”整个关掉了! 后果:
      *     ① 横移/后退时车头一直漂(日志: 打靶右移 850mm 内 err 从 -0.3° 涨到 -5.5°,
@@ -954,15 +954,20 @@ void Chassis_Update_Control(void)
  * 平移指令
  * 参数：fwd_mm —— 前进距离(毫米, 负数表示后退)
  *       strafe_mm —— 左移距离(毫米, 负数表示右移)
+ *       strafe_cfg —— true = 强制用"平移参数集"(见 Chassis_Move_Right_WithBack),
+ *                     false = 按“纯平移/非纯平移”自动选
  * 直接让车走多少毫米
  * ===================================================================== */
-static void add_move(int32_t fwd_mm, int32_t strafe_mm)
+static void add_move_ex(int32_t fwd_mm, int32_t strafe_mm, bool strafe_cfg)
 {
     int32_t fwd_cnt = mm_to_counts(fwd_mm);
     int32_t strafe_cnt = mm_to_counts(strafe_mm) * CH_STRAFE_SIGN;          //CH_STRAFE_SIGN: 左移为正, 右移为负, 见 Chassis.h
 
-    /* ---- 分段 PID: 纯左移/右移用"平移参数", 其余(前进/后退/斜行)用"直行参数" ---- */
-    const ChassisPidCfg_t *cfg = (fwd_mm == 0 && strafe_mm != 0) ? &s_cfg_strafe : &s_cfg_straight;
+    /* ---- 分段 PID: 纯左移/右移用"平移参数", 其余(前进/后退/斜行)用"直行参数" ----
+     * strafe_cfg=true 用于“右移 + 少量向后分量”这类【本质仍是平移】的指令
+     * (见 Chassis_Move_Right_WithBack): 虽然带了前后分量, 但标定是按横移做的,
+     * 必须继续用平移参数集, 否则航向保持/trim 那套调参会整个换掉。 */
+    const ChassisPidCfg_t *cfg = (strafe_cfg || (fwd_mm == 0 && strafe_mm != 0)) ? &s_cfg_strafe : &s_cfg_straight;
     if (cfg != s_cfg)
     {
         apply_cfg(cfg);   /* 切换参数集(内部已复位积分) */
@@ -1017,6 +1022,12 @@ static void add_move(int32_t fwd_mm, int32_t strafe_mm)
     s_moving = true;
 }
 
+/* 普通平移指令入口: 分段参数按“纯平移 / 非纯平移”自动选(见 add_move_ex) */
+static void add_move(int32_t fwd_mm, int32_t strafe_mm)
+{
+    add_move_ex(fwd_mm, strafe_mm, false);
+}
+
 void Chassis_Move_Forward(int32_t distance_mm)
 {
     add_move(distance_mm, 0);
@@ -1035,6 +1046,20 @@ void Chassis_Move_Left(int32_t distance_mm)
 void Chassis_Move_Right(int32_t distance_mm)
 {
     add_move(0, -distance_mm);
+}
+
+/* ⭐ 2026-10-09 新增: 右移 + 固定比例的“向后分量”(用途/原理见 Chassis.h 的声明注释)
+ * 例: Chassis_Move_Right_WithBack(500, 0.085f) → 右移 500mm, 同时后退 42mm。
+ * ⚠️ 与“右移后再单独后退一小步”不同: 这里四轮的目标是【同时】给出的,
+ *    走出来的是一条斜直线(全程都在补), 不是先直后折。 */
+void Chassis_Move_Right_WithBack(int32_t distance_mm, float back_comp)
+{
+    float back_f = (float)distance_mm * back_comp;
+    int32_t back_mm = (int32_t)(back_f >= 0.0f ? back_f + 0.5f : back_f - 0.5f);
+
+    /* strafe_mm 取负 = 右移(同 Chassis_Move_Right); fwd_mm 取负 = 后退
+     * (横移途中车往上漂 ⇒ 补的方向是“向后”)。 */
+    add_move_ex(-back_mm, -distance_mm, true);
 }
 
 void Chassis_Move_Diagonal(int32_t fwd_mm, int32_t strafe_mm)
