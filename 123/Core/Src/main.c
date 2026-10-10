@@ -314,7 +314,7 @@ int main(void)
    *       调小→稳但不赶时间时更稳, 比赛时间紧张时可酌情加大(如 250~300)。
    * 若只想让某一段更快, 不必改这里: 在 MissionControl.c 路线宏旁用
    * Chassis_Move_* 前的 Chassis_SetMaxSpeed 单独提速即可。 */
-  Chassis_SetMaxSpeed(200);
+  Chassis_SetMaxSpeed(350);
 
   /* ---- ⭐ 注入“摆臂阻塞期间刷新陀螺仪 yaw”的回调 ----
    * Arm_GotoPose() 摆一次臂要阻塞好几秒; 期间底盘闭环跑在 TIM9 中断里,

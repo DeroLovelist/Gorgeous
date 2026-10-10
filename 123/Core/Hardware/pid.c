@@ -20,6 +20,8 @@ void DualPID_Init(DualPID_Controller *pid,
     pid->max_output = max_output;
     pid->vel_ff = vel_ff;
     pid->vel_ff_dead = vel_ff_dead;
+    pid->slow_dist = 0.0f;       /* 默认关闭, 由 DualPID_SetSlowdown 打开 */
+    pid->slow_min = 0.0f;
     pid->pos_integral = 0;
     pid->pos_error_prev = 0;
     pid->vel_integral = 0;
@@ -29,6 +31,13 @@ void DualPID_Init(DualPID_Controller *pid,
 void DualPID_SetMaxVel(DualPID_Controller *pid, float max_vel)
 {
     pid->max_vel = max_vel;
+}
+
+/* ⭐⭐ 2026-10-10 新增: 设置"提前减速"(按剩余距离) —— 见 DualPID_Update 里的用法说明 */
+void DualPID_SetSlowdown(DualPID_Controller *pid, float dist_counts, float min_vel)
+{
+    pid->slow_dist = (dist_counts > 0.0f) ? dist_counts : 0.0f;
+    pid->slow_min  = (min_vel > 0.0f) ? min_vel : 0.0f;
 }
 
 float DualPID_Update(DualPID_Controller *pid,
@@ -76,6 +85,31 @@ float DualPID_Update(DualPID_Controller *pid,
     float pos_lim = pid->max_vel - fabsf(bias);
     if (pos_lim < 0.0f) pos_lim = 0.0f;
     vel_target = fmaxf(fminf(vel_target, pos_lim), -pos_lim);
+
+    /* ---------- ⭐⭐ 2026-10-10: 提前减速 (按编码器剩余距离) ----------
+     * 为什么要: 段末位置误差一进到位容差(30 计数≈4.5mm)就【冻结+断输出】
+     *   (等于松开油门), 而在此之前位置环给的期望速度还有 0.6×30 ≈ 18 计数/周期
+     *   (≈135mm/s) ⇒ 惯性让车继续滑一段(现场表现"300mm/s 冲出界")。
+     * 怎么做: 剩余距离 < slow_dist 时, 把期望速度上限按剩余距离【线性】压小:
+     *     剩余 ≥ slow_dist     → 不限速(正常全速)
+     *     剩余 = slow_dist / 2 → 上限降到 50%
+     *     剩余 = 30 计数       → 上限 ≈ max_vel × 30 / slow_dist
+     *   例: max_vel=40(≈300mm/s)、slow_dist=200 ⇒ 到位时上限 ≈ 6 计数/周期(≈45mm/s),
+     *   比原来的 ~135mm/s 低得多 ⇒ 滑行距离大幅缩短。
+     * ⚠️ slow_dist = 0 ⇒ 完全跳过(老行为)。
+     * ⚠️ 用 slow_min 兜底: 期望速度降到推不动(静摩擦)反而会"停不到位";
+     *    5 计数/周期 ≈ 38mm/s 是实测能稳定推动的下限(见 Chassis.h CH_SLOWDOWN_*)。 */
+    if (pid->slow_dist > 0.0f)
+    {
+        float ae = fabsf(pos_error);
+        if (ae < pid->slow_dist)
+        {
+            float cap = pid->max_vel * (ae / pid->slow_dist);
+            if (cap < pid->slow_min) cap = pid->slow_min;
+            if (vel_target >  cap) vel_target =  cap;
+            if (vel_target < -cap) vel_target = -cap;
+        }
+    }
 
     /* 不允许偏置反向: 正向平移时偏置最多把该轮减到 0(反向平移同理) */
     if (vel_target > 0.0f && bias < -vel_target) bias = -vel_target;

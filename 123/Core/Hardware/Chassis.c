@@ -330,6 +330,11 @@ static void apply_cfg(const ChassisPidCfg_t *cfg)
                      cfg->vel_Kp, cfg->vel_Ki, cfg->vel_Kd,
                      s_max_vel, CH_PID_MAX_OUTPUT,
                      cfg->vel_ff, cfg->vel_ff_dead);
+        /* ⭐ 2026-10-10: 每次起步都按宏重新套用"提前减速"(见 Chassis.h 的 CH_SLOWDOWN_*)。
+         *    DualPID_Init 里已把它清 0, 所以必须在这里重新设一次。 */
+        DualPID_SetSlowdown(&s_pid[i],
+                            CH_SLOWDOWN_ENABLE ? (float)CH_SLOWDOWN_DIST_COUNT : 0.0f,
+                            CH_SLOWDOWN_MIN_COUNT);
     }
     s_heading_integral = 0.0f;
 }

@@ -41,6 +41,18 @@ extern "C" {
  * 同时被 ServoArm_Init() 和 Mission_Init() 使用, 保证两处一致 */
 #define SERVO_HOME_MOVE_MS    10000
 
+/* ---- 通用“速度下限 / 加速度”默认值 -----------------------------------
+ * 这是 Servos_SetPositions()/Servos_SetPositionsMasked() 一直在用的值;
+ * 单独列出来是为了能【按次】指定更柔的参数 —— 见下面
+ * Servos_SetPositionsMaskedEx()。
+ *   speed_min: 速度下限(步/秒)。短距离动作算出来的速度会被它抬到这里:
+ *              默认 200 步/秒 ⇒ 转 5 码只要 25ms = 一次“抽搐”, 手臂惯性
+ *              下容易过冲+余振(画面跟着抖)。微动用 20~60 会柔得多。
+ *   acc:       加速度(0~254, 协议值, 越小起步/停住越柔)。
+ * ⚠️ 只是默认值, 不会因为改了这里而影响任何动作 —— 要用请显式传参。 */
+#define SERVO_SPEED_MIN_DEF   200
+#define SERVO_ACC_DEF          50
+
 /**
  * @brief  初始化机械臂: 初始化舵机串口、等舵机上电、读回实际位置、
  *         使能扭矩并回到初始姿态
@@ -67,6 +79,26 @@ void Servos_SetPositions(uint16_t positions[SERVO_COUNT], uint16_t time_ms);
  */
 void Servos_SetPositionsMasked(const uint16_t positions[SERVO_COUNT],
                                uint8_t mask, uint16_t time_ms);
+
+/**
+ * @brief  只设置 mask 选中的舵机位置, 并【按次】指定速度下限与加速度
+ * @param  positions 长度为 SERVO_COUNT 的目标位置数组 (0~4095)
+ * @param  mask      舵机选择掩码, 见上面 SERVO_MASK_*
+ * @param  time_ms   期望运动时间(ms), 0 表示最快
+ * @param  speed_min 本次速度下限(步/秒)。传 SERVO_SPEED_MIN_DEF(200)
+ *                   = 与 Servos_SetPositionsMasked() 完全等价
+ * @param  acc       本次加速度(0~254)。传 SERVO_ACC_DEF(50) = 默认
+ * @note   用途: “精对准微动”。通用接口的速度下限会把几码的微动钳成
+ *         200 步/秒(二十几毫秒冲到位) ⇒ 手臂被“抽”一下, 过冲+余振,
+ *         摄像头跟着抖、下一帧误差不准 ⇒ 反复修 = 看起来一直在晃。
+ *         这里传一个小下限(如 20)就能让它按 time_ms 慢慢走完。
+ * ⚠️ 只用于【短距离微动】: 下限给小了再用于长距离动作会慢得离谱。
+ *
+ * 例(打靶精对准, 5 码微步走 250ms 而不是 25ms):
+ *   Servos_SetPositionsMaskedEx(pose, SERVO_MASK_ID1, 600, 20, 20);
+ */
+void Servos_SetPositionsMaskedEx(const uint16_t positions[SERVO_COUNT], uint8_t mask,
+                                 uint16_t time_ms, uint16_t speed_min, uint8_t acc);
 
 /**
  * @brief  更新上电初始姿态(示教标定 HOME 时同步, 下次 ServoArm_Init 生效)

@@ -48,6 +48,14 @@ typedef struct
     float vel_ff;            /* 速度前馈线性增益 (PWM / 每周期计数) */
     float vel_ff_dead;       /* 电机死区补偿 (PWM) */
 
+    /* ============ ⭐⭐ 2026-10-10 提前减速 (按编码器剩余距离) ============
+     * 由 DualPID_SetSlowdown() 设置; slow_dist = 0 表示关闭(老行为)。
+     * 作用: 剩余距离 < slow_dist 时, 把期望速度上限按剩余距离【线性压小】
+     *       (越接近目标越慢) ⇒ 段末"冻结断输出"那一刻速度已经很低,
+     *       否则位置环一到容差就松开油门, 车靠惯性继续滑(现场"冲出界")。 */
+    float slow_dist;         /* 减速起始剩余距离 (编码器计数); 0 = 关闭 */
+    float slow_min;          /* 减速下限期望速度 (计数/控制周期); 防降太狠推不动 */
+
     /*
      * ───────────────────── 参数详细说明 ─────────────────────
      *
@@ -145,6 +153,15 @@ void DualPID_Init(DualPID_Controller *pid,
  * @brief 修改串级 PID 的最大目标速度 (速度上限)
  */
 void DualPID_SetMaxVel(DualPID_Controller *pid, float max_vel);
+
+/**
+ * @brief 设置"提前减速": 剩余距离 < dist 时期望速度上限按比例压小
+ * @param dist_counts 减速起始剩余距离 (编码器计数); ≤0 = 关闭(老行为)
+ * @param min_vel     减速下限 (计数/控制周期): ⚠️ 别给 0, 太小会推不动(停不到位)
+ * @note  参数来源 = Chassis.h 的 CH_SLOWDOWN_*, 由 Chassis.c 的 apply_cfg()
+ *        在每次起步时套用。原理/取值见 pid.c 的 DualPID_Update() 里那段说明。
+ */
+void DualPID_SetSlowdown(DualPID_Controller *pid, float dist_counts, float min_vel);
 
 /**
  * @brief 串级 PID 计算

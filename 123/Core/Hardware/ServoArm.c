@@ -39,13 +39,18 @@
  * ⭐ 速度 / 加速度 / 上电时序
  *   4096 步 = 360°, 所以“步/秒”换算角度: 度/秒 = 步/秒 ÷ 4096 × 360。
  * ===================================================================== */
-#define SERVO_SPEED_MIN         200    /* 速度下限(步/秒) ≈ 17.6°/s。
+#define SERVO_SPEED_MIN         SERVO_SPEED_MIN_DEF   /* 速度下限(步/秒) ≈ 17.6°/s。
                                         * 用于“短距离/距离算不出来”时的兜底速度。
                                         * ⚠️ 别设太小(原来 50 ≈ 4.4°/s): 上电回位时
                                         * 舵机可能离目标很远, 下限过小会爬几十秒都到不了;
-                                        * 也别设太大(>500)免得短动作冲得猛。建议 150~250 */
+                                        * 也别设太大(>500)免得短动作冲得猛。建议 150~250
+                                        * ⭐ 2026-10-10: 数值搬到了 ServoArm.h 的
+                                        *    SERVO_SPEED_MIN_DEF —— 调用方要用它当“默认值”
+                                        *    传给 Servos_SetPositionsMaskedEx()
+                                        *    (精对准微动传更小的下限, 见那里的说明) */
 #define SERVO_SPEED_MAX         4095   /* 速度上限(步/秒) = 协议满速 */
-#define SERVO_ACC_DEFAULT       50     /* 加速度(0~254): 值越小起步越柔。50 比较温和 */
+#define SERVO_ACC_DEFAULT       SERVO_ACC_DEF   /* 加速度(0~254): 值越小起步越柔。
+                                                 * 50 比较温和(定义在 ServoArm.h) */
 #define SERVO_POWER_ON_DELAY_MS 500    /* 上电后等舵机/驱动板启动的时间(ms)。
                                         * MCU 往往比舵机先上电, 不等的话最初几条
                                         * 指令会丢(回位指令收不到 → 停在原地) */
@@ -75,9 +80,14 @@ static volatile int32_t s_read_pos[SERVO_COUNT] = {-1, -1, -1, -1, -1};
 static uint16_t SERVO_POS_HOME[SERVO_COUNT] = {  2052, 2274, 810, 1413, 93 };
 
 /**
- * @brief  由运动距离与时间换算舵机速度(步/秒)
+ * @brief  由运动距离与时间换算舵机速度(步/秒), 并指定“速度下限”
+ * @param  speed_min 本次允许的最低速度(步/秒): 算出来的速度低于它就用它。
+ *                   ⭐ 2026-10-10 新增(供精对准微动用): 传一个小的下限
+ *                   (如 20)时, 几码的微动才会按 time_ms 慢慢走完, 而不是
+ *                   被 200 步/秒的通用下限钳成二十几毫秒的“抽搐”。
  */
-static uint16_t ServoArm_CalcSpeed(uint16_t from, uint16_t to, uint16_t time_ms)
+static uint16_t ServoArm_CalcSpeedEx(uint16_t from, uint16_t to, uint16_t time_ms,
+                                     uint16_t speed_min)
 {
     uint32_t dist;
     uint32_t speed;
@@ -93,13 +103,21 @@ static uint16_t ServoArm_CalcSpeed(uint16_t from, uint16_t to, uint16_t time_ms)
     }
 
     speed = (dist * 1000U) / time_ms;   /* 步/秒 */
-    if (speed < SERVO_SPEED_MIN) {
-        speed = SERVO_SPEED_MIN;        /* 兜底: 距离很小/算成 0 时也别用蠕动速度 */
+    if (speed < speed_min) {
+        speed = speed_min;              /* 兜底: 距离很小/算成 0 时也别用蠕动速度 */
     }
     if (speed > SERVO_SPEED_MAX) {
         speed = SERVO_SPEED_MAX;
     }
     return (uint16_t)speed;
+}
+
+/**
+ * @brief  由运动距离与时间换算舵机速度(步/秒) —— 用通用速度下限
+ */
+static uint16_t ServoArm_CalcSpeed(uint16_t from, uint16_t to, uint16_t time_ms)
+{
+    return ServoArm_CalcSpeedEx(from, to, time_ms, SERVO_SPEED_MIN);
 }
 
 /**
@@ -131,16 +149,20 @@ void ServoArm_Init(void)
 }
 
 /**
- * @brief  裸同步写: 只把 mask 选中的舵机写到目标位置(不含任何保护/拆段)
- * @param  from    上一次指令位置(用来换算本段速度)
- * @param  to      目标位置(调用方保证已限幅到 0~4095)
- * @param  time_ms 期望本段运动时间(ms), 0=最快
- * @param  mask    舵机选择掩码(SERVO_MASK_ID1..ID5 按位或)
+ * @brief  裸同步写: 只把 mask 选中的舵机写到目标位置(不含任何保护/拆段),
+ *         并可【按次】指定速度下限/加速度
+ * @param  from      上一次指令位置(用来换算本段速度)
+ * @param  to        目标位置(调用方保证已限幅到 0~4095)
+ * @param  time_ms   期望本段运动时间(ms), 0=最快
+ * @param  mask      舵机选择掩码(SERVO_MASK_ID1..ID5 按位或)
+ * @param  speed_min 本次速度下限(步/秒), 见 ServoArm_CalcSpeedEx()
+ * @param  acc_val   本次加速度(0~254)
  * @note   只同步更新被写入舵机的 s_last_pos
  */
-static void Servos_WriteRawMask(const uint16_t from[SERVO_COUNT],
-                                const uint16_t to[SERVO_COUNT],
-                                uint16_t time_ms, uint8_t mask)
+static void Servos_WriteRawMaskEx(const uint16_t from[SERVO_COUNT],
+                                  const uint16_t to[SERVO_COUNT],
+                                  uint16_t time_ms, uint8_t mask,
+                                  uint16_t speed_min, uint8_t acc_val)
 {
     uint8_t ids[SERVO_COUNT];
     int16_t pos[SERVO_COUNT];
@@ -154,8 +176,8 @@ static void Servos_WriteRawMask(const uint16_t from[SERVO_COUNT],
         }
         ids[n] = s_servo_ids[i];
         pos[n] = (int16_t)to[i];
-        spd[n] = ServoArm_CalcSpeed(from[i], to[i], time_ms);
-        acc[n] = SERVO_ACC_DEFAULT;
+        spd[n] = ServoArm_CalcSpeedEx(from[i], to[i], time_ms, speed_min);
+        acc[n] = acc_val;
         s_last_pos[i] = to[i];
         n++;
     }
@@ -167,13 +189,31 @@ static void Servos_WriteRawMask(const uint16_t from[SERVO_COUNT],
 }
 
 /**
- * @brief  设置位置(可只动 mask 选中的舵机)
+ * @brief  裸同步写(用通用速度下限/加速度) —— 与以前完全一致
+ * @note   只有“大步长拆两段”(SERVO_LONG_JUMP_SPLIT=1)那个分支用到它,
+ *         所以跟着那个开关一起编译, 免得默认配置下报“函数未使用”。
+ */
+#if SERVO_LONG_JUMP_SPLIT
+static void Servos_WriteRawMask(const uint16_t from[SERVO_COUNT],
+                                const uint16_t to[SERVO_COUNT],
+                                uint16_t time_ms, uint8_t mask)
+{
+    Servos_WriteRawMaskEx(from, to, time_ms, mask, SERVO_SPEED_MIN, SERVO_ACC_DEFAULT);
+}
+#endif
+
+/**
+ * @brief  设置位置(可只动 mask 选中的舵机), 并可【按次】指定速度下限/加速度
  * @note   默认行为 = 直接发一条同步写指令。
  *         若打开 SERVO_LONG_JUMP_SPLIT(见文件头), 大步长的舵机会自动
  *         插一个“同方向中间点”分两段走, 防止舵机按最短路径反向甩半圈。
+ *         speed_min 见 ServoArm_CalcSpeedEx(), acc_val 见协议(0~254)。
+ * ⭐ 2026-10-10 新增(供“精对准微动”用): 通用下限 200 步/秒会把几码的微动
+ *    钳成二十几毫秒的“抽搐”, 手臂惯性 ⇒ 过冲+余振 ⇒ 画面抖、反复修。
  */
-static void Servos_SetPositionsMask(const uint16_t positions[SERVO_COUNT],
-                                    uint8_t mask, uint16_t time_ms)
+static void Servos_SetPositionsMaskEx(const uint16_t positions[SERVO_COUNT],
+                                      uint8_t mask, uint16_t time_ms,
+                                      uint16_t speed_min, uint8_t acc_val)
 {
     uint16_t from[SERVO_COUNT];
     uint16_t to[SERVO_COUNT];
@@ -234,7 +274,18 @@ static void Servos_SetPositionsMask(const uint16_t positions[SERVO_COUNT],
     }
 #endif
 
-    Servos_WriteRawMask(from, to, time_ms, mask);
+    Servos_WriteRawMaskEx(from, to, time_ms, mask, speed_min, acc_val);
+}
+
+/**
+ * @brief  设置位置(可只动 mask 选中的舵机) —— 用通用速度下限/加速度
+ * @note   与上面 Servos_SetPositionsMaskEx() 完全等价, 只是参数取默认值。
+ */
+static void Servos_SetPositionsMask(const uint16_t positions[SERVO_COUNT],
+                                    uint8_t mask, uint16_t time_ms)
+{
+    Servos_SetPositionsMaskEx(positions, mask, time_ms,
+                              SERVO_SPEED_MIN, SERVO_ACC_DEFAULT);
 }
 
 /**
@@ -258,6 +309,21 @@ void Servos_SetPositionsMasked(const uint16_t positions[SERVO_COUNT],
                                uint8_t mask, uint16_t time_ms)
 {
     Servos_SetPositionsMask(positions, mask, time_ms);
+}
+
+/**
+ * @brief  只设置 mask 选中的舵机位置, 并【按次】指定速度下限与加速度
+ * @param  positions 长度为 SERVO_COUNT 的目标位置数组 (0~4095)
+ * @param  mask      舵机选择掩码, 见 ServoArm.h 的 SERVO_MASK_*
+ * @param  time_ms   期望运动时间(ms), 0=最快
+ * @param  speed_min 本次速度下限(步/秒), 见 ServoArm.h 的 SERVO_SPEED_MIN_DEF
+ * @param  acc       本次加速度(0~254)
+ * @note   用途/取舍见 ServoArm.h 里本函数的声明注释。
+ */
+void Servos_SetPositionsMaskedEx(const uint16_t positions[SERVO_COUNT], uint8_t mask,
+                                 uint16_t time_ms, uint16_t speed_min, uint8_t acc)
+{
+    Servos_SetPositionsMaskEx(positions, mask, time_ms, speed_min, acc);
 }
 
 /**
