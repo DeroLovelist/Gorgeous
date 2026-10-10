@@ -375,7 +375,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 
 /* ---- ③ 停下等待时间(ms): 右移 + 航向校正好之后先停一会儿,
  *      等车体晃动停下来再让机械臂摆出去, 免得抓的时候还在晃 ---- */
-#define RESCUE_STOP_WAIT_MS     3000
+#define RESCUE_STOP_WAIT_MS     2000
 
 /* ---- ③' ⭐ 2026-10-07 新增: 右转 90° 且航向校准【到位】之后, 先原地停稳这么久
  *      才允许右移进救援区。
@@ -387,7 +387,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *   再原地停车开始计时; 计时到点才右移 —— 即“先校准到位, 后额外停稳 3 秒”。
  *   ⚠️ 不是“最多等 3 秒”(那样没等它真到位就跑了)。
  * 建议 2000~4000(默认 3000); 0 = 关闭(校准完立刻右移)。 */
-#define RESCUE_ALIGN_SETTLE_MS  3000
+#define RESCUE_ALIGN_SETTLE_MS  2000
 
 /* ---- 【方案二】转 ID1 专用参数(和打靶那套完全同构) ---- */
 /* ⭐⭐ 2026-10-08 重新示教得到的【三个对准/抓取位置】(用户实测) ------------
@@ -597,7 +597,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *   ⚠️ 只作用于【锁存值】这条路: 没锁存过(退回姿态表里的 ID1, 例如无视觉测试/未对准)
  *      时【不加】—— 那种情况下抓取位是示教标定出来的, 本来就是对的。
  *   ⚠️ 不回写姿态表: 只是运行时修正, 重上电/再跑一次救援仍从本宏取。 */
-#define RESCUE_GRAB_ID1_OFFSET     0    /* 舵机码: 抓取时给锁存值加的修正量(正=右,负=左,0=不修) */
+#define RESCUE_GRAB_ID1_OFFSET     -20    /* 舵机码: 抓取时给锁存值加的修正量(正=右,负=左,0=不修) */
 
 /* ---- K230 run_task 编号(与 yolo_main3.py handle_command 对齐) ---- */
 #define K230_TASK_BALL      1   /* 球: 抓取小球(排爆第一步) */
@@ -869,16 +869,16 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
                              /*正式地图*//*自己地图*/
 #define ROUTE_1_TO_QR_MM           656      /* 起点 → 二维码扫描点(直行) */
 #define ROUTE_3_LEFT_A_MM          557    /* 扫码后左移 A 段 */
-#define ROUTE_4_DIAG_FWD_MM        125      /* 左上斜跑: 前进分量(≈45°斜走) */
-#define ROUTE_4_DIAG_LEFT_MM       125     /* 左上斜跑: 左移分量(≈45°斜走) */
+#define ROUTE_4_DIAG_FWD_MM        130      /* 左上斜跑: 前进分量(≈45°斜走) */
+#define ROUTE_4_DIAG_LEFT_MM       130     /* 左上斜跑: 左移分量(≈45°斜走) */
 
 /* ---------- 过斜坡段 ---------- */
-#define ROUTE_5_TO_RAMP_MM         /*890*/   893    /* 斜坡前直行距离 */
-#define ROUTE_7_LEFT_B_MM          /*885 */  871 /* 左移 B 段 */
+#define ROUTE_5_TO_RAMP_MM         /*890*/   899//893    /* 斜坡前直行距离 */
+#define ROUTE_7_LEFT_B_MM          /*885 */  866 /* 左移 B 段 */
 #define ROUTE_7_LEFT_C_MM           408    /* 左移 C 段 */
 
 /* ---------- 排爆区走位 ---------- */
-#define ROUTE_8_TO_BOMB_AREA_MM     /* 990 */  993  /* 直行进入排爆区 */
+#define ROUTE_8_TO_BOMB_AREA_MM     /* 990 */  991  /* 直行进入排爆区 */
 #define ROUTE_8B_RIGHT_MM           /* 672 */  722    /* 右移微调: 672 → 702 (+30mm)
                                                       * 实测排爆区差一点到中心观看点; 每次 ±10~20mm 微调 */
 #define ROUTE_9_TURN_DEG            (0.1)  /* 转向排爆点(相对角度, 负=右转) */
@@ -894,7 +894,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *     与救援段那几处(车头已 -90°, 前进 = 场地右)方向含义不同, 别混。
  *  ⚠️ 到位死区 ≈ CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm ⇒ 实际位移 ≈ |本值| − 4.5;
  *     绝对值别小于 6(会被死区吃掉、等于没动还白等一次)。 */
-#define ROUTE_BOMB_AFTER_STEP_MM    9      /* 排爆后: 车头前进 9mm(实际约 4.5mm) 再校 0° */
+#define ROUTE_BOMB_AFTER_STEP_MM    0      /* 排爆后: 车头前进 9mm(实际约 4.5mm) 再校 0° */
 
 /* ---------- 打靶路线 (2026-10-04 改版后只剩两段真正在用) ----------
  * ⭐ 2026-10-09: 每一段右移都【对半拆开走】(实测: 一次右移 850mm 会攒下约 5° 航向误差,
@@ -948,7 +948,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *      第 1 处(CORRECT_A2) = ROUTE_12_P1_BACK_MM  = -15
  *      第 2 处(CORRECT_B2) = ROUTE_12_P1_BACK2_MM = -6(底盘能停稳的最小一步) */
 #define ROUTE_12_P1_BACK_MM         -15    /* 方案一固定步长 · 第 1 处(CORRECT_A2): 车头后退 15mm */
-#define ROUTE_12_P1_BACK2_MM        -6     /* 方案一固定步长 · 第 2 处(CORRECT_B2): 车头后退 6mm
+#define ROUTE_12_P1_BACK2_MM        -15/*-6     /* 方案一固定步长 · 第 2 处(CORRECT_B2): 车头后退 6mm
                                             * (实际约 1.5mm; 再小会被到位死区吃掉、等于没动) */
 
 /* ⭐ 打靶走位“航向校正前先挪一小步”的【总开关】(2026-10-09 新增):
@@ -959,7 +959,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *   实车要反复在“挪 / 不挪”之间对比, 每次改步长会把标定好的绝对值冲掉;
  *   用开关切更保险 —— 打开时只要把步长填回去即可。
  * ⚠️ 开关打开却把步长留成 0 = 白开: 下面有 #error 提前拦住(只查走了方案一的那处)。 */
-#define ROUTE_12_MINSTEP_ENABLE     1
+#define ROUTE_12_MINSTEP_ENABLE     0
 
 /* ⭐⭐ 2026-10-09 新增(用户要求): 这两处“挪一小步”各有两个方案, 【各自独立】选 -------
  * 每处一个方案开关:
@@ -981,7 +981,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *    这里的两个开关决定【总开关打开后】每处走哪个方案。
  * ⚠️ 方案二选“区间内 → 0”时, Route_BackMinStep(0) 会直接返回(不挪、不等待), 只做
  *    紧接着的那次航向校正。 */
-#define ROUTE_12_A2_STEP_MODE   1   /* 第 1 处(CORRECT_A2): 0 = 方案一(固定 -15) / 1 = 方案二(按偏航角) */
+#define ROUTE_12_A2_STEP_MODE   0   /* 第 1 处(CORRECT_A2): 0 = 方案一(固定 -15) / 1 = 方案二(按偏航角) */
 #define ROUTE_12_B2_STEP_MODE   0   /* 第 2 处(CORRECT_B2): 0 = 方案一(固定 -6)  / 1 = 方案二(按偏航角) */
 
 /* ---- 方案二公用的【偏角门限】(度): 只看绝对值, 两个方向都管(用户要求 1.1°) */
@@ -1007,7 +1007,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 
 #define ROUTE_12_P1_C_MM            400    /* (未使用: MOVE_C 改成只摆 TARGET_LOOK, 不再走位) */
 #define ROUTE_12_TURN_A_DEG         400    /* (未使用: TURN_A/TURN_B 已不在流程里) */
-#define ROUTE_12_P2_A_MM           /* 602 */  541   /* ⭐ 打靶收尾第 1 段 = 右移到【拐角】(mm):
+#define ROUTE_12_P2_A_MM           /* 602 */  575   /* ⭐ 打靶收尾第 1 段 = 右移到【拐角】(mm):
                                             * ⚠️ 2026-10-07 实测: 这段右移到位后小车正好到车场
                                             * 拐角, 那里原地转 90° 的余量才充足(转就紧跟在它后面)。
                                             * 590 → 560: 原来会略微冲过拐角, 减 20mm 让它停在
@@ -1022,7 +1022,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *      → ⑤右移 ROUTE_14_TO_HOSTAGE_MM(进救援区, ⭐ 现在拆两段、中途校一次)
  *        → 停等3s → 摆 HOSTAGE_LOOK
  * ⚠️ 走到②时车头还是 0° ⇒ 用的是“后退”(Chassis_Move_Backward)。 */
-#define ROUTE_12_P2_BACK_MM         50
+#define ROUTE_12_P2_BACK_MM         25
                                            
 #define ROUTE_12_P2_B_MM            200    /* (已废弃) */
 #define ROUTE_12_P2_C_MM            200    /* (已废弃) */
@@ -1032,7 +1032,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * 为什么需要: 底盘“到位/转向完成”判定成立之后车其实还在轻微晃, 这里多等一段
  *   再让臂/摄像头伸出去 —— 免得底盘刹车/麦轮摆动还没停, 机械臂就带着摄像头一起晃。
  * 建议 0(关闭) ~ 1500; 默认 800。 */
-#define TARGET_STOP_SETTLE_MS   800
+#define TARGET_STOP_SETTLE_MS   200
 
 /* ---------- 救援(掉头) ---------- */
 #define ROUTE_14_TO_HOSTAGE_MM      /* 950 */  965  /* 救援前横移距离(mm)。⚠️ 2026-10-07 起:
@@ -1041,7 +1041,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 /* ⭐⭐ 2026-10-09 新增(用户要求): ④ 右移进救援区【中途插一次航向校准】 ------------
  * 目的: 965mm 一路走到底才校准, 中间攒的航向误差没人收; 现在在半路先校一次
  *       (还没到救援区), 走法/做法和前面几处(②⑨⑪ 以及打靶走位那几处)完全一样 =
- *       【先挪一小步 → 再按绝对角校准到 -90°】。
+ *       【先挪一小步 → 再按绝对角校准到 -90°】
  * 拆法(⚠️ 总长只在那一个宏里, 别在两处各写一半):
  *      第一段 = ROUTE_14_MID_MM, 校准后第二段 = 总长 − 第一段
  *   ⇒ 只想改“一共右移多远”就改 ROUTE_14_TO_HOSTAGE_MM; 想挪校准点改 ROUTE_14_MID_MM。
@@ -1102,11 +1102,11 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *  ⭐ ⑦ 抓取 (2026-10-06): 底盘不动, 靠底座 ID1 小步转对准人质; 对准完
  *     (收到 C, 或步数/时长超时兜底)按 ID1 的【累计偏移量】选左/中/右一侧,
  *     再执行该侧的【抓取 → 抱紧 → 抬起】三个姿态(共 9 个姿态, 待示教标定,
- *     见 Arm_Start_Rescue_Grab / Arm_Start_Rescue_Retract)。
- *  ⚠️ 车头转了 90° 之后, 机械臂那几套姿态(ID1 底座尤其)需要重新示教标定。 */
+ *     见 Arm_Start_Rescue_Grab / Arm_Start_Rescue_Retract)
+ *  ⚠️ 车头转了 90° 之后, 机械臂那几套姿态(ID1 底座尤其)需要重新示教标定 */
 #define ROUTE_16_RIGHT_A_MM         300    /* (未使用: 该状态已改成“只摆 HOSTAGE_LOOK”) */
 #define ROUTE_17_RIGHT_B_MM         650    /* ⭐ 抓完后第 1 段右移(mm)(原来叫“后退”) */
-#define ROUTE_18_RIGHT_C_MM         /* 890 */  924    /* ⭐ 抓完后第 2 段右移(mm)(原来叫“后退”) */
+#define ROUTE_18_RIGHT_C_MM         /* 890 */  964    /* ⭐ 抓完后第 2 段右移(mm)(原来叫“后退”) */
 
 /* ⭐⭐ 救援段(阶段四): ② 【转完 90° 之后】航向校准前的“挪最小一步”(mm) ----------
  *  作用状态 = STATE_15_TURN_FOR_HOSTAGE(即“①转完 90° → ②校准”里的 ②),
@@ -1119,7 +1119,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *  取值: 底盘到位死区 ≈ CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm ⇒
  *      【实际位移 ≈ |本值| − 4.5mm】(填 75 → 实际约 70mm; 填 6 → 实际约 1.5mm)。
  *      ⚠️ 绝对值别小于 6 —— 会被死区吃掉、等于没动(还白等一次); 0 = 关掉这一步。 */
-#define ROUTE_RESCUE_AFTER_TURN_MM   80     /* ②(转完90°后): 车头前进 75mm(实际约 70mm) */
+#define ROUTE_RESCUE_AFTER_TURN_MM   75     /* ②(转完90°后): 车头前进 75mm(实际约 70mm) */
 
 /* ⭐ 救援段(阶段四): 每次【航向纠正】之前, 先“挪最小一步”(mm)
  * 作用状态 = 阶段四各处航向纠正:
@@ -1143,8 +1143,8 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * ⚠️ 底盘到位死区 ≈ CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm ⇒
  *      【实际位移 ≈ |本值| − 4.5mm】: 填 6 → 实际约 1.5mm。
  *      ⚠️ 绝对值别小于 6 —— 会被死区吃掉、等于没动(还白等一次)。 */
-#define ROUTE_RESCUE_FWD_MM         15     /* ⑨: 车头前进 6mm */
-#define ROUTE_RESCUE_LAST_STEP_MM   15    /* ⑪(最后一次): 车头前进 6mm。
+#define ROUTE_RESCUE_FWD_MM         -30     /* ⑨: 车头前进 6mm */
+#define ROUTE_RESCUE_LAST_STEP_MM   0    /* ⑪(最后一次): 车头前进 6mm。
                                            * 负数 = 后退; 0 = 关掉这一步。 */
 
 #define ROUTE_19_RIGHT_D_MM         800    /* (未使用) */
@@ -1168,7 +1168,8 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * 
  * ===================================================================== */
 //id2限幅（50往前~2300往后）id3限幅（700往下~3100往上）id4限幅（900往下~3010往上）id5限幅（25张开~600闭合）
-static uint16_t s_arm_pose_table[ARM_POSE_COUNT][SERVO_COUNT] = {
+static uint16_t s_arm_pose_table[ARM_POSE_COUNT][SERVO_COUNT] =
+ {
     /*  名称             ID1   ID2   ID3   ID4   ID5  */
     {  2052, 2274, 810, 1413, 93  },   /* HOME          复位(运行时取自 ServoArm, 此行不生效) */
     {  2052,  656,1760, 2185, 93  },   /* SCAN          扫码: 车停稳后伸臂给摄像头
@@ -1274,7 +1275,7 @@ static uint16_t s_arm_pose_time[ARM_POSE_COUNT] = {
     2500,   /* TARGET_READY  准备识别靶子 */
     4000,   /* TARGET_LOOK   识别靶子 */
     6000,   /* TARGET_FIRE   激光发射位 */
-    6000,   /* TARGET_LIFT   发射完抬起。
+    2000,   /* TARGET_LIFT   发射完抬起。
              * ⚠️ 2026-10-06: 本动作是全场【负载最重】的(ID2 从 585 抬到 1843 =
              *    +1258 码 / ID3 从 1899 转到 878 = -1021 码, 全程顶着重力)。
              *    实测“抬完大臂后机械臂薓下去”, 疑似峰值电流/过热把舵机拉降额。
