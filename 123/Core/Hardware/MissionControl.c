@@ -44,6 +44,27 @@
 /* 日志快捷方式: 输出到 USART3(蓝牙) */
 #define MLOG(...)   elog_i("MISSION", __VA_ARGS__)
 
+/* ⭐⭐ 方案②(陀螺仪零偏)的【起锚范围】开关 --------------------------------------
+ * 与 MissionControl.h 里那两个 SCOPE 开关同族, 但只有本文件用到, 所以定义在这里。
+ *   SCOPE_TAIL   (在 .h) = 1 : 【抓取人质后 → 终点】, 在 STATE_17 起锚 / STATE_19 停锚
+ *   SCOPE_TARGET (在 .h) = 0 : 【打靶走位段】, 在 STATE_11A 起锚 / STATE_14 停锚
+ *   SCOPE_RESCUE (本文件) = 0: 【进救援区右移 → 对准人质 → 抓取人质】这一段,
+ *                              在 STATE_15C 停稳时起锚 / STATE_19 停锚
+ *   ⭐ 三者互相独立, 不许混用: SCOPE_RESCUE = 1 时【不再】在 STATE_17 重复起锚
+ *      (重复起锚会把 corrected_yaw 重新对齐当前 yaw, 顺手清掉刚建好的前馈链),
+ *      统一由 STATE_15C 一路用到 STATE_19 —— 这正是原版 f8106e7 的做法。
+ *   ⚠️ 当前取值: TAIL = 1 / TARGET = 0 / RESCUE = 0
+ *      ⇒ 只有【抓取人质后 → 终点】用方案②, 其余全程走方案①(原始 yaw)。
+ *   ⚠️ 原来 STATE_15C 那个起锚错挂在 GYRO_BIAS_TGT_ON 下, 一旦把 SCOPE_TARGET
+ *      打开就会把这一段一起激活 ⇒ 已改用本开关, 彻底解耦。
+ */
+#define GYRO_BIAS_SCOPE_RESCUE      0     /* 1 = 救援区右移→对准→抓取 这一段也用方案② */
+#if (GYRO_BIAS_SCHEME && GYRO_BIAS_SCOPE_RESCUE)
+#define GYRO_BIAS_RESCUE_ON         1
+#else
+#define GYRO_BIAS_RESCUE_ON         0     /* 方案① 或 本段不启用: 一律不起锚 */
+#endif
+
 /* ================= 全局变量定义 ================= */
 volatile MissionState_t g_mission_state = MISSION_STATE_IDLE;   // 任务状态机当前状态
 volatile uint8_t g_vision_task_in_progress = 0;                 // 视觉子状态机任务号 (0=无任务, 1=排爆, 2=打靶, 3=救援)
@@ -7604,9 +7625,9 @@ void Mission_Update(void)
              *    (那时横移的航向保持会拿残余角当基准 → 越走越斜)。
              *    ⚠️ 顺序是“先到位、后计时”, 不是“最多等 3 秒”。 */
             case STATE_15C_RESCUE_ALIGN_SETTLE:
-#if GYRO_BIAS_TGT_ON
-                /* ⭐ 方案②且在打靶走位段启用: 救援区停稳期间顺手起锚(先做 ZUPT),
-                 *    这样后面的 ④ 右移就已经有零偏估计了(与救援区右移同一套) */
+#if GYRO_BIAS_RESCUE_ON
+                /* ⭐ 方案②且 GYRO_BIAS_SCOPE_RESCUE=1: 救援区停稳期间起锚(先做 ZUPT),
+                 *    这样后面的 ④ 右移就已经有零偏估计了; 一路用到 STATE_19 停锚。 */
                 Chassis_GyroBias_Start();
 #endif
                 Chassis_Stop();
@@ -7688,11 +7709,13 @@ void Mission_Update(void)
              *       只按绝对角把车头摆正(-90°, 顺带重同步航向基准), 让后面 1614mm 长距离更直;
              *    ⑩ 那一步才是一次性连续右移(⑩+⑫ 合并), 中途不再停车、不再校正。 */
             case STATE_17_RESCUE_RIGHT_B:
-#if GYRO_BIAS_TAIL_ON
+#if (GYRO_BIAS_TAIL_ON && !GYRO_BIAS_RESCUE_ON)
                 /* ⭐⭐ 2026-10-11(用户要求): 【抓取人质后】才启用陀螺仪零偏方案 ——
                  *    从这一步(⑥ 抓完后的第 1 个状态)起锚, 一路用到终点(⑫ 停锚)。
                  *    起锚时会把软件航向 corrected_yaw 对齐到当前航向, 所以紧接着的
-                 *    Heading_AlignTo(-90°) 和后面的右移都以它为基准, 不会跳变。 */
+                 *    Heading_AlignTo(-90°) 和后面的右移都以它为基准, 不会跳变。
+                 *    ⚠️ 若 GYRO_BIAS_SCOPE_RESCUE=1, 起锚已提前到 STATE_15C,
+                 *       这里就不再重复起锚(见 GYRO_BIAS_SCOPE_RESCUE 处的说明)。 */
                 Chassis_GyroBias_Start();
 #endif
                 MLOG("救援: 抓完人质 -> 先原地校一次航向(挪步 %+dmm, 目标 %.1f°)",
