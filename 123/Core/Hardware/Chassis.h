@@ -799,6 +799,20 @@ void Chassis_SetNextMoveSlowdown(int32_t dist_counts, float min_vel);
 void Chassis_SetNextMoveSpeedCap(float mmps);
 
 /**
+ * @brief  ⭐ 2026-10-11 新增(用户要求): 覆盖【紧接着那一次转向】的力度上限
+ * @param  adj 本次转向的修正量单次限幅(编码器计数/周期; 即 CH_MAX_TURN_ADJUST 的临时值)
+ *             ≤0 = 取消覆盖(恢复用 CH_MAX_TURN_ADJUST 宏)
+ * @note   ⭐ 用途: 个别航向校正需要"转得更有力" —— 例如【放完球之后那次校 0°】
+ *         (STATE_11A): 残留角只有 2~4°, 折算到轮子行程极小, 用默认 22 时常被
+ *         麦轮静摩擦/辊子刮地咬住、转不到位, 把这一步的力度单独加大就能压过去。
+ *         调用顺序: 先 Chassis_SetNextTurnAdjust(), 紧接着发 Chassis_Rotate()/Rotate_To();
+ *         这个覆盖【只生效一次】, 发一次转向就消耗掉(下一个转向又回默认)。
+ *         ⚠️ 别调太大: 力度越大越容易冲过头/甩尾; 建议默认 22 → 30~40 之间试。
+ *         ⚠️ 想改【整场】的转向力度请直接改 CH_MAX_TURN_ADJUST, 不要逐处覆盖。
+ */
+void Chassis_SetNextTurnAdjust(float adj);
+
+/**
  * @brief 斜向移动: fwd_mm 前进(>0)/后退(<0), strafe_mm 左移(>0)/右移(<0)
  */
 void Chassis_Move_Diagonal(int32_t fwd_mm, int32_t strafe_mm);

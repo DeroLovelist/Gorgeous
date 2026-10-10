@@ -66,9 +66,12 @@ static bool  s_moving = false;               /* 平移进行中 */
 static bool  s_turn_open = false;            /* 转向进行中 */
 static float s_turn_remaining = 0.0f;        /* 剩余转向角度 */
 static float s_turn_request = 0.0f;          /* 本次转向【请求】的角度(绝对值, 膨胀保护用) */
+static float s_turn_adjust_max = CH_MAX_TURN_ADJUST;  /* ⭐ 本次转向的力度上限(可被一次性覆盖) */
 static uint16_t s_turn_abort_cnt = 0;        /* 剩余角超限的连续周期数(见 CH_TURN_ABORT_EXTRA_DEG) */
 static uint16_t s_turn_stuck_cnt = 0;        /* "推不动"连续周期数(见 CH_TURN_STUCK_CYCLES) */
 static float s_turn_prev_yaw = 0.0f;        // 上一周期航向 (度, PD 阻尼用)
+/* ⭐ 2026-10-11: 【紧接着那一次转向】的力度上限覆盖值; <=0 = 不覆盖(用 CH_MAX_TURN_ADJUST) */
+static float s_next_turn_adjust = 0.0f;
 static uint16_t s_turn_stable = 0;          // 转向停车稳定计数
 static float s_steer_i_peak = 0.0f;         /* 转向环 I 项峰值(本次转向内保持, 调试用) */
 static uint16_t s_move_stable = 0;           /* 平移停车稳定计数 */
@@ -1130,16 +1133,18 @@ void Chassis_Update_Control(void)
         float adj = 0.0f;
         if (fabsf(s_turn_remaining) >= CH_ANGLE_ERR_THRESHOLD)//ch-angle_err_threshold: 转向闭环的死区阈值, 单位: 度, 默认 1.5°; 误差小于该值时不再修正, 避免在目标角度附近来回震荡
         {
+            /* ⭐⭐ 2026-10-11: 本次转向的【力度上限】—— 可被一次性覆盖
+             *    (Chassis_SetNextTurnAdjust, 用于"放完球那次校正力度加大")。 */
+            float amax = s_turn_adjust_max;
+
             /* ⭐⭐ 2026-10-11: 【大转角末段收力】(见 Chassis.h 的 CH_TURN_APPROACH_*)——
              *    剩余角进入收力区后按比例压小限幅 ⇒ 最后几度慢慢蹭进去, 停车时几乎没速度,
              *    滑行量大幅减小(治"转弯 90° 时航向校准不准")。 */
-            float amax = CH_MAX_TURN_ADJUST;
-
             if (CH_TURN_APPROACH_DEG > 0.0f &&
                 s_turn_request >= CH_TURN_APPROACH_FROM_DEG &&
                 fabsf(s_turn_remaining) < CH_TURN_APPROACH_DEG)
             {
-                amax = CH_MAX_TURN_ADJUST * (fabsf(s_turn_remaining) / CH_TURN_APPROACH_DEG);
+                amax = s_turn_adjust_max * (fabsf(s_turn_remaining) / CH_TURN_APPROACH_DEG);
                 if (amax < CH_TURN_APPROACH_MIN) amax = CH_TURN_APPROACH_MIN;
             }
 
@@ -1162,8 +1167,8 @@ void Chassis_Update_Control(void)
              * dyaw 与 adj 同符号约定(正=逆时针), 故乘 CH_TURN_SIGN 与上面保持一致。
              * 若无此项 → adj=0 → 放任滑行, 而状态已切走 → 表现为"多转"。*/
             adj = -CH_TURN_BRAKE_KD * dyaw * CH_TURN_SIGN;
-            if (adj > CH_MAX_TURN_ADJUST)  adj = CH_MAX_TURN_ADJUST;
-            if (adj < -CH_MAX_TURN_ADJUST) adj = -CH_MAX_TURN_ADJUST;
+            if (adj >  s_turn_adjust_max) adj =  s_turn_adjust_max;    /* ⭐ 与上面同一个力度上限 */
+            if (adj < -s_turn_adjust_max) adj = -s_turn_adjust_max;
         }
 
         int32_t a = (int32_t)adj;
@@ -1413,6 +1418,12 @@ void Chassis_SetNextMoveSlowdown(int32_t dist_counts, float min_vel)
 void Chassis_SetNextMoveSpeedCap(float mmps)
 {
     s_next_speed_cap = (mmps > 0.0f) ? mmps : 0.0f;
+}
+
+/* ⭐ 2026-10-11: 覆盖【紧接着那一次转向】的力度上限(见 Chassis.h 的同名函数) */
+void Chassis_SetNextTurnAdjust(float adj)
+{
+    s_next_turn_adjust = (adj > 0.0f) ? adj : 0.0f;
 }
 
 /* =====================================================================
@@ -1667,6 +1678,9 @@ void Chassis_Rotate(float delta_deg)
 
     s_turn_remaining = delta_deg;
     s_turn_request   = fabsf(delta_deg);   /* ⭐ 2026-10-11: 膨胀保护的基准(见 CH_TURN_ABORT_EXTRA_DEG) */
+    /* ⭐ 2026-10-11: 本次转向的力度上限 —— 有一次性覆盖就用它, 用完即清(见 SetNextTurnAdjust) */
+    s_turn_adjust_max = (s_next_turn_adjust > 0.0f) ? s_next_turn_adjust : CH_MAX_TURN_ADJUST;
+    s_next_turn_adjust = 0.0f;
     s_turn_abort_cnt = 0;
     s_turn_stuck_cnt = 0;
     s_turn_prev_yaw = Chassis_YawFiltered();   /* ⭐ 2026-10-11: 用过了合理性检查的 yaw */

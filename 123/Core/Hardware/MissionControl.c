@@ -1559,6 +1559,20 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
                                              * 就完成, 超时说明这次根本转不动(见
                                              * TURN_SKIP_DEG), 早停早往下走。 */
 
+/* ⭐⭐ 2026-10-11 新增(用户要求): 【放完球之后那次航向校正】的转向力度加大 ------------
+ * 位置 = STATE_11A_HEADING_CORRECT(排爆放球做完 → 进打靶走位之前那次校 0°)。
+ * 【为什么要加大】这次校正常常只有 2~4° 的残留:
+ *   转向环输出是"每周期往四轮位置目标里加 adj(≤ CH_MAX_TURN_ADJUST = 22 计数)"——
+ *   2~4° 折算到轮子行程只有几毫米, 麦轮原地转还要克服侧向刮地的静摩擦
+ *   ⇒ 用默认 22 时经常"咬住不动 / 转不到位"(实测日志里这次校正两次都撞超时)。
+ *   把这一步的力度单独加大(只作用于这一次转向, 用完即回默认), 就压得过去了。
+ * 【取值】BOMB_AFTER_ALIGN_TURN_ADJUST = 35(默认 22 的 ~1.6 倍)。
+ *   ⚠️ 别太大: 力度越大越容易冲过头/甩尾(本处已有"停稳 + 二次压正"兜着, 但仍建议 30~45)。
+ *   ⚠️ 只影响 STATE_11A 那两次转向(Chassis_SetNextTurnAdjust 是一次性的),
+ *      其它地方的转向力度不变; 想整场都加大请改 Chassis.h 的 CH_MAX_TURN_ADJUST。
+ *   ⚠️ 置 0 = 不覆盖(用全局默认 22, 即老行为)。 */
+#define BOMB_AFTER_ALIGN_TURN_ADJUST   35.0f
+
 /* ⭐⭐ 2026-10-11 新增: 航向校正的“小角度跳过”门槛 (单位: 度) ---------------------
  * 【为什么需要】实车日志(排爆后那次)铁证: 请求只 0.5~1.3° 的校正【根本完不成】——
  *   ① 转向环死区 CH_ANGLE_ERR_THRESHOLD = 0.35°, 所以它一定要真的转那 1.3°;
@@ -1720,7 +1734,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  * ⚠️ 航向基准: 掉头后必须把航向基准也改成 RESCUE_HEADING_DEG(-90°),
  *    否则后续横移的“航向保持”会按旧基准(0°)把车硬拽回原朝向 ——
  *    90° 掉头就白做了(见 Heading_AlignTo())。 */
-#define RESCUE_HEADING_DEG          (-90.0f) /* 救援阶段车头朝向(绝对角, 度):
+#define RESCUE_HEADING_DEG          (-90.1f) /* 救援阶段车头朝向(绝对角, 度):
                                              * 正=逆时针/左转, 负=顺时针/右转
                                              * ⇒ -90 = 右转 90°。
                                              * 后续所有平移的航向基准 + 航向校准
@@ -7333,6 +7347,8 @@ void Mission_Update(void)
                     /* ⭐ 2026-10-11: 偏差 ≤ TURN_SKIP_DEG 就别发了(1~2° 的校正
                      *    在这台车上转不动、还会把位置目标越积越大, 见 TURN_SKIP_DEG)。 */
                     if (!Turn_SkipIfTiny(0.0f)) {
+                        /* ⭐⭐ 用户要求: 【放完球这次校正力度加大】(见 BOMB_AFTER_ALIGN_TURN_ADJUST) */
+                        Chassis_SetNextTurnAdjust(BOMB_AFTER_ALIGN_TURN_ADJUST);
                         Chassis_Rotate_To(0.0f);
                         Chassis_WaitTurnDone(BOMB_AFTER_ALIGN_TIMEOUT_MS);
                     }
@@ -7341,6 +7357,8 @@ void Mission_Update(void)
                     Mission_Coop_Wait(BOMB_AFTER_ALIGN_SETTLE_MS);
 
                     if (!Turn_SkipIfTiny(0.0f)) {
+                        /* ⭐ 压正这次同样加大力度(否则"停稳后剩的那点残余"照样转不动) */
+                        Chassis_SetNextTurnAdjust(BOMB_AFTER_ALIGN_TURN_ADJUST);
                         Chassis_Rotate_To(0.0f);
                         Chassis_WaitTurnDone(BOMB_AFTER_ALIGN_TIMEOUT_MS);
                     }
