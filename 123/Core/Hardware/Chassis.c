@@ -34,6 +34,18 @@ static int32_t            s_speed_filt[W_NUM];/* |速度| 低通值 (计数/周�
 static int16_t            s_last_pwm[W_NUM]; /* 最近一次输出 PWM (软启动斜坡基准 + 调试用) */
 
 static const float *s_yaw = NULL;            /* 航向角数据源 (度) */
+
+/* ⭐⭐ 2026-10-11 陀螺仪零偏在线估计 (ZUPT + 编码器辅助) —— 见 Chassis.h 的宏说明
+ *   (从分支 ver/tuoluoyi 的 f8106e7「改好了陀螺仪」手工移植过来) */
+static const float *s_gyro_z_src = NULL;     /* 陀螺仪 z 轴角速度数据源 (度/秒) */
+static float s_gyro_bias = 0.0f;             /* 零偏估计 (度/秒) */
+static bool  s_gyro_bias_on = false;         /* 是否已起锚 (仅排爆后打靶段 / 救援区) */
+static float s_corr_yaw = 0.0f;              /* 软件积分航向 (修正 bias 后, 度) */
+static uint16_t s_zupt_cnt = 0;              /* 静止连续周期数 (ZUPT) */
+static float s_zupt_sum = 0.0f;              /* 静止时 gyro_z 累加和 */
+static float s_gyro_corrected_last = 0.0f;   /* 最近一次 corrected 角速度 (调试) */
+static bool  s_gyro_slip_last = false;       /* 最近一次是否暂停(转弯/打滑/横移) (调试) */
+static bool  s_move_is_strafe = false;       /* 当前平移段是否纯横移: 横移时禁用编码器辅助(只留 ZUPT) */
 /* ⭐ 2026-10-11: yaw 合理性检查(见 Chassis.h 的 CH_YAW_JUMP_LIMIT_DEG)。
  *   闭环内部一律用 Chassis_YawFiltered(), 不用 *s_yaw 原始值。 */
 static float    s_yaw_ok        = 0.0f;      /* 上一次通过检查的 yaw */
@@ -78,6 +90,9 @@ static int16_t s_vel_bias_last[W_NUM] = { 0, 0, 0, 0 }; /* 最近一次速度偏
  *   FR/BR 目标 -trim (与航向 PID 的 corr 正方向一致)。
  *   为什么不能只用速度偏置: 见 Chassis.h 的 CH_HEADING_TRIM_MAX 说明。 */
 static int32_t s_heading_trim = 0;
+static int32_t s_heading_trim_step = CH_HEADING_TRIM_STEP;  /* trim 每周期限幅(运行时可变: 起锚时加大) */
+static int32_t s_heading_trim_prev = 0;   /* 上一段横移收敛的 trim(前馈初值) */
+static int8_t  s_strafe_dir = 0;          /* 上一段横移方向: +1=左移, -1=右移, 0=非横移 */
 static const int8_t s_hdg_rot_sign[W_NUM] = { +1, -1, +1, -1 };
 
 /* 每轮 counts/mm 标定系数 (来自 Chassis.h, 补偿左右轮轮径/编码器差异) */
@@ -370,6 +385,7 @@ static void chassis_freeze(void)
         s_move_start_pos[i] = s_pos[i];
         DualPID_Reset(&s_pid[i]);
     }
+    s_heading_trim_prev = s_heading_trim;   /* ⭐ 2026-10-11: 保存本段收敛的 trim, 供下一段同方向横移前馈 */
     s_heading_trim = 0;
     s_heading_integral = 0.0f;
     s_heading_corr_last = 0.0f;
@@ -803,6 +819,158 @@ static void yaw_drift_poll(void)
     s_drift_prev = y;
 }
 
+/* =====================================================================
+ * ⭐⭐ 2026-10-11 陀螺仪零偏在线估计 (ZUPT + 编码器辅助)
+ *   —— 从分支 ver/tuoluoyi 的提交 f8106e7「改好了陀螺仪」手工移植 + 适配
+ * ---------------------------------------------------------------------
+ * 目的: 排爆区后的打靶平移段, 用零偏估计抵消陀螺仪 bias 造成的 yaw 漂移,
+ *       避免航向保持环"把漂移当真"反向拧车 → 走斜。
+ * 原则: 只修 bias, 不修 yaw(不改硬件读数/不重置/不钳位/不用低通冒充)。
+ * 生效: 由 MissionControl 起锚/停锚 (STATE_11A 起, STATE_14 前停, STATE_15C 再起)。
+ * ⚠️ 本工程还有一层"yaw 合理性检查"(Chassis_YawFiltered): 未起锚时航向保持用
+ *    过滤后的 yaw(挡坏帧); 起锚后用本模块的 corrected_yaw(挡不了坏帧, 所以
+ *    起锚期间的 ZUPT/转弯对齐点也都走 Chassis_YawFiltered, 尽量不把垃圾灌进来)。
+ * ===================================================================== */
+void Chassis_SetGyroZSource(const float *gz_addr)
+{
+    s_gyro_z_src = gz_addr;
+}
+
+void Chassis_GyroBias_Start(void)
+{
+#if CH_GYRO_BIAS_ENABLE
+    if (s_yaw != NULL)
+    {
+        s_corr_yaw = Chassis_YawFiltered();      /* 软件航向对齐当前(已过滤的)硬件 yaw */
+    }
+    s_gyro_bias = 0.0f;
+    s_zupt_cnt = 0;
+    s_zupt_sum = 0.0f;
+    s_gyro_slip_last = false;
+    s_gyro_bias_on = true;
+    s_heading_trim_step = CH_HEADING_TRIM_STEP_TARGET;   /* 起锚期间: trim 建立加速, 压横移稳态误差 */
+    s_heading_trim_prev = 0;      /* 起锚重开前馈链(不把上一段的 trim 带进来) */
+    s_strafe_dir = 0;
+#else
+    (void)0;
+#endif
+}
+
+void Chassis_GyroBias_Stop(void)
+{
+    s_gyro_bias_on = false;
+    s_zupt_cnt = 0;
+    s_zupt_sum = 0.0f;
+    s_gyro_bias = 0.0f;
+    s_heading_trim_step = CH_HEADING_TRIM_STEP;          /* 恢复默认 trim 步长(其他阶段原行为) */
+}
+
+void Chassis_SetHeadingTrimStep(int32_t step)
+{
+    if (step < 0) step = 0;
+    s_heading_trim_step = step;
+}
+
+bool Chassis_GyroBias_IsOn(void)
+{
+    return s_gyro_bias_on;
+}
+
+float Chassis_GetGyroBias(void)
+{
+    return s_gyro_bias;
+}
+
+float Chassis_GetCorrectedYaw(void)
+{
+    return s_corr_yaw;
+}
+
+/** @brief 每控制周期调用一次(在 read_encoders 之后、航向保持之前): ZUPT / 编码器辅助修 bias */
+static void gyro_bias_update(float dt)
+{
+    if (!s_gyro_bias_on || s_gyro_z_src == NULL || s_yaw == NULL)
+    {
+        return;
+    }
+
+    float gz = *s_gyro_z_src;
+
+    /* 编码器反算的偏航角速度 (度/秒):
+     *   wk = (-FL + FR - BL + BR)/4 = 纯转动分量 (前进为正的计数/周期, 逆时针正)。
+     *   换算: 经验标定 CH_ENC_OMEGA_COUNTS_PER_RAD 计数 = 1 rad; 控制周期 20ms → 每秒 50 个周期。 */
+    float wk = (float)(-s_speed[W_FL] + s_speed[W_FR] - s_speed[W_BL] + s_speed[W_BR]) * 0.25f;
+    float omega_enc = wk * 50.0f * (180.0f / 3.14159265f) / CH_ENC_OMEGA_COUNTS_PER_RAD;
+
+    float corrected = gz - s_gyro_bias;
+    s_gyro_corrected_last = corrected;
+
+    /* ---- ① ZUPT: 静止时真实角速度 = 0 → gyro_z 均值 = bias ---- */
+    if (!s_moving && !s_turn_open)
+    {
+        bool quiet = true;
+        for (int i = 0; i < W_NUM; i++)
+        {
+            if (s_speed_filt[i] >= CH_GYRO_BIAS_STATIC_SPEED)
+            {
+                quiet = false;
+                break;
+            }
+        }
+        if (quiet)
+        {
+            s_zupt_sum += gz;
+            if (++s_zupt_cnt >= CH_GYRO_BIAS_ZUPT_SAMPLES)
+            {
+                s_gyro_bias = s_zupt_sum / (float)s_zupt_cnt;
+                s_zupt_cnt = 0;
+                s_zupt_sum = 0.0f;
+            }
+            /* 静止: 软件航向冻结并跟随硬件(航向校正的绝对基准) */
+            s_corr_yaw = Chassis_YawFiltered();
+            s_gyro_slip_last = false;
+            return;
+        }
+    }
+
+    s_zupt_cnt = 0;
+    s_zupt_sum = 0.0f;
+
+    /* ---- ③ 转弯: 暂停 bias 更新, 软件航向跟随硬件(转弯后校正基准) ---- */
+    if (s_turn_open)
+    {
+        s_corr_yaw = Chassis_YawFiltered();
+        s_gyro_slip_last = true;
+        return;
+    }
+
+    /* ---- ② 平移直行: 积分 corrected 角速度 + 编码器辅助慢修 bias ---- */
+    /* 打滑判据: 编码器与陀螺仪差异过大 → 暂停 bias 更新(但陀螺仪仍可信, 照常积分) */
+    bool slip = (fabsf(corrected - omega_enc) > CH_GYRO_BIAS_SLIP_THRESH_DPS);
+    /* ⭐ 横移时编码器 omega_enc 被辊子打滑污染 → 禁用编码器辅助, 只保留 ZUPT 修 bias */
+    bool enc_disabled = (s_move_is_strafe || slip);
+    s_gyro_slip_last = enc_disabled;
+
+    s_corr_yaw += corrected * dt;
+
+    if (!enc_disabled && s_moving)
+    {
+        s_gyro_bias += CH_GYRO_BIAS_ENC_Ki * (corrected - omega_enc) * dt;
+    }
+}
+
+/** @brief 主循环 500ms 日志块调用: 打印 bias / corrected / yaw(原始) / corrected_yaw */
+void Chassis_GyroBias_DebugLog(void)
+{
+    elog_i("GBIAS", "on=%d bias=%.3f corr=%.3f yaw=%.2f cyaw=%.2f slip=%d",
+           (int)s_gyro_bias_on,
+           (double)s_gyro_bias,
+           (double)s_gyro_corrected_last,
+           (double)((s_yaw != NULL) ? Chassis_YawFiltered() : 0.0f),
+           (double)s_corr_yaw,
+           (int)s_gyro_slip_last);
+}
+
 void Chassis_Update_Control(void)
 {
     if (!s_inited || s_suspended)
@@ -815,6 +983,9 @@ void Chassis_Update_Control(void)
     yaw_drift_poll();   /* ⭐ 2026-10-11: yaw 漂移率观测(修"车头偏是不是温漂"的判据) */
 
     float dt = CH_CTRL_PERIOD_MS / 1000.0f;
+
+    /* ⭐ 2026-10-11: 陀螺仪零偏在线估计(ZUPT + 编码器辅助) —— 在航向保持之前更新 bias/corr_yaw */
+    gyro_bias_update(dt);
 
     /* ⭐⭐ 2026-09-30/10-01: "卡住"检测 (位置环与航向环都用它)
      * 判定: 连续 CH_STALL_DETECT_CYCLES 个周期都满足
@@ -873,7 +1044,10 @@ void Chassis_Update_Control(void)
     int16_t vel_bias[W_NUM] = { 0, 0, 0, 0 };
     if (s_moving && s_yaw != NULL)
     {
-        float yaw = Chassis_YawFiltered();   /* ⭐ 2026-10-11: 坏读数不参与航向保持 */
+        /* ⭐⭐ 2026-10-11: 零偏估计【起锚】期间, 平移段的航向保持改用软件积分航向
+         *    (gyro_z − bias 积分出来的 corrected_yaw) —— 抵消 bias 造成的 yaw 虚增;
+         *    未起锚(其他阶段)时保持原行为: 用(过了跳变检查的)硬件 yaw。 */
+        float yaw = s_gyro_bias_on ? s_corr_yaw : Chassis_YawFiltered();
         float yaw_err = wrap_180(yaw - s_heading_target);
         float dyaw = wrap_180(yaw - s_heading_prev_yaw);
         s_heading_prev_yaw = yaw;
@@ -917,8 +1091,8 @@ void Chassis_Update_Control(void)
         if (cfg->hd_trim > 0.0f && s_move_stable == 0)
         {
             int32_t inc = (int32_t)(corr * cfg->hd_trim);   /* 正 = 顺时针方向差速 */
-            if (inc >  (int32_t)CH_HEADING_TRIM_STEP) inc =  (int32_t)CH_HEADING_TRIM_STEP;
-            if (inc < -(int32_t)CH_HEADING_TRIM_STEP) inc = -(int32_t)CH_HEADING_TRIM_STEP;
+            if (inc >  s_heading_trim_step) inc =  s_heading_trim_step;   /* ⭐ 2026-10-11: 步长可调(起锚期间加大) */
+            if (inc < -s_heading_trim_step) inc = -s_heading_trim_step;
             s_heading_trim += inc;
             if (s_heading_trim >  (int32_t)CH_HEADING_TRIM_MAX) s_heading_trim =  (int32_t)CH_HEADING_TRIM_MAX;
             if (s_heading_trim < -(int32_t)CH_HEADING_TRIM_MAX) s_heading_trim = -(int32_t)CH_HEADING_TRIM_MAX;
@@ -1240,6 +1414,26 @@ static void add_move_ex(int32_t fwd_mm, int32_t strafe_mm, bool strafe_cfg, uint
     int32_t fwd_cnt = mm_to_counts(fwd_mm);
     int32_t strafe_cnt = mm_to_counts(strafe_mm) * CH_STRAFE_SIGN;          //CH_STRAFE_SIGN: 左移为正, 右移为负, 见 Chassis.h
 
+    /* ⭐ 2026-10-11(零偏估计配套): 纯横移(左/右移)时编码器差速被辊子打滑污染
+     *   → 零偏估计里禁用编码器辅助(只留 ZUPT 修 bias)。 */
+    s_move_is_strafe = (strafe_cfg || (fwd_mm == 0 && strafe_mm != 0));
+
+    /* ⭐ trim 前馈(2026-10-11): 起锚期间, 同方向横移直接用【上一段收敛的 trim】做初值,
+     *   治"起步歪/稳态误差"(不用再从 0 花 1~2s 重建)。
+     *   ⚠️ 只在起锚期间生效 ⇒ 排爆区前/直行段完全不受影响。 */
+    {
+        int8_t dir = (strafe_mm > 0) ? 1 : (strafe_mm < 0) ? -1 : 0;   /* 本段横移方向: +1=左移, -1=右移, 0=非横移 */
+        if (s_gyro_bias_on && dir != 0 && dir == s_strafe_dir)
+        {
+            s_heading_trim = s_heading_trim_prev;   /* 同向横移: 沿用上一段收敛的 trim */
+        }
+        else
+        {
+            s_heading_trim = 0;
+        }
+        s_strafe_dir = dir;
+    }
+
     s_pos_thresh = thresh;   /* ⭐ 本段到位死区(到位判定 + 卡住检测共用) */
 
     /* ---- 分段 PID: 纯左移/右移用"平移参数", 其余(前进/后退/斜行)用"直行参数" ----
@@ -1344,7 +1538,8 @@ static void add_move_ex(int32_t fwd_mm, int32_t strafe_mm, bool strafe_cfg, uint
      * 现在基准由任务层一次性设定, 见 Chassis_SetHeadingRef() / Mission_Init()。 */
     if (s_yaw != NULL)
     {
-        s_heading_prev_yaw = Chassis_YawFiltered();  /* 只同步"上一周期角度", 防止首个周期 dyaw 突变 */
+        s_heading_prev_yaw = s_gyro_bias_on ? s_corr_yaw : Chassis_YawFiltered();
+        /* 只同步"上一周期角度", 防止首个周期 dyaw 突变(起锚期间基准是软件航向) */
     }
 
     s_heading_integral = 0.0f;
@@ -1504,6 +1699,8 @@ void Chassis_SyncTarget(void)
         s_move_start_pos[i] = s_pos[i];
     }
     s_heading_trim = 0;      /* 航向微调也清零(否则生效目标 = 目标+微调 会与当前位置差一截) */
+    s_heading_trim_prev = 0; /* ⭐ 2026-10-11: 复位 trim 前馈链 */
+    s_strafe_dir = 0;
     s_move_stable = 0;
     s_arrived_cycles = 0;
     s_move_cycles = 0;
@@ -1515,7 +1712,8 @@ void Chassis_SetHeadingRef(float deg)
     s_heading_target = deg;
     if (s_yaw != NULL)
     {
-        s_heading_prev_yaw = Chassis_YawFiltered();   /* 同步上一周期角度, 避免下个周期 dyaw 突变 */
+        s_heading_prev_yaw = s_gyro_bias_on ? s_corr_yaw : Chassis_YawFiltered();
+        /* 同步上一周期角度, 避免下个周期 dyaw 突变(起锚期间基准是软件航向) */
     }
     s_heading_integral = 0.0f;
 }

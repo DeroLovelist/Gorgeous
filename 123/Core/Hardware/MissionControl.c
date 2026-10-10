@@ -3545,6 +3545,7 @@ void Mission_Init(void)
     Chassis_SyncTarget();
     /* ⭐ 平移时的航向基准 = 0°(与全程各处 "航向校正到 0°" 一致)。
      * 以前是每段平移各自以"当前朝向"为基准 → 校不完的误差被继承, 越跑越偏 */
+    Chassis_GyroBias_Stop();      /* ⭐ 2026-10-11: 复位零偏估计(回未起锚状态), 保证干净上电 */
     Chassis_SetHeadingRef(0.0f);
     Chassis_Stop();
     Laser_Off();
@@ -7247,6 +7248,7 @@ void Mission_Update(void)
              *    ⚠️ Route_MinStep 内部【阻塞等到位】, 所以紧接着发转向是安全的;
              *       转向到位由转移检查里的 Chassis_Task_Is_Complete() 等。 */
             case STATE_11A_HEADING_CORRECT:
+                Chassis_GyroBias_Start();   /* ⭐ 2026-10-11: 排爆后起锚 —— 打靶平移段开始零偏在线估计 */
                 MLOG("排爆后: 航向校正(先挪 %+dmm, 再转到 0°)", (int)ROUTE_BOMB_AFTER_STEP_MM);
                 Route_MinStep(ROUTE_BOMB_AFTER_STEP_MM);
                 /* ⭐⭐ 2026-10-11(用户要求): 改成"转到位 → 停稳 → 再压一次"的阻塞式写法。
@@ -7485,6 +7487,7 @@ void Mission_Update(void)
              *    ⚠️ 必须同时把【航向基准】改成 -90°: 下面④的 Chassis_Move_Right
              *       是靠“航向保持”走直线的, 基准还是 0° 的话车会被一路拽回原朝向。 */
             case STATE_14_MOVE_FORWARD_B:
+                Chassis_GyroBias_Stop();    /* ⭐ 2026-10-11: 打靶平移段结束停锚 —— 救援段恢复用原始 yaw */
                 Chassis_SetHeadingRef(RESCUE_HEADING_DEG);
                 Chassis_Rotate_To(RESCUE_HEADING_DEG);
                 MLOG("救援①: 车头右转 90° -> 目标航向 %.1f° (航向基准已同步)",
@@ -7508,6 +7511,7 @@ void Mission_Update(void)
              *    (那时横移的航向保持会拿残余角当基准 → 越走越斜)。
              *    ⚠️ 顺序是“先到位、后计时”, 不是“最多等 3 秒”。 */
             case STATE_15C_RESCUE_ALIGN_SETTLE:
+                Chassis_GyroBias_Start();   /* ⭐ 2026-10-11: 救援区起锚 —— 停稳这一段先做 ZUPT, 右移走 trim 加速 + 零偏估计 */
                 Chassis_Stop();
                 s_rescue_align_tick = HAL_GetTick();
                 MLOG("救援③: 航向已校准到位, 原地停稳 %dms 再右移 (当前 yaw=%.1f°, 目标 %.1f°)",
