@@ -1130,9 +1130,22 @@ void Chassis_Update_Control(void)
         float adj = 0.0f;
         if (fabsf(s_turn_remaining) >= CH_ANGLE_ERR_THRESHOLD)//ch-angle_err_threshold: 转向闭环的死区阈值, 单位: 度, 默认 1.5°; 误差小于该值时不再修正, 避免在目标角度附近来回震荡
         {
+            /* ⭐⭐ 2026-10-11: 【大转角末段收力】(见 Chassis.h 的 CH_TURN_APPROACH_*)——
+             *    剩余角进入收力区后按比例压小限幅 ⇒ 最后几度慢慢蹭进去, 停车时几乎没速度,
+             *    滑行量大幅减小(治"转弯 90° 时航向校准不准")。 */
+            float amax = CH_MAX_TURN_ADJUST;
+
+            if (CH_TURN_APPROACH_DEG > 0.0f &&
+                s_turn_request >= CH_TURN_APPROACH_FROM_DEG &&
+                fabsf(s_turn_remaining) < CH_TURN_APPROACH_DEG)
+            {
+                amax = CH_MAX_TURN_ADJUST * (fabsf(s_turn_remaining) / CH_TURN_APPROACH_DEG);
+                if (amax < CH_TURN_APPROACH_MIN) amax = CH_TURN_APPROACH_MIN;
+            }
+
             adj = PidLocCtrl(&s_steer, s_turn_remaining) * CH_TURN_SIGN;//s_steer转向PID
-            if (adj > CH_MAX_TURN_ADJUST)  adj = CH_MAX_TURN_ADJUST;    //转向限幅
-            if (adj < -CH_MAX_TURN_ADJUST) adj = -CH_MAX_TURN_ADJUST;
+            if (adj >  amax) adj =  amax;                               //转向限幅(可能已按剩余角收小)
+            if (adj < -amax) adj = -amax;
 
             /* 记录本次转向中 |I 项| 的峰值 (调试): I 项只在转向且剩余角≥死区时才有值,
              * OLED 100ms 刷新容易错过, 故用峰值保持方便事后观察 */

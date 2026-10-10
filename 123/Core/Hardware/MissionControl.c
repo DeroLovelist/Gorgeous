@@ -2801,6 +2801,68 @@ static void Route_ApplyStopMode(int mode)
 }
 
 /**
+ * @brief  ⭐⭐ 2026-10-11 新增(用户实测: "打靶结束之后转弯 90° 时航向校准不准"):
+ *         大转角(90°)专用的【阻塞式转正 + 停稳 + 压正】
+ * @param  target_deg 目标绝对航向(度), 例: RESCUE_HEADING_DEG = -90°
+ * @retval 1 = 已经足够正(两次都没动); 0 = 做过至少一次转向
+ * @note   为什么要这套(而不是像别处那样"发个非阻塞转向 + 转移条件等完成"):
+ *         ① 转向环的完成判据允许角速度到 CH_TURN_RATE_THRESHOLD(0.2°/周期 = 10°/s),
+ *            判"完成"后其实是 Chassis_Stop() 断输出【滑行】—— 90° 这种大转角带上来的
+ *            角速度最大, 滑过的量也最大(实测 1~3°);
+ *         ② 各处的"航向校正"走 Heading_AlignTo → TURN_SKIP_DEG = 2° 以内【直接跳过】,
+ *            所以那 1~3° 的残留经常【没人再管】, 直接被带进整段救援走位。
+ *         做法: 转到位 → 原地停稳 RESCUE_TURN_SETTLE_MS(让滑行/晃动结束) → 再压正一次,
+ *            而且压正这一步用【更紧的跳过门槛】RESCUE_TURN_TIGHT_DEG(1°), 不被 2° 放过。
+ *         ⚠️ 用 Mission_Coop_Wait 等(不是 HAL_Delay): 期间照刷陀螺仪 yaw、照收 K230 行。
+ *         ⚠️ 每次转向的等待上限 = RESCUE_TURN_TIMEOUT_MS, 超时会强制停车(不会卡死)。
+ */
+#define RESCUE_TURN_SETTLE_MS        300    /* 两次转正之间的原地停稳(ms); 0 = 不等待 */
+#define RESCUE_TURN_TIMEOUT_MS       6000   /* 每次转正的等待上限(ms) */
+#define RESCUE_TURN_TIGHT_DEG        1.0f   /* 压正这一步的"够正"门槛(度), 不跟 TURN_SKIP_DEG(2°) */
+
+/* 前置声明: 定义在下面"转向辅助"那一段(Chassis_WaitTurnDone 附近) */
+static uint8_t Chassis_WaitTurnDone(uint32_t timeout_ms);
+
+static uint8_t Turn_AlignTightBlocking(float target_deg)
+{
+    float e = target_deg - Chassis_GetYaw();
+    uint8_t moved = 0;
+
+    while (e > 180.0f)  e -= 360.0f;
+    while (e < -180.0f) e += 360.0f;
+
+    /* 基准一定要同步(后面平移的航向保持用它), 不管转不转 */
+    Chassis_SetHeadingRef(target_deg);
+
+    if (e <= RESCUE_TURN_TIGHT_DEG && e >= -RESCUE_TURN_TIGHT_DEG) {
+        MLOG("大转角压正: 偏差 %+.2f° 已在 ±%.2f° 内 → 不用转(只同步基准)",
+             (double)e, (double)RESCUE_TURN_TIGHT_DEG);
+        return 1u;
+    }
+
+    /* 第 1 次转正 */
+    Chassis_Rotate_To(target_deg);
+    Chassis_WaitTurnDone(RESCUE_TURN_TIMEOUT_MS);
+    MLOG("大转角转正(1/2)完成: yaw=%.2f° (目标 %.2f°)", (double)Chassis_GetYaw(), (double)target_deg);
+    moved = 1u;
+
+    /* 停稳: 让滑行/车身晃动结束, 再压正一次消掉残余 */
+    Mission_Coop_Wait(RESCUE_TURN_SETTLE_MS);
+    e = target_deg - Chassis_GetYaw();
+    while (e > 180.0f)  e -= 360.0f;
+    while (e < -180.0f) e += 360.0f;
+    if (e > RESCUE_TURN_TIGHT_DEG || e < -RESCUE_TURN_TIGHT_DEG) {
+        Chassis_Rotate_To(target_deg);
+        Chassis_WaitTurnDone(RESCUE_TURN_TIMEOUT_MS);
+        MLOG("大转角压正(2/2)完成: yaw=%.2f° (目标 %.2f°, 停稳后才压的正)",
+             (double)Chassis_GetYaw(), (double)target_deg);
+    } else {
+        MLOG("大转角压正(2/2): 停稳后偏差 %+.2f° 已够正, 不再转", (double)e);
+    }
+    return moved;
+}
+
+/**
  * @brief  ⭐ 2026-10-11 新增: "挪一小步"的【冲击保护】—— 短距离贴边移动要慢、要早减速
  * @param  mm       本步的步长(mm): 0 = 直接返回(不挪这一步, 也就别设覆盖)
  * @param  cap_mmps 本段最高速度(mm/s); 0 = 不限
@@ -7498,9 +7560,12 @@ void Mission_Update(void)
                 /* ⭐ 方案②且在打靶走位段启用: 打靶平移段结束停锚, 救援段恢复用原始 yaw */
                 Chassis_GyroBias_Stop();
 #endif
-                Chassis_SetHeadingRef(RESCUE_HEADING_DEG);
-                Chassis_Rotate_To(RESCUE_HEADING_DEG);
-                MLOG("救援①: 车头右转 90° -> 目标航向 %.1f° (航向基准已同步)",
+                /* ⭐⭐ 2026-10-11(用户实测"转弯 90° 时航向校准不准"): 改成【阻塞式
+                 *    "转到位 → 停稳 → 再压正"】(门槛 1°, 不被 TURN_SKIP_DEG 的 2° 放过),
+                 *    并把航向基准同步到 -90° —— 后面 ④ 右移靠航向保持走直线。
+                 *    见 Turn_AlignTightBlocking 的注释; 由 RESCUE_TURN_* 三个宏控制。 */
+                Turn_AlignTightBlocking(RESCUE_HEADING_DEG);
+                MLOG("救援①: 车头右转 90° -> 目标航向 %.1f° (已转正+压正, 航向基准已同步)",
                      (double)RESCUE_HEADING_DEG);
                 break;
             /* ② 航向校准: 转到绝对 -90°(顺带再确认一次航向基准)。
