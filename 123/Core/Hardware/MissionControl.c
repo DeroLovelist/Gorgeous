@@ -95,6 +95,21 @@ char g_qr_code_string[8];                                       // 扫码结果�
  *    0 = 算其它档(450ms, 若实测这一步太快、进打靶时臂还晃, 就改 0)。 */
 #define ARM_HOLD_TARGET_READY_IS_TARGET   1
 
+/* ⭐⭐ 2026-10-11(用户要求): 排爆【抓球】那三步的时间再给长一点 ----------------------
+ * 抓球 = BALL_PRE(伸到球前) → BALL_CLOSE(合夹爪) → BALL_LIFT(抓着抬大臂), 见
+ *   Arm_Start_Bomb_Grab()。
+ * 原来: 运动时间 2500/2000/2500 + 每步保持 450(ARM_HOLD_MS_OTHER) = 共 8350ms;
+ * 现在: 3200/2600/3200 + 每步保持 ARM_HOLD_MS_GRAB(600) = 共 10800ms(+2.45s)。
+ * 为什么要加长: 这三步都是"贴着小球"的小动作, 快了下发还没走完就发下一条 → 夹爪顶飞球、
+ *   或被球桶边缘挂到; 慢一点球更不容易滑掉、抬起瞬间也更稳。
+ * ⚠️ 只影响这三个姿态(BALL_PRE/CLOSE/LIFT), 表里其它行和其它阶段都不受影响。
+ * ⚠️ 嫌总时间太长 → 按比例调这三个宏(例如 2900/2300/2900 + hold 500)。
+ * ⚠️ 想完全回退到改之前: 三个宏改回 2500/2000/2500, ARM_HOLD_MS_GRAB 改回 450。 */
+#define ARM_GRAB_PRE_MS             3200   /* BALL_PRE   抓夹伸到小球前(原 2500) */
+#define ARM_GRAB_CLOSE_MS           2600   /* BALL_CLOSE 合夹爪夹紧(原 2000) */
+#define ARM_GRAB_LIFT_MS            3200   /* BALL_LIFT  抓着球抬大臂(原 2500) */
+#define ARM_HOLD_MS_GRAB            600    /* 抓球这三步各自的保持时间(原来走 ARM_HOLD_MS_OTHER=450) */
+
 #if !MISSION_TEST_NO_ARM
 /**
  * @brief  该姿态是否属于"打靶"那一档(决定保持时间用 200 还是 450)
@@ -111,9 +126,20 @@ static uint8_t Arm_IsTargetPose(uint8_t pose_idx)
             pose_idx == ARM_POSE_TARGET_LIFT) ? 1u : 0u;
 }
 
-/** @brief 按姿态号取保持时间(ms): 打靶 200 / 其它 450, 见 ARM_HOLD_MS_* */
+/** @brief 该姿态是否属于排爆【抓球】那三步(BALL_PRE/CLOSE/LIFT), 见 ARM_GRAB_*_MS */
+static uint8_t Arm_IsGrabPose(uint8_t pose_idx)
+{
+    return (pose_idx == ARM_POSE_BALL_PRE ||
+            pose_idx == ARM_POSE_BALL_CLOSE ||
+            pose_idx == ARM_POSE_BALL_LIFT) ? 1u : 0u;
+}
+
+/** @brief 按姿态号取保持时间(ms): 抓球 600 / 打靶 200 / 其它 450, 见各 ARM_HOLD_MS_* 宏 */
 static uint16_t Arm_HoldMs(uint8_t pose_idx)
 {
+    if (Arm_IsGrabPose(pose_idx)) {
+        return (uint16_t)ARM_HOLD_MS_GRAB;
+    }
     return Arm_IsTargetPose(pose_idx) ? (uint16_t)ARM_HOLD_MS_TARGET
                                       : (uint16_t)ARM_HOLD_MS_OTHER;
 }
@@ -1778,6 +1804,19 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 #define ROUTE_17_RIGHT_B_MM         650    /* ⭐ 抓完后第 1 段右移(mm)(原来叫“后退”) */
 #define ROUTE_18_RIGHT_C_MM         /* 890 */  964/*934*/    /* ⭐ 抓完后第 2 段右移(mm)(原来叫“后退”) */
 
+/* ⭐⭐ 2026-10-11(用户要求): 救援【撤退段】降速 -----------------------------------
+ * 【为什么要】抱上人质之后重心偏了, 350mm/s 横移时辊子刮地扰动大、段末单对角甩尾也大
+ *   (实测段末甩 +5.9°) ⇒ 从【抓完人质那一步(⑧)】起把全场车速降到 250, 走到终点(⑫)再恢复。
+ * 【作用范围】STATE_17 进入时降速 → STATE_19 进入时恢复, 中间整段(⑧ + ⑩ + 中途校正 +
+ *   那 20mm 前进)全部按 250 走; 恢复是为了"下次任务 / 手动模式"从 350 开始。
+ * 【怎么关掉】把 ROUTE_RESCUE_RETURN_SPEED_MMPS 改成和 ROUTE_DEFAULT_SPEED_MMPS 一样的值
+ *   (= 350)即可, 两个宏相等时降速/恢复都是同一速度, 等于没改。
+ * ⚠️ 不会再影响转向速度: 250mm/s → 33.1 计数/周期, 而转向限幅 CH_MAX_TURN_ADJUST = 22.0
+ *   (见 Chassis_SetMaxSpeed 的换算), 33.1 > 22 ⇒ 转弯力度照旧。
+ * ⚠️ 与 main.c 里 Chassis_SetMaxSpeed(350) 必须一致 —— 改一个就一起改。 */
+#define ROUTE_RESCUE_RETURN_SPEED_MMPS   250   /* 撤退段车速(mm/s); 与下面相等 = 关闭降速 */
+#define ROUTE_DEFAULT_SPEED_MMPS         350   /* 默认车速(mm/s), 与 main.c Chassis_SetMaxSpeed(350) 一致 */
+
 /* ⭐⭐ 2026-10-10(用户要求): 救援【抓完人质 → 终点】的走法 ---------------------
  *   【1(★当前)】抓完人质 → ⑧【先原地校一次航向(不挪步)】→ ⑩【一段走到终点】→ ⑫停下:
  *        · ⑧ 只校航向: Heading_AlignTo(RESCUE_HEADING_DEG = -90°);
@@ -1981,9 +2020,9 @@ static uint16_t s_arm_pose_time[ARM_POSE_COUNT] = {
     6000,   /* SCAN          扫码 */
     2500,   /* SCAN_RESET    扫码之后复位 */
     2500,   /* BALL_LOOK     看球 */
-    2500,   /* BALL_PRE      抓夹到小球前 */
-    2000,   /* BALL_CLOSE    夹紧(只有夹爪动) */
-    2500,   /* BALL_LIFT     抓完抬起 */
+    ARM_GRAB_PRE_MS,   /* BALL_PRE      抓夹到小球前(⭐2026-10-11 由 2500 加长, 见 ARM_GRAB_*_MS) */
+    ARM_GRAB_CLOSE_MS, /* BALL_CLOSE    夹紧(只有夹爪动; ⭐2026-10-11 由 2000 加长) */
+    ARM_GRAB_LIFT_MS,  /* BALL_LIFT     抓完抬起(⭐2026-10-11 由 2500 加长) */
     2500,   /* BUCKET_CARRY  携带姿态 */
     2500,   /* BUCKET_LOOK   看桶 */
     2500,   /* PLACE_PRE     移到放置位 */
@@ -7709,6 +7748,12 @@ void Mission_Update(void)
              *       只按绝对角把车头摆正(-90°, 顺带重同步航向基准), 让后面 1614mm 长距离更直;
              *    ⑩ 那一步才是一次性连续右移(⑩+⑫ 合并), 中途不再停车、不再校正。 */
             case STATE_17_RESCUE_RIGHT_B:
+                /* ⭐⭐ 2026-10-11(用户要求): 撤退段降速 —— 抱上人质后重心偏, 350mm/s 横移
+                 *    刮地扰动大、段末甩尾大; 从这一步起降到 ROUTE_RESCUE_RETURN_SPEED_MMPS,
+                 *    到 STATE_19(⑫ 终点)再恢复 ROUTE_DEFAULT_SPEED_MMPS。 */
+                Chassis_SetMaxSpeed(ROUTE_RESCUE_RETURN_SPEED_MMPS);
+                MLOG("救援⑧: 进入撤退段, 车速降到 %dmm/s(抱人质后减扰动/甩尾)",
+                     (int)ROUTE_RESCUE_RETURN_SPEED_MMPS);
 #if (GYRO_BIAS_TAIL_ON && !GYRO_BIAS_RESCUE_ON)
                 /* ⭐⭐ 2026-10-11(用户要求): 【抓取人质后】才启用陀螺仪零偏方案 ——
                  *    从这一步(⑥ 抓完后的第 1 个状态)起锚, 一路用到终点(⑫ 停锚)。
@@ -7724,7 +7769,13 @@ void Mission_Update(void)
                 Heading_AlignTo(RESCUE_HEADING_DEG);
                 break;
 #else
-            case STATE_17_RESCUE_RIGHT_B:          Chassis_Move_Right(ROUTE_17_RIGHT_B_MM); break;
+            case STATE_17_RESCUE_RIGHT_B:
+                /* ⭐⭐ 2026-10-11(用户要求): 撤退段降速(同上面 RESCUE_TAIL_ONESHOT=1 分支) */
+                Chassis_SetMaxSpeed(ROUTE_RESCUE_RETURN_SPEED_MMPS);
+                MLOG("救援⑧: 进入撤退段, 车速降到 %dmm/s(抱人质后减扰动/甩尾)",
+                     (int)ROUTE_RESCUE_RETURN_SPEED_MMPS);
+                Chassis_Move_Right(ROUTE_17_RIGHT_B_MM);
+                break;
 #endif
             case STATE_17A_RESCUE_HEADING_CORRECT:
                 Route_MinStep(ROUTE_RESCUE_FWD_MM);   /* ⭐ 转正前先挪一步(+6 = 车头前进) */
@@ -7832,6 +7883,10 @@ void Mission_Update(void)
                 break;
             /* ⑫ 停下 → 结束(转移里置 MISSION_STATE_COMPLETE) */
             case STATE_19_RESCUE_RIGHT_D:
+                /* ⭐⭐ 2026-10-11(用户要求): 撤退段降速的【恢复点】—— 任务已到终点, 把车速
+                 *    放回默认, 免得影响下次任务/手动模式(见 ROUTE_RESCUE_RETURN_SPEED_MMPS)。 */
+                Chassis_SetMaxSpeed(ROUTE_DEFAULT_SPEED_MMPS);
+                MLOG("救援⑫: 任务完成, 车速恢复默认 %dmm/s", (int)ROUTE_DEFAULT_SPEED_MMPS);
 #if GYRO_BIAS_TAIL_ON
                 Chassis_GyroBias_Stop();   /* ⭐ 2026-10-11: 任务走完, 停锚恢复默认(trim 步长也回默认) */
 #endif
