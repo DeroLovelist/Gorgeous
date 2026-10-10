@@ -1204,6 +1204,23 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  * 取值/推荐: 2000~4000(默认 3000)。设小→激光照得短; 设大→白耗时。 */
 #define TARGET_FIRE_HOLD_MS     3000
 
+/* ⭐⭐ 2026-10-11(用户实测反馈): 打靶【冻结带】—— 够准了就别再动舵机 -----------------
+ * 【现象】"摄像头瞄准靶心之后 ID4 还在抖, 激光出靶子"。
+ * 【两个来源】
+ *   ① K230 判成功后会先发 "FIRE"(点激光)再发 "OK"。老代码收到 FIRE 只是记个时间戳,
+ *      【继续拿后面的 D 帧微调】⇒ 激光亮着的那 1.5s 里 ID4 还在一步几码地转, 腕部余振
+ *      把激光点晃出靶心。⇒ 现在收到 FIRE 【立刻冻结姿态】(见 TARGET_FINE_IDLE)。
+ *   ② 即使还没 FIRE, 只要两轴误差都很小, 我们仍按 TARGET_ALIGN_TOLERANCE(10px) 继续
+ *      "蹭" ⇒ 舵机一直在动, 抖动不停。K230 自己的开火窗口是 ±50px, 所以误差已经在
+ *      20px 内时【它随时会打】—— 这时继续微调是负收益。
+ * 【做法】本宏 = 冻结带(px): |x| 和 |y| 【都】小于它 ⇒ 不再动 ID1/ID4, 只等 OK/FIRE。
+ * 【取值】20(px)。0 = 关闭(回到"一直微调到 10px 或收到 OK 为止", 会有抖动风险)。
+ *   ⚠️ 必须 ≥ TARGET_ALIGN_TOLERANCE(10), 否则本保护形同虚设(先被容差分支吃掉)。
+ *   ⚠️ 调大(如 30) → 更早冻结、更稳, 但最终画面精度略降;
+ *      调小(如 12) → 更准, 但接近靶心时舵机会继续动。
+ * --------------------------------------------------------------------- */
+#define TARGET_STOP_NUDGE_TOL_PX   20
+
 /* ⭐ 打靶两轴标定(mode 6)专用: 1 = 只标竖直轴(ID4), 横向(ID1)完全不动。
  * 用途: ID1 标好之后, 单独标 ID4 的符号 / 步长。
  * ⚠️ K230 每帧只发“误差大的那一个轴”, 所以用本项时必须【人工把靶子横向
@@ -2810,8 +2827,9 @@ static void Route_ImpactGuard(int32_t mm, float cap_mmps, int32_t ramp_mm)
          (int)mm, (int)cap_mmps, (int)ramp_mm);
 }
 
-/* ---- 前置声明(定义在文件下方"机械臂 ID1"那一段, 那里才有 s_id1_offset) ---- */
+/* ---- 前置声明(定义在文件下方"机械臂 ID1"那一段, 那里才有 s_id1_offset/s_id1_pos) ---- */
 static int32_t Arm_Id1GetOffset(void);
+static int32_t Arm_Id1GetLogicalPos(void);
 static void    Arm_Id1Step(uint8_t pose_idx, int32_t delta, uint16_t move_ms,
                            int32_t pos_min, int32_t pos_max, uint16_t speed_min, uint8_t acc);
 
@@ -2820,11 +2838,10 @@ static int8_t   s_bucket_id1_sign     = (int8_t)BUCKET_LR_ID1_SIGN;  /* 当前�
 static int32_t  s_bucket_id1_last_px  = 0;    /* 上一次用 ID1 修时的误差(判方向反了) */
 static uint8_t  s_bucket_id1_moved    = 0;    /* 上一次是否真的动过 ID1 */
 static uint8_t  s_bucket_id1_flipped  = 0;    /* 是否已经自动翻过方向(只翻一次) */
-/* 桶对准是否已经动过 ID1 ⇒ 放球姿态要不要带上这个偏移(见 Arm_BucketPlaceId1)。
- * 桶对准开始时置 1(顺带把偏移清零), 放球动作走完清 0。 */
-static uint8_t  s_bucket_id1_off_valid = 0;
 /* ⭐⭐ 2026-10-11(用户要求): 【锁存】—— 与救援 s_rescue_id1_lock 同一套做法:
- *   在"摄像头对准桶"那一刻把 ID1 的数值存下来, 放球动作直接用它(见 Arm_BucketPlaceId1)。 */
+ *   在"摄像头对准桶"那一刻把 ID1 的数值存下来, 放球动作直接用它(见 Arm_BucketPlaceId1)。
+ *   ⚠️ 原来是"放球姿态 = 标定值 + 累计偏移"(s_bucket_id1_off_valid 那套), 已改成
+ *      与救援完全一致的【锁存】, 旧变量已删除(不要再引用它)。 */
 static int32_t  s_bucket_id1_lock       = 0;   /* 锁存值(ID1 逻辑位置) */
 static int32_t  s_bucket_id1_lock_base  = 0;   /* 锁存那一刻的基准值(BUCKET_LOOK 表值),
                                                 * 用来算"对准修正量 = 锁存 − 基准" */
@@ -3243,11 +3260,12 @@ static void Arm_GotoPoseYComp(uint8_t pose_idx, const FbArmCfg_t *cfg)
 }
 
 /**
- * @brief  ⭐⭐ 2026-10-11: 同 Arm_GotoPoseYComp, 但 ID1 额外叠加"桶对准的 ID1 偏移"
+ * @brief  ⭐⭐ 2026-10-11(用户要求): 同 Arm_GotoPoseYComp, 但 ID1 换成【锁存值 + 手动偏移】
  * @note   只给【放球】那两个姿态用(PLACE_PRE / PLACE_OPEN):
- *         桶对准阶段允许用小步转 ID1 修轻微横向误差(见 Bucket_LrFineWithId1),
- *         那这里下发时必须带上同一个偏移, 否则放球位和对准位不是同一个角度。
- *         没做过桶对准时(s_bucket_id1_off_valid = 0) 与 Arm_GotoPoseYComp 完全一致。
+ *         桶精对准阶段可以用小步转 ID1 修轻微横向误差(见 Bucket_LrFineWithId1),
+ *         对准成功那一刻把这个 ID1 锁存下来(s_bucket_id1_lock), 放球时用它
+ *         ⇒ "对准时底座转到哪, 放球就在哪"(与救援 Arm_GotoRescuePoseKeepId1 同一套做法)。
+ *         没锁存过(测试模式 / 超时直接放球)时退回姿态表标定值, 与老行为一致。
  */
 static uint16_t Arm_BucketPlaceId1(uint8_t pose_idx);   /* 定义在下面"机械臂 ID1"那一段 */
 
@@ -3264,13 +3282,16 @@ static void Arm_GotoPoseYCompId1(uint8_t pose_idx, const FbArmCfg_t *cfg)
     for (i = 0; i < SERVO_COUNT; i++) {
         pose[i] = src[i];
     }
-    pose[0] = Arm_BucketPlaceId1(pose_idx);    /* [0] = ID1 底座 */
+    pose[0] = Arm_BucketPlaceId1(pose_idx);    /* [0] = ID1 底座(锁存值 + 手动偏移) */
     if (s_bomb_fb_valid) {
         FbArmCompApply(cfg, s_bomb_fb_px, pose, pose_idx);
     }
-    MLOG("机械臂: %s 的 ID1 = 标定 %d %+ld(ID1修正) = %d (桶对准用 ID1 修过横向)",
-         ArmAction_GetName(pose_idx), (int)src[0],
-         (long)(s_bucket_id1_off_valid ? Arm_Id1GetOffset() : 0),
+    MLOG("机械臂: %s 的 ID1 = 锁存 %ld %+d(手动偏移) %+d(标定差) = %d",
+         ArmAction_GetName(pose_idx),
+         (long)(s_bucket_id1_lock_valid ? s_bucket_id1_lock : 0),
+         (int)BUCKET_PLACE_ID1_OFFSET,
+         (int)((s_bucket_id1_lock_valid && !BUCKET_PLACE_ID1_USE_LOCK)
+                   ? ((int32_t)src[0] - s_bucket_id1_lock_base) : 0),
          (int)pose[0]);
     Arm_GotoPoseBuffer(pose, pose_idx);
 }
@@ -4592,6 +4613,12 @@ static int32_t Arm_Id1GetOffset(void)
     return s_id1_offset;
 }
 
+/** @brief  ⭐⭐ 2026-10-11: 读 ID1【逻辑位置】—— 桶对准"锁存"时要用它(与救援锁存同一个量) */
+static int32_t Arm_Id1GetLogicalPos(void)
+{
+    return s_id1_pos;
+}
+
 /**
  * @brief  ⭐⭐ 2026-10-11(用户要求): 桶放球姿态的 ID1 = 【锁存的 ID1】+ 手动偏移
  * @param  pose_idx PLACE_PRE / PLACE_OPEN
@@ -5191,6 +5218,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
     static uint32_t target_fine_cmd_tick = 0; /* ⭐ 上次发 start_align 的时刻(重试用) */
     static uint32_t target_fire_tick = 0;     /* ⭐ 收到 K230 "FIRE" 的时刻(0=还没收到; 用来做宽限收尾) */
     static uint8_t  target_fine_xok_warned = 0; /* 两轴都已达标但K230仍在发D: 只提示一次(防刷屏) */
+    static uint8_t  target_freeze_warned   = 0; /* ⭐ 2026-10-11: 进"冻结带"只提示一次(防刷屏) */
     static uint16_t target_fine_move_ms = 0;    /* ⭐ 本步要等多久(ID1/ID4 的转动时间不同) */
     static uint16_t target_id4_steps = 0;       /* ⭐ 精对准竖直(ID4)已微调了多少步(防卡死) */
     static int32_t  target_last_dy = 0;         /* ⭐ 上一步 ID4 动作后的竖直误差(用来算 ID4 步长) */
@@ -5423,7 +5451,11 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                 s_bucket_id1_moved    = 0;
                 s_bucket_id1_flipped  = 0;
                 s_bucket_id1_last_px  = 0;
-                s_bucket_id1_off_valid = 1;    /* 放球姿态要带上这次累计的 ID1 偏移 */
+                /* ⭐⭐ 2026-10-11: 本次的锁存值先清掉(对准成功那一刻再存, 见
+                 *    BOMB_WAIT_BUCKET_ALIGN), 免得用到上一轮的旧值 */
+                s_bucket_id1_lock       = 0;
+                s_bucket_id1_lock_base  = (int32_t)s_arm_pose_table[ARM_POSE_BUCKET_LOOK][0];
+                s_bucket_id1_lock_valid = 0;
                 MLOG("[桶] 横向修正: 大误差走底盘(最小步 %dmm), 轻微误差转 ID1 "
                      "(ID1 允许范围 %d~%d, 基准 %d)",
                      (int)BUCKET_LR_CHASSIS_MIN_MM,
@@ -5444,6 +5476,19 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                     if (Vision_FineAlignProcess(line, "BUCKET", &cooldown_until, &settle_until,
                                                 &s_align_bucket)) {
                         BombFbCapture();        /* ⭐ 对准成功: 抓下这一刻的 Y 误差 → 放桶时补 ID2 */
+                        /* ⭐⭐ 2026-10-11(用户要求): 【锁存 ID1】—— 就在"摄像头对准桶"这一刻
+                         *    把底座 ID1 的数值存下来, 之后放球动作直接用它(与救援抓取
+                         *    s_rescue_id1_lock 完全同一个做法, 见 Arm_BucketPlaceId1)。
+                         *    ⚠️ 对准阶段 ID1 被限幅在 BUCKET_LR_ID1_POS_*(0~40),
+                         *       所以锁存值一定落在安全范围内, 不会越界。 */
+                        s_bucket_id1_lock       = Arm_Id1GetLogicalPos();
+                        s_bucket_id1_lock_valid = 1;
+                        MLOG("[桶] 锁存 ID1 = %ld (对准基准 %ld ⇒ 本次对准修正量 %+ld; "
+                             "放球动作直接用它 + 手动偏移 %+d, 方式 = %s)",
+                             (long)s_bucket_id1_lock, (long)s_bucket_id1_lock_base,
+                             (long)(s_bucket_id1_lock - s_bucket_id1_lock_base),
+                             (int)BUCKET_PLACE_ID1_OFFSET,
+                             BUCKET_PLACE_ID1_USE_LOCK ? "锁存值直接用" : "只搬修正量(保留标定差)");
                         /* ⭐⭐ 2026-10-10(用户要求): 桶改回【抓球那一套】——
                          *    ① 精对准只修左右(BUCKET_USE_SCHEME_2 = 0 / s_align_bucket);
                          *    ② 前后(深度)【不动底盘】, 而是把这帧 Y 误差交给臂: 放桶时
@@ -5513,9 +5558,9 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                  *       PLACE_LIFT(大臂抬起, 已拆成 ID1/2/3 再 ID4/5 两步防剐蹭) */
                 MLOG("阶段: 放置小球");
                 Arm_Start_Bomb_Place();
-                s_bucket_id1_off_valid = 0;   /* ⭐ 2026-10-11: ID1 偏移已用完, 清掉(下次桶对准重新累计) */
-                s_bucket_id1_moved     = 0;
-                s_bucket_id1_flipped   = 0;
+                s_bucket_id1_lock_valid = 0;   /* ⭐ 2026-10-11: 锁存值已用完, 清掉(下次桶对准重新锁) */
+                s_bucket_id1_moved      = 0;
+                s_bucket_id1_flipped    = 0;
                 /* ⭐ 放完球、大臂抬起之后, 直接把臂转到“准备识别靶子”姿态
                  *    (ARM_POSE_TARGET_READY)。之后 STATE_12_PART1_MOVE_A 让小车
                  *    右移; 走完 4 段右移+航向校正, 到 STATE_12_PART1_MOVE_C 才摆成
@@ -5613,6 +5658,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                     target_fine_tick  = 0;
                     target_fine_cmd_tick = 0;
                     target_fine_xok_warned = 0;
+                    target_freeze_warned   = 0;
                     target_fire_tick  = 0;
                     target_fine_move_ms = TARGET_ID1_MOVE_MS;
                     target_id4_steps = 0;
@@ -5773,11 +5819,21 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                 }
                 if (Mission_GetNewLine(line, sizeof(line))) {
                     if (strncmp(line, "FIRE", 4) == 0) {
-                        MLOG("[靶] K230 已发射激光(FIRE) —— 它发完 FIRE 就停发误差了, %dms 内收不到 OK 也照样收尾",
-                             (int)K230_FIRE_GRACE_MS);
+                        /* ⭐⭐ 2026-10-11(用户实测反馈: "摄像头瞄准靶心之后 ID4 还在抖, 激光出靶子")：
+                         *  ⚠️ 原来收到 FIRE 只是记个时间戳, 【继续处理后面的 D 帧】⇒ 激光已经亮着
+                         *     的那 1.5s(K230_FIRE_GRACE_MS)里还在一步几码地转 ID4/ID1 ⇒
+                         *     机械臂和腕部的余振把激光点晃出靶心。
+                         *  FIRE = K230 已经判成功并点亮激光 ⇒ 这一刻【立刻冻结姿态】:
+                         *     转到 TARGET_HOLD(只等、不给舵机发任何指令), 3s 后照常抬臂收尾。
+                         *  ⚠️ 不要再回到"继续等 D 帧微调"——那正是激光打偏的原因。
+                         *  target_fire_tick 仍记下来, 日志/宽限逻辑照旧。 */
                         if (target_fire_tick == 0) {
                             target_fire_tick = HAL_GetTick();
                         }
+                        MLOG("[靶] K230 已发射激光(FIRE) -> 【立刻冻结姿态】保持 %dms 后抬臂 "
+                             "(收到 FIRE 后不再动 ID1/ID4, 免得把激光晃出靶子)",
+                             (int)TARGET_FIRE_HOLD_MS);
+                        target_sub_state = TARGET_HOLD;
                     } else if (strncmp(line, "OK", 2) == 0) {
                         MLOG("[靶] 精对准完成(收到OK, 共微调%u步) -> 保持姿态 %dms 后抬臂",
                              (unsigned)target_fine_steps, (int)TARGET_FIRE_HOLD_MS);
@@ -5796,7 +5852,24 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                              *    这里按“先横向、后竖直”【串行】处理 —— 一次只动一个舵机,
                              *    因为转腕部(ID4)会同时影响画面横向(横滚耦合), 同时发会互相干扰。
                              * ⚠️ 容差用 TARGET_ALIGN_TOLERANCE(20), 与 K230 新收紧的窗口一致 */
-                            if (abs(err_x) >= TARGET_ALIGN_TOLERANCE) {
+                            /* ⭐⭐ 2026-10-11(用户实测反馈): 【冻结带】—— 两轴都已经足够小
+                             *    (够 K230 判成功并点激光)就【不再动舵机】, 只等它的 OK/FIRE。
+                             *    为什么要: 在靶心附近还一步几码地"蹭", 舵机/腕部的余振会一直
+                             *    存在, 激光点就跟着晃 —— 实测"瞄准靶心之后 ID4 还在抖, 激光出靶子"。
+                             *    取值见 TARGET_STOP_NUDGE_TOL_PX(默认 20px, 0 = 关闭本保护)。 */
+                            uint8_t freeze_here =
+                                (uint8_t)(TARGET_STOP_NUDGE_TOL_PX > 0 &&
+                                          abs(err_x) < (int)TARGET_STOP_NUDGE_TOL_PX &&
+                                          abs(err_y) < (int)TARGET_STOP_NUDGE_TOL_PX);
+
+                            if (freeze_here) {
+                                if (!target_freeze_warned) {
+                                    target_freeze_warned = 1;
+                                    MLOG("[靶] 两轴已进入【冻结带】±%dpx (x=%d, y=%d) -> "
+                                         "不再动 ID1/ID4, 冻结姿态等 K230 的 OK/FIRE",
+                                         (int)TARGET_STOP_NUDGE_TOL_PX, err_x, err_y);
+                                }
+                            } else if (abs(err_x) >= TARGET_ALIGN_TOLERANCE) {
                                 /* 画面偏左(err_x>0) 等价于接近阶段的 'L', 方向一致。
                                  * ⭐ 步长按误差大小自适应(见 Target_Id1StepFor) ——
                                  *    一律用 60 码会在容差窗口(±50px)里来回摆。 */
@@ -6040,6 +6113,7 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                 target_fine_tick  = 0;
                 target_fine_cmd_tick = 0;
                 target_fine_xok_warned = 0;
+                target_freeze_warned   = 0;
                 target_fire_tick  = 0;
                 target_id4_steps  = 0;
                 target_last_dy_valid = 0;
