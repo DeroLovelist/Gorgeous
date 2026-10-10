@@ -128,7 +128,7 @@ typedef enum {
      *      (ROUTE_12_SPLIT_ENABLE / ROUTE_12_MID_CORRECT_ENABLE):
      *      SPLIT=0, MID=1(当前): STATE_11A(出发前先校 0°)
      *               → MOVE_A(右移【前半】)
-     *               → CORRECT_B【中间那次: 先原地摆正 0°, 再挪一小步(后退)】
+     *               → CORRECT_B【中间那次: 先挪一小步, 再校到 0°】
      *               → MOVE_B(右移【后半】)
      *               → CORRECT_B2(最后一次校 + 停稳)
      *               → MOVE_C(摆 TARGET_LOOK) → STATE_13 打靶视觉对准
@@ -165,7 +165,7 @@ typedef enum {
     STATE_12_PART1_MOVE_A2,                  // (仅 SPLIT=1 用) 第1段右移 后半
     STATE_12_PART1_CORRECT_A2,               // (仅 SPLIT=1 用) 第2处航向校正(先挪 ROUTE_12_A2_MINSTEP_MM)
     STATE_12_PART1_MOVE_B,                   // 右移【后半】(MID=1 时走这里; SPLIT=1 时 = 第2段前半)
-    STATE_12_PART1_CORRECT_B,                // 中间那次航向校正(SPLIT=0: 先摆正再挪 ROUTE_12_B_MINSTEP_MM; =1: 第3处)
+    STATE_12_PART1_CORRECT_B,                // 中间那次航向校正(先挪 ROUTE_12_B_MINSTEP_MM); SPLIT=1 时 = 第3处
     STATE_12_PART1_MOVE_B2,                  // (仅 SPLIT=1 用) 第2段右移 后半
     STATE_12_PART1_CORRECT_B2,               // 最后一次航向校正(先挪 ROUTE_12_B2_MINSTEP_MM) + 停稳 TARGET_STOP_SETTLE_MS
     STATE_12_PART1_MOVE_C,                   // 摆 ARM_POSE_TARGET_LOOK
@@ -199,13 +199,29 @@ typedef enum {
      *         Y 轴(前后)像素误差给机械臂 ID2 补“里程”(伸出去多一点/少一点),
      *         参数 = RESCUE_FB_ARM_*(与抓球/放桶同一机制、独立参数);
      *         同一帧的 x(横向)用于给底座 ID1 补对准残余(RESCUE_GRAB_*)。
+     *         ⭐⭐ 2026-10-11 修 BUG: 抓取三连(抓取位/抱紧位/抬起位)用的是
+     *         【对准完成那一刻锁存的 ID1】(s_rescue_id1_lock), 而“锁存过没有”的判据
+     *         原来写成“锁存值 >= 0” —— 但锁存的是【逻辑位置, 救援基准 2059 归一化后
+     *         是 -2037, 必为负】⇒ 判据永远失败 ⇒ 抓取退回姿态表里的 ID1(2059),
+     *         与摄像头对准的角度(实测 1992)差 67 码 ≈ 5.9°, 表现就是
+     *         “摄像头把 ID1 转到对准位了, 机械臂抓的却是另一个角度”。
+     *         现在改用独立有效标志 s_rescue_id1_valid(值可正可负)。
      *      ⭐⭐ 2026-10-10(用户要求): 抓完人质 → 【先原地校一次航向】→ 一路走到终点,
      *      由 RESCUE_TAIL_ONESHOT 切换(当前 = 1):
      *        1(当前): ⑧只校航向(不挪步: ROUTE_RESCUE_FWD_MM = 0, 只按绝对角摆正到 -90°)
      *                 → ⑩【一段走完】ROUTE_17_RIGHT_B_MM + ROUTE_18_RIGHT_C_MM
-     *                 → ⑫停下(任务完成)。中途不再停车、不再校正, ⑨/⑪ 不会被进入。
+     *                    ⭐⭐ 2026-10-11(用户要求): 这一段【对半走】, 中点插一次
+     *                    【航向校正 + 往前进 20mm】, 再走后半(RESCUE_TAIL_MID_CORRECT_ENABLE=1;
+     *                    置 0 = 回到“一段走到底、中途不停不校正”)
+     *                 → ⑫停下(任务完成)。⑨/⑪ 不会被进入。
      *        0      : ⑧右移 ROUTE_17_RIGHT_B_MM → ⑨航向校准
      *                 → ⑩右移 ROUTE_18_RIGHT_C_MM → ⑪航向校准 → ⑫停下 (老做法)
+     *      ⭐⭐ 2026-10-11(用户要求): 这【最后一段右移】带一个“车头左方分量”
+     *      (RESCUE_TAIL_LEFT_COMP = 0.025): 每右移 1mm 同时向【车头左方】走 0.025mm。
+     *      ⚠️ 车头左方与“右移”是同一根轴的两端 ⇒ 实际效果是【这段右移少走 2.5%】
+     *         (1614mm 少走 ≈40mm), 不是横着偏出去。
+     *      ⚠️ 想改成“横着偏出去”(沿车头前方 = 场地右, 与右移垂直): 把 LEFT 置 0、
+     *         改 RESCUE_TAIL_FWD_COMP(默认 0)。
      * ⭐⭐ 2026-10-10(用户要求): ⑥ 到人质处、开始识别/伸臂【之前】先退一小步 —— 它【不是
      *    单独一个状态】, 而是并进 STATE_16_RESCUE_RIGHT_A 的进入动作里(宏
      *    ROUTE_RESCUE_GRAB_BACK_MM, 默认 -15 = 车头后退 15mm; 0 = 关掉这一步)。
@@ -233,7 +249,7 @@ typedef enum {
     STATE_16A_RESCUE_HEADING_CORRECT,        // (未使用) 备用航向校正
     STATE_17_RESCUE_RIGHT_B,                 // ⑧ (开关=1: 只校航向不移动; =0: 第 1 段右移 ROUTE_17_RIGHT_B_MM)
     STATE_17A_RESCUE_HEADING_CORRECT,        // (仅 RESCUE_TAIL_ONESHOT=0 用) ⑨ 先挪 ROUTE_RESCUE_FWD_MM, 再校到 -90°
-    STATE_18_RESCUE_RIGHT_C,                 // ⑩ (开关=1: 一段走完 ⑧+⑩ 合并; =0: 第 2 段右移 ROUTE_18_RIGHT_C_MM)
+    STATE_18_RESCUE_RIGHT_C,                 // ⑩ (开关=1: ⑧+⑩ 合并成一段, 且对半走、中点校航向+前进20mm; =0: 第 2 段右移 ROUTE_18_RIGHT_C_MM)
     STATE_18A_RESCUE_HEADING_CORRECT,        // (仅开关=0 用) ⑪ 先挪 ROUTE_RESCUE_LAST_STEP_MM, 再校到 -90°
     STATE_19_RESCUE_RIGHT_D,                 // ⑫ 停下 → MISSION_STATE_COMPLETE
     STATE_19A_RESCUE_HEADING_CORRECT,        // (未使用)
@@ -324,7 +340,7 @@ typedef enum {
 /* ---- 姿态表访问/执行接口 ---- */
 void ArmAction_SetPositions(uint8_t pose_idx, const uint16_t pos[5]);
 const char *ArmAction_GetName(uint8_t pose_idx);
-/* 摆到指定姿态(阻塞: 等舵机走完 pose 自己的运动时间 + hold_time 再返回) */
+/* 摆到指定姿态(阻塞: 等舵机走完 pose 自己的运动时间 + 保持时间 再返回) */
 void Arm_GotoPose(uint8_t pose_idx);
 /* 分两步摆到指定姿态(阻塞): 先动 first_mask 里的舵机(SERVO_MASK_*),
  * 等它们到位停稳, 再动剩下的。用于实测“一步摆到位会剐蹭”的动作,

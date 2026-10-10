@@ -34,12 +34,28 @@ static int32_t            s_speed_filt[W_NUM];/* |速度| 低通值 (计数/周�
 static int16_t            s_last_pwm[W_NUM]; /* 最近一次输出 PWM (软启动斜坡基准 + 调试用) */
 
 static const float *s_yaw = NULL;            /* 航向角数据源 (度) */
+/* ⭐ 2026-10-11: yaw 合理性检查(见 Chassis.h 的 CH_YAW_JUMP_LIMIT_DEG)。
+ *   闭环内部一律用 Chassis_YawFiltered(), 不用 *s_yaw 原始值。 */
+static float    s_yaw_ok        = 0.0f;      /* 上一次通过检查的 yaw */
+static float    s_yaw_raw_last  = 0.0f;      /* 上一次看到的原始读数(判"这拍有没有刷新") */
+static uint32_t s_yaw_tick      = 0;         /* 上次刷新的时刻(算允许的最大变化量用) */
+static uint8_t  s_yaw_bad_cnt   = 0;         /* 连续超限的【刷新次数】 */
+static uint32_t s_yaw_glitches  = 0;         /* 累计丢弃的坏读数(调试) */
+/* ⭐ 2026-10-11: yaw 【静止漂移率】观测(判"车头偏是不是温漂"), 只统计不改行为 ——
+ *   定义放在这里(而不是 yaw_drift_poll 旁边), 因为 yaw_filter_reset() 要重置它。 */
+static float    s_drift_dps   = 0.0f;   /* 当前估计的漂移率 (度/秒) */
+static float    s_drift_acc   = 0.0f;   /* 本窗口累计角变化 (度) */
+static uint16_t s_drift_ms    = 0;      /* 本窗口累计时长 (ms) */
+static float    s_drift_prev  = 0.0f;   /* 上一拍的 yaw (算角变化用) */
 static bool  s_inited = false;
 static bool  s_suspended = false;            /* 挂起标志(手动测试时置位) */
 static bool  s_moving = false;               /* 平移进行中 */
 
 static bool  s_turn_open = false;            /* 转向进行中 */
 static float s_turn_remaining = 0.0f;        /* 剩余转向角度 */
+static float s_turn_request = 0.0f;          /* 本次转向【请求】的角度(绝对值, 膨胀保护用) */
+static uint16_t s_turn_abort_cnt = 0;        /* 剩余角超限的连续周期数(见 CH_TURN_ABORT_EXTRA_DEG) */
+static uint16_t s_turn_stuck_cnt = 0;        /* "推不动"连续周期数(见 CH_TURN_STUCK_CYCLES) */
 static float s_turn_prev_yaw = 0.0f;        // 上一周期航向 (度, PD 阻尼用)
 static uint16_t s_turn_stable = 0;          // 转向停车稳定计数
 static float s_steer_i_peak = 0.0f;         /* 转向环 I 项峰值(本次转向内保持, 调试用) */
@@ -187,11 +203,86 @@ static float wrap_180(float a)
     return a;
 }
 
+/**
+ * @brief  ⭐ 2026-10-11 新增: 读 yaw 并按【变化率】做合理性检查
+ * @retval 通过检查的 yaw(度); 本拍读数被判为坏值时沿用上一拍的 [好值]
+ * @note   见 Chassis.h 的 CH_YAW_MAX_RATE_DPS 说明(修"转向环追幻影狂转")。
+ *         ⚠️ 判"是否刷新过"用原始读数的变化: 主循环 20ms 才刷一次 yaw, 而本
+ *         函数在 1ms 定时中断里被调用 —— 不以原始值是否有变化做门槛的话,
+ *         同一个坏读数会被数 20 次, 重同步计数(CH_YAW_JUMP_RESYNC_N)就没意义了。
+ *         ⚠️ 时间窗按 HAL_GetTick() 算, 并封顶 CH_YAW_RATE_WINDOW_MAX_MS:
+ *         长时间没刷新时不允许"一次放行一大步"。
+ *         ⚠️ 本函数在中断里跑, 只做浮点比较, 绝不打印。
+ */
+static float Chassis_YawFiltered(void)
+{
+    float raw;
+
+    if (s_yaw == NULL)
+    {
+        return 0.0f;
+    }
+    raw = *s_yaw;
+    if (raw == s_yaw_raw_last)
+    {
+        return s_yaw_ok;        /* 这拍没有新读数(还没到 20ms, 或读数被"冻结") */
+    }
+
+    /* 允许变化量 = 最大角速度 × 距上次刷新的时间(封顶) */
+    {
+        uint32_t now = HAL_GetTick();
+        uint32_t dt_ms = now - s_yaw_tick;
+        float allow;
+
+        s_yaw_tick = now;
+        if (dt_ms == 0u)                       dt_ms = 1u;
+        if (dt_ms > CH_YAW_RATE_WINDOW_MAX_MS) dt_ms = CH_YAW_RATE_WINDOW_MAX_MS;
+        allow = CH_YAW_MAX_RATE_DPS * ((float)dt_ms * 0.001f);
+
+        if (fabsf(wrap_180(raw - s_yaw_ok)) > allow)
+        {
+            if (++s_yaw_bad_cnt < CH_YAW_JUMP_RESYNC_N)
+            {
+                s_yaw_glitches++;
+                s_yaw_raw_last = raw;   /* 记下"这拍已经看过了" */
+                return s_yaw_ok;        /* 坏读数: 丢弃, 沿用上一拍好值 */
+            }
+            s_yaw_bad_cnt = 0;          /* 连续多拍超限 ⇒ 传感器真变了: 接受并重新同步 */
+        }
+        else
+        {
+            s_yaw_bad_cnt = 0;
+        }
+    }
+    s_yaw_raw_last = raw;
+    s_yaw_ok = raw;
+    return s_yaw_ok;
+}
+
+/** 把 yaw 合理性检查的状态复位到"当前原始值"(初始化/重新注入数据源时用) */
+static void yaw_filter_reset(void)
+{
+    s_yaw_ok      = (s_yaw != NULL) ? *s_yaw : 0.0f;
+    s_yaw_raw_last = s_yaw_ok;
+    s_yaw_bad_cnt  = 0;
+    s_yaw_tick     = HAL_GetTick();
+    s_drift_prev   = s_yaw_ok;   /* ⭐ 漂移观测也跟着重新起步 */
+    s_drift_acc    = 0.0f;
+    s_drift_ms     = 0u;
+}
+
 static int32_t mm_to_counts(int32_t mm)
 {
     float f = (float)mm * CH_COUNTS_PER_MM;             //CH_COUNTS_PER_MM表示每毫米对应的计数值
     return (int32_t)(f >= 0.0f ? f + 0.5f : f - 0.5f);  //四舍五入取整
 }
+
+/* ⭐⭐ 2026-10-11 新增: 本段平移用的【到位死区】(编码器计数)。
+ *   普通段 = CH_POS_THRESHOLD_COUNT(30 计数 ≈4.5mm);
+ *   “对准微步”段(Chassis_Move_*Fine) = CH_ALIGN_FINE_THRESHOLD_COUNT(≈1.8mm)。
+ *   每次 add_move 时按入口设定, 到位判定与“卡住检测”都用它 —— 两处必须一致,
+ *   否则会出现“到位判定说没到、卡住检测说已经到了”的互相打架。 */
+static uint16_t s_pos_thresh = CH_POS_THRESHOLD_COUNT;
 
 /* 本轮"生效目标位置" = 累计目标 + 航向微调
  * (到位判定 / MOVE 日志的 e: / 位置环都用这个, 否则 trim 会被当成"残差") */
@@ -297,6 +388,7 @@ static void chassis_freeze(void)
 void Chassis_SetYawSource(const float *yaw_addr)
 {
     s_yaw = yaw_addr;
+    yaw_filter_reset();     /* ⭐ 2026-10-11: 重新注入数据源后, 合理性检查从当前值重新起步 */
 }
 
 void Chassis_SetMaxSpeed(float mm_per_sec)
@@ -331,7 +423,9 @@ static void apply_cfg(const ChassisPidCfg_t *cfg)
                      s_max_vel, CH_PID_MAX_OUTPUT,
                      cfg->vel_ff, cfg->vel_ff_dead);
         /* ⭐ 2026-10-10: 每次起步都按宏重新套用"提前减速"(见 Chassis.h 的 CH_SLOWDOWN_*)。
-         *    DualPID_Init 里已把它清 0, 所以必须在这里重新设一次。 */
+         *    DualPID_Init 里已把它清 0, 所以必须在这里重新设一次。
+         * ⚠️ 这里设的是【短段默认值】; add_move_ex() 会在知道本段长度之后,
+         *    对 ≥300mm 的长段按比例覆盖成更长的减速区(见 CH_SLOWDOWN_LONG_*)。 */
         DualPID_SetSlowdown(&s_pid[i],
                             CH_SLOWDOWN_ENABLE ? (float)CH_SLOWDOWN_DIST_COUNT : 0.0f,
                             CH_SLOWDOWN_MIN_COUNT);
@@ -397,7 +491,8 @@ void Chassis_Init(void)
     s_heading_integral = 0.0f;
     s_heading_trim = 0;
     s_heading_target = 0.0f;   /* 默认基准 0°; 任务层也可用 Chassis_SetHeadingRef() 改 */
-    s_heading_prev_yaw = (s_yaw != NULL) ? *s_yaw : 0.0f;
+    yaw_filter_reset();        /* ⭐ 2026-10-11: yaw 合理性检查复位 */
+    s_heading_prev_yaw = s_yaw_ok;
     s_inited = true;
 }
 
@@ -432,7 +527,8 @@ void Chassis_Resume(void)
     s_move_timeout_cycles = (uint16_t)(CH_MOVE_TIMEOUT_MIN_MS / CH_CTRL_PERIOD_MS);
     s_heading_integral = 0.0f;
     s_heading_trim = 0;
-    s_heading_prev_yaw = (s_yaw != NULL) ? *s_yaw : 0.0f;
+    yaw_filter_reset();        /* ⭐ 2026-10-11: yaw 合理性检查复位(手动测试可能掰动过车身) */
+    s_heading_prev_yaw = s_yaw_ok;
     s_suspended = false;
 }
 
@@ -534,6 +630,10 @@ void Chassis_Tick(void)
 /* ⭐ 每段平移结束时打印一行(只在结束时打, 不占用 500ms 周期日志):
  *   d:FL/FR/BL/BR = 本段四轮实际走的编码器计数;
  *   e:FL/FR/BL/BR = 结束瞬间四轮残差(目标-实际, 计数);
+ *   sth           = 本段用的【到位死区】(编码器计数): 30 = 普通大段路线,
+ *                   12 = ⭐对准微步(CH_ALIGN_FINE_THRESHOLD_COUNT)。
+ *                   看 d 时把它一起看: 微步段四轮 d 应该都接近指令值(≈53 计数/8mm),
+ *                   若出现某轮 d≈0 → 那轮一开始就在死区带里, 完全没出力。
  *   yaw           = 结束瞬间航向(度);
  *   行首 "TO"    = 超时兜底强制结束(说明该段被卡住, 没走到位)。
  * 怎么看:
@@ -585,14 +685,55 @@ static void move_finish_log(const char *why)
     if (s_move_log_pending) return;   /* 上一条还没被主循环取走: 不覆盖(宁丢不叠) */
 
     snprintf(s_move_log_buf, sizeof(s_move_log_buf),
-             "%s d:FL=%ld FR=%ld BL=%ld BR=%ld e:FL=%ld FR=%ld BL=%ld BR=%ld yaw=%.2f",
+             "%s d:FL=%ld FR=%ld BL=%ld BR=%ld e:FL=%ld FR=%ld BL=%ld BR=%ld sth=%u yaw=%.2f",
              tag,
              (long)(s_pos[W_FL] - s_move_start_pos[W_FL]), (long)(s_pos[W_FR] - s_move_start_pos[W_FR]),
              (long)(s_pos[W_BL] - s_move_start_pos[W_BL]), (long)(s_pos[W_BR] - s_move_start_pos[W_BR]),
              (long)(eff_tgt(W_FL) - s_pos[W_FL]), (long)(eff_tgt(W_FR) - s_pos[W_FR]),
              (long)(eff_tgt(W_BL) - s_pos[W_BL]), (long)(eff_tgt(W_BR) - s_pos[W_BR]),
+             (unsigned)s_pos_thresh,
              (double)((s_yaw != NULL) ? *s_yaw : 0.0f));
     s_move_log_pending = 1;
+}
+
+/* ⭐ 2026-10-11 新增: 转向环"剩余角异常膨胀"被强制停车时的一行日志。
+ * 与 move_finish_log 同样的道理: 本函数在 1ms 定时中断里被调用, 而 elog 是
+ * 【同步阻塞 + 关中断】的串口输出(见上面 move_finish_log 的说明) ——
+ * 所以这里只格式化进缓冲区并置标志, 真正打印交给 Chassis_FlushPendingLog()。 */
+static char             s_turn_log_buf[224];
+static volatile uint8_t s_turn_log_pending = 0;
+
+static void turn_abort_log(float yaw_now)
+{
+    if (s_turn_log_pending) return;
+
+    snprintf(s_turn_log_buf, sizeof(s_turn_log_buf),
+             "⚠ 剩余角异常 %.1f°(本次只请求 %.1f°, yaw=%.1f°, 坏读数 %lu) "
+             "→ 判为航向读数被污染, 已强制停车(本次校正作废)",
+             (double)s_turn_remaining, (double)s_turn_request, (double)yaw_now,
+             (unsigned long)s_yaw_glitches);
+    s_turn_log_pending = 1;
+}
+
+/**
+ * @brief  ⭐⭐ 2026-10-11 新增: 转向环"推不动"收手时的日志
+ * @note   关键看四轮速度(v: 计数/周期):
+ *           四轮都很大而 dyaw≈0 → 轮子在地上【原地刮】(静摩擦/打滑);
+ *           四轮都≈0           → 车被【卡住】或者 yaw 读数【冻结】了
+ *                               (软件 I2C 读失败时会冻住, 见 JY61P.c)。
+ *         与 turn_abort_log 一样: 中断里只格式化, 主循环才打印。
+ */
+static void turn_stuck_log(float yaw_now)
+{
+    if (s_turn_log_pending) return;
+
+    snprintf(s_turn_log_buf, sizeof(s_turn_log_buf),
+             "⚠ 转向推不动(%.1f° 没转完, 只请求 %.1f°, yaw=%.1f°, 坏读数 %lu): "
+             "四轮 v=%d/%d/%d/%d → 已在原地刮/卡住/读数冻结, 收手停车(本次校正作废)",
+             (double)s_turn_remaining, (double)s_turn_request, (double)yaw_now,
+             (unsigned long)s_yaw_glitches,
+             (int)s_speed[W_FL], (int)s_speed[W_FR], (int)s_speed[W_BL], (int)s_speed[W_BR]);
+    s_turn_log_pending = 1;
 }
 
 /* 由【主循环】调用: 打印中断里攒下的 MOVE 行。
@@ -601,15 +742,65 @@ void Chassis_FlushPendingLog(void)
 {
     char buf[sizeof(s_move_log_buf)];
 
-    if (!s_move_log_pending) return;
+    if (s_move_log_pending)
+    {
+        /* 拷贝期间关中断, 避免 ISR 正好在覆盖缓冲区 → 打出半新半旧的行 */
+        __disable_irq();
+        memcpy(buf, s_move_log_buf, sizeof(buf));
+        s_move_log_pending = 0;
+        __enable_irq();
 
-    /* 拷贝期间关中断, 避免 ISR 正好在覆盖缓冲区 → 打出半新半旧的行 */
-    __disable_irq();
-    memcpy(buf, s_move_log_buf, sizeof(buf));
-    s_move_log_pending = 0;
-    __enable_irq();
+        elog_i("MOVE", "%s", buf);
+    }
 
-    elog_i("MOVE", "%s", buf);
+    /* ⭐ 2026-10-11: 转向环被"剩余角膨胀保护"强制停车的那一行(见 turn_abort_log) */
+    if (s_turn_log_pending)
+    {
+        char tbuf[sizeof(s_turn_log_buf)];
+
+        __disable_irq();
+        memcpy(tbuf, s_turn_log_buf, sizeof(tbuf));
+        s_turn_log_pending = 0;
+        __enable_irq();
+
+        elog_i("TURN", "%s", tbuf);
+    }
+}
+
+/* ⭐⭐ 2026-10-11 新增: yaw 【静止漂移率】观测(只统计/显示, 不参与控制)-----------
+ * 用户问"最后那段加补偿左移时车头会偏, 是不是温漂"。
+ * 判据: 【车静止且没在转向】时真航向不可能变 ⇒ 这段时间 yaw 的变化率就是
+ *   漂移率(6 轴陀螺仪积分出来的 yaw 确实会随温度缓慢漂) + 一点噪声。
+ * 做法: 静止时累加角变化与时长, 攒够 2s 更新一次显示值; 一旦动起来就作废重攒
+ *   (动起来的角变化是"真转", 不能算进漂移)。
+ * 怎么看(主循环 I/HDG 行末尾的 drift=):
+ *   |drift| ≲ 0.05°/s  → 基本没有温漂问题 ⇒ "车头偏"是机械/打滑/辊子侧向刮地;
+ *   |drift| ≳ 0.2°/s   → 温漂明显: 5s 的长横移会白歪 1°以上, 该考虑
+ *                         ① 缩短长段(中途插一次校正); ② 换用带磁力计的 9 轴
+ *                         (yaw 用磁场绝对参考, 不积分、不漂); ③ 模块贴散热/远离热源。
+ * ⚠️ 车被别人/机械臂反作用力推动时这一窗的估计会被污染(动起来就作废重攒)。
+ */
+static void yaw_drift_poll(void)
+{
+    float y = Chassis_YawFiltered();
+
+    if (!s_moving && !s_turn_open)
+    {
+        s_drift_acc += wrap_180(y - s_drift_prev);
+        if (s_drift_ms < 0xFFF0u) s_drift_ms = (uint16_t)(s_drift_ms + CH_CTRL_PERIOD_MS);
+        if (s_drift_ms >= 2000u)
+        {
+            s_drift_dps = s_drift_acc / ((float)s_drift_ms * 0.001f);
+            s_drift_acc = 0.0f;
+            s_drift_ms  = 0u;
+        }
+    }
+    else
+    {
+        s_drift_acc = 0.0f;   /* 动起来了: 这段观测作废(里面的角变化是"真转") */
+        s_drift_ms  = 0u;
+    }
+    s_drift_prev = y;
 }
 
 void Chassis_Update_Control(void)
@@ -620,6 +811,8 @@ void Chassis_Update_Control(void)
     }
 
     read_encoders();
+
+    yaw_drift_poll();   /* ⭐ 2026-10-11: yaw 漂移率观测(修"车头偏是不是温漂"的判据) */
 
     float dt = CH_CTRL_PERIOD_MS / 1000.0f;
 
@@ -647,7 +840,7 @@ void Chassis_Update_Control(void)
         {
             int32_t e = iabs(eff_tgt(i) - s_pos[i]);
             if (s_speed_filt[i] >= CH_STALL_SPEED_COUNT) quiet = false;
-            if (e >= CH_POS_THRESHOLD_COUNT) not_arrived = true;
+            if (e >= (int32_t)s_pos_thresh) not_arrived = true;
             if (e > max_err) max_err = e;
         }
         if (quiet && not_arrived)
@@ -680,7 +873,7 @@ void Chassis_Update_Control(void)
     int16_t vel_bias[W_NUM] = { 0, 0, 0, 0 };
     if (s_moving && s_yaw != NULL)
     {
-        float yaw = *s_yaw;
+        float yaw = Chassis_YawFiltered();   /* ⭐ 2026-10-11: 坏读数不参与航向保持 */
         float yaw_err = wrap_180(yaw - s_heading_target);
         float dyaw = wrap_180(yaw - s_heading_prev_yaw);
         s_heading_prev_yaw = yaw;
@@ -688,9 +881,18 @@ void Chassis_Update_Control(void)
         /* 航向误差死区: 误差足够小时不再修正, 避免停车前微调甩尾 */
         const ChassisPidCfg_t *cfg = s_cfg;   /* 分段参数: 直行/平移各一套 */
         float corr = 0.0f;
+        /* ⭐⭐ 2026-10-11 新增: 误差过大就别管(见 Chassis.h 的 CH_HDG_MAX_ERR_DEG)——
+         *    平移里的航向保持只能修几度的漂移; 差几十上百度时硬掰只会把直线走成
+         *    弧线(实测 yaw 差 100° 时 trim 打满 ±215、vb=±16, 854mm 走成弧线)。 */
+        bool hdg_far = (CH_HDG_MAX_ERR_DEG > 0.0f &&
+                        fabsf(yaw_err) > CH_HDG_MAX_ERR_DEG);
+        if (hdg_far)
+        {
+            s_heading_integral = 0.0f;   /* 清积分: 免得误差回到范围内时猛纠一下 */
+        }
         /* ⭐ hdg_cut = 段末让权(残差已很小): 本拍 corr 强制 0、vel_bias 全 0,
          * 把最后十几毫米完全交给位置环, 四轮才能同时减速同时停(见 Chassis.h)。 */
-        if (!stalled && !hdg_cut && fabsf(yaw_err) >= cfg->hd_dead)
+        if (!stalled && !hdg_cut && !hdg_far && fabsf(yaw_err) >= cfg->hd_dead)
         {
             /* 积分 (带抗饱和), 消除持续漂移下的稳态航向误差 */
             s_heading_integral += yaw_err * dt;
@@ -742,7 +944,7 @@ void Chassis_Update_Control(void)
     /* ---- 1. 转向闭环 (陀螺仪) ---- */
     if (s_turn_open)
     {
-        float yaw = s_yaw ? *s_yaw : 0.0f;
+        float yaw = Chassis_YawFiltered();   /* ⭐ 2026-10-11: 坏读数不参与转向判断 */
         float dyaw = wrap_180(yaw - s_turn_prev_yaw);           //得到相对变化的角度
         s_turn_prev_yaw = yaw;
         s_turn_remaining -= dyaw;
@@ -796,6 +998,55 @@ void Chassis_Update_Control(void)
         {
             s_turn_stable = 0;
         }
+
+        /* ⭐⭐ 2026-10-11 新增: "剩余角异常膨胀"保护(见 Chassis.h 的 CH_TURN_ABORT_EXTRA_DEG)。
+         * 为什么放在最后: 让本拍照常输出, 从下一拍起转向环已关(避免中途半拍输出)。
+         * 触发场景(实车日志): 请求 0.5° 的校正被一次 ~127° 的坏读数污染 →
+         * remaining 变 +126° → 车照着转了好几圈。正常转向 remaining 只会递减,
+         * 所以"比请求值还大 60°"必是异常, 直接停住, 不再往下转。 */
+        if (s_turn_open && CH_TURN_ABORT_EXTRA_DEG > 0.0f)
+        {
+            if (fabsf(s_turn_remaining) > s_turn_request + CH_TURN_ABORT_EXTRA_DEG)
+            {
+                if (++s_turn_abort_cnt >= CH_TURN_ABORT_STABLE_N)
+                {
+                    s_turn_abort_cnt = 0;
+                    s_turn_open = false;
+                    s_turn_stable = 0;
+                    Chassis_Stop();
+                    turn_abort_log(yaw);
+                }
+            }
+            else
+            {
+                s_turn_abort_cnt = 0;
+            }
+        }
+
+        /* ⭐⭐ 2026-10-11 新增: "推不动就收手"(见 Chassis.h 的 CH_TURN_STUCK_CYCLES)。
+         * 放在最后: 本拍照常输出, 从下一拍起转向环已关。
+         * 为什么必须有: 环的输出是【每周期累加进位置目标】的, 而平移有 CH_STALL_*
+         * 兜底、转向这条路【完全没有】—— 车不转时目标无限累积, 几秒后一旦抓住地面
+         * 整车被甩出去(实测 3s 攒出 111°、10s 攒出 781mm ⇒ 用户看到的"转了几圈")。 */
+        if (s_turn_open && CH_TURN_STUCK_CYCLES > 0)
+        {
+            if (fabsf(s_turn_remaining) > CH_ANGLE_ERR_THRESHOLD &&
+                fabsf(dyaw) < CH_TURN_STUCK_DYAW)
+            {
+                if (++s_turn_stuck_cnt >= (uint16_t)CH_TURN_STUCK_CYCLES)
+                {
+                    s_turn_stuck_cnt = 0;
+                    s_turn_open = false;
+                    s_turn_stable = 0;
+                    Chassis_Stop();
+                    turn_stuck_log(yaw);
+                }
+            }
+            else
+            {
+                s_turn_stuck_cnt = 0;
+            }
+        }
     }
     /* ---- 2. 平移到位判断 (位置 + 速度都达标, 连续多周期才算停稳) ---- */
     else if (s_moving)
@@ -804,7 +1055,7 @@ void Chassis_Update_Control(void)
         bool vel_ok = true;    /* 四轮速度都小于"停稳"阈值(用低通速度, 滤掉静止抖动) */
         for (int i = 0; i < W_NUM; i++)
         {
-            if (iabs(eff_tgt(i) - s_pos[i]) >= CH_POS_THRESHOLD_COUNT) pos_ok = false;
+            if (iabs(eff_tgt(i) - s_pos[i]) >= (int32_t)s_pos_thresh) pos_ok = false;
             if (s_speed_filt[i] >= CH_STOP_SPEED_THRESHOLD)              vel_ok = false;
         }
 
@@ -955,18 +1206,41 @@ void Chassis_Update_Control(void)
     output_pwm(pwm);
 }
 
+/* ⭐ 2026-10-11: 【紧接着那一次平移】的"提前减速"覆盖值(见 Chassis.h 的同名函数)。
+ *   < 0 = 不覆盖(按 CH_SLOWDOWN_* 自动算); 0 = 本段不减速(急停); > 0 = 用它做减速起始。
+ *   ⚠️ 定义必须放在 add_move_ex() 之前(那里要用它)。 */
+static int32_t s_next_slow_counts = -1;
+static float   s_next_slow_min    = 0.0f;
+/* ⭐ 2026-10-11: 【紧接着那一次平移】的最高速度覆盖值(mm/s); 0 = 不限(用全局 s_max_vel) */
+static float   s_next_speed_cap   = 0.0f;
+
+void Chassis_SetNextMoveSlowdown(int32_t dist_counts, float min_vel)
+{
+    s_next_slow_counts = (dist_counts < 0) ? -1 : dist_counts;
+    s_next_slow_min    = (min_vel > 0.0f) ? min_vel : 0.0f;
+}
+
+void Chassis_SetNextMoveSpeedCap(float mmps)
+{
+    s_next_speed_cap = (mmps > 0.0f) ? mmps : 0.0f;
+}
+
 /* =====================================================================
  * 平移指令
  * 参数：fwd_mm —— 前进距离(毫米, 负数表示后退)
  *       strafe_mm —— 左移距离(毫米, 负数表示右移)
  *       strafe_cfg —— true = 强制用"平移参数集"(见 Chassis_Move_Right_WithBack),
  *                     false = 按“纯平移/非纯平移”自动选
+ *       thresh —— ⭐ 本段的到位死区(编码器计数): 普通段传 CH_POS_THRESHOLD_COUNT,
+ *                 “对准微步”传 CH_ALIGN_FINE_THRESHOLD_COUNT(见 Chassis.h)
  * 直接让车走多少毫米
  * ===================================================================== */
-static void add_move_ex(int32_t fwd_mm, int32_t strafe_mm, bool strafe_cfg)
+static void add_move_ex(int32_t fwd_mm, int32_t strafe_mm, bool strafe_cfg, uint16_t thresh)
 {
     int32_t fwd_cnt = mm_to_counts(fwd_mm);
     int32_t strafe_cnt = mm_to_counts(strafe_mm) * CH_STRAFE_SIGN;          //CH_STRAFE_SIGN: 左移为正, 右移为负, 见 Chassis.h
+
+    s_pos_thresh = thresh;   /* ⭐ 本段到位死区(到位判定 + 卡住检测共用) */
 
     /* ---- 分段 PID: 纯左移/右移用"平移参数", 其余(前进/后退/斜行)用"直行参数" ----
      * strafe_cfg=true 用于“右移 + 少量向后分量”这类【本质仍是平移】的指令
@@ -997,6 +1271,61 @@ static void add_move_ex(int32_t fwd_mm, int32_t strafe_mm, bool strafe_cfg)
         if (iabs(dc) > max_cnt) max_cnt = iabs(dc);
     }
 
+    /* ⭐⭐ 2026-10-11: 本段的【冲击保护/限速】—— 见 Chassis_SetNextMoveSpeedCap。
+     *   ⚠️ 必须【每一段都设一次】: apply_cfg 只在"参数集切换"时才重设 max_vel,
+     *      同一套参数连着走两段时它不会恢复 —— 不在这里兜底, 限速会被继承到下一段。 */
+    {
+        float vmax = s_max_vel;
+
+        if (s_next_speed_cap > 0.0f)
+        {
+            float c = s_next_speed_cap * CH_COUNTS_PER_MM * CH_CTRL_PERIOD_MS / 1000.0f;
+
+            if (c < 5.0f)      c = 5.0f;        /* 与 Chassis_SetMaxSpeed 同一套硬边界 */
+            if (c > s_max_vel) c = s_max_vel;   /* 只允许限速, 不允许超全局 */
+            vmax = c;
+        }
+        for (int i = 0; i < W_NUM; i++)
+        {
+            DualPID_SetMaxVel(&s_pid[i], vmax);
+        }
+        s_next_speed_cap = 0.0f;   /* ⭐ 覆盖只生效一次(发一次移动即消耗掉) */
+    }
+
+    /* ⭐⭐ 2026-10-11(用户要求): 本段的"提前减速"距离按【本段长度】定 ——
+     *   ≥ CH_SLOWDOWN_LONG_FROM_MM(300mm) 的长段按比例拉长(封顶), 免得
+     *   300mm/s 在固定的 30mm 里刹不住 → 过冲。详见 Chassis.h 的 CH_SLOWDOWN_LONG_*。
+     *   ⚠️ 必须在 apply_cfg() 之后设: apply_cfg 里按宏设的是"短段默认值", 会覆盖这里。
+     *   ⚠️ DualPID_Reset() 不会清 slow_dist(只有 DualPID_Init 会), 所以同一套参数
+     *      连着走两段时, 这一段设的值不会被上一步的 Reset 抹掉。 */
+    if (CH_SLOWDOWN_ENABLE)
+    {
+        float ramp = (float)CH_SLOWDOWN_DIST_COUNT;
+        float vmin = CH_SLOWDOWN_MIN_COUNT;
+
+        if (s_next_slow_counts >= 0)
+        {
+            /* ⭐ 2026-10-11: 本段被【显式指定】(见 Chassis_SetNextMoveSlowdown)。
+             *   counts = 0 ⇒ 本段不减速(到点直接停 = "急停")。 */
+            ramp = (float)s_next_slow_counts;
+            vmin = s_next_slow_min;
+        }
+        else if (CH_SLOWDOWN_LONG_PCT > 0.0f &&
+                 max_cnt >= (int32_t)((float)CH_SLOWDOWN_LONG_FROM_MM * CH_COUNTS_PER_MM))
+        {
+            float by_pct = (float)max_cnt * (float)CH_SLOWDOWN_LONG_PCT * 0.01f;
+            float cap    = (float)CH_SLOWDOWN_LONG_MAX_MM * CH_COUNTS_PER_MM;
+
+            if (by_pct > ramp) ramp = by_pct;
+            if (ramp > cap)    ramp = cap;
+        }
+        for (int i = 0; i < W_NUM; i++)
+        {
+            DualPID_SetSlowdown(&s_pid[i], ramp, vmin);
+        }
+        s_next_slow_counts = -1;   /* ⭐ 覆盖只生效一次(发一次移动即消耗掉) */
+    }
+
     /* ⭐ 超时按本段距离自适应 (见 Chassis.h 的 CH_MOVE_MIN_SPEED_MMPS 说明)。
      * 固定超时一旦小于"本段应耗时"就会把本段切断 → 车走的距离变成"速度×超时",
      * 用户会看到"不管距离宏改多少, 车都走同一个值"。 */
@@ -1015,7 +1344,7 @@ static void add_move_ex(int32_t fwd_mm, int32_t strafe_mm, bool strafe_cfg)
      * 现在基准由任务层一次性设定, 见 Chassis_SetHeadingRef() / Mission_Init()。 */
     if (s_yaw != NULL)
     {
-        s_heading_prev_yaw = *s_yaw;      /* 只同步"上一周期角度", 防止首个周期 dyaw 突变 */
+        s_heading_prev_yaw = Chassis_YawFiltered();  /* 只同步"上一周期角度", 防止首个周期 dyaw 突变 */
     }
 
     s_heading_integral = 0.0f;
@@ -1030,7 +1359,7 @@ static void add_move_ex(int32_t fwd_mm, int32_t strafe_mm, bool strafe_cfg)
 /* 普通平移指令入口: 分段参数按“纯平移 / 非纯平移”自动选(见 add_move_ex) */
 static void add_move(int32_t fwd_mm, int32_t strafe_mm)
 {
-    add_move_ex(fwd_mm, strafe_mm, false);
+    add_move_ex(fwd_mm, strafe_mm, false, CH_POS_THRESHOLD_COUNT);
 }
 
 void Chassis_Move_Forward(int32_t distance_mm)
@@ -1053,6 +1382,43 @@ void Chassis_Move_Right(int32_t distance_mm)
     add_move(0, -distance_mm);
 }
 
+/* ⭐⭐ 2026-10-11 新增: 视觉【对准微步】专用的平移入口 (到位死区更小) ---------
+ * 与上面四个完全一样的动作, 唯一的差别是"到位死区"用 CH_ALIGN_FINE_THRESHOLD_COUNT
+ * (≈1.8mm) 而不是 CH_POS_THRESHOLD_COUNT(≈4.5mm) —— 原理与用途见 Chassis.h 的说明。
+ * 目的: 8~20mm 的微步能真的走掉绝大部分, 四轮都出力 ⇒ 车真的平移过去,
+ *       而不是"个别轮子空转几毫米、车原地蹭"。
+ * ⚠️ 仍然走"平移参数集"(strafe_cfg=true): 对准只会用到左右/前后小步,
+ *    用平移那套 PID/航向参数最接近标定条件。
+ * ⚠️ CH_ALIGN_FINE_ENABLE=0 时自动退回大死区 = 老行为。 */
+static void add_move_fine(int32_t fwd_mm, int32_t strafe_mm)
+{
+    uint16_t th = CH_ALIGN_FINE_ENABLE ? (uint16_t)CH_ALIGN_FINE_THRESHOLD_COUNT
+                                       : (uint16_t)CH_POS_THRESHOLD_COUNT;
+    add_move_ex(fwd_mm, strafe_mm, true, th);
+
+    /* ⭐⭐ 2026-10-11(用户实测反馈): 对准微步要"干脆地动", 不要"慢慢蹭"——
+     *   上面 add_move_ex 给本段套的"提前减速"(整段都在减速区内, 速度被压到
+     *   ≈45~80mm/s)对 8mm 的微步太柔和: 起步慢、容易被静摩擦拖住 ⇒ 四轮出力的
+     *   时刻不一致 ⇒ 看起来就是"只有个别轮子动、车不平移"(用户报的"车身偏移")。
+     *   这里把提前减速取消(保留全部速度权限), 微步就有一致的起步冲量。
+     *   ⚠️ 不会因此冲过头: 位置环的期望速度还要经 PWM 软启动斜坡(CH_PWM_RAMP_STEP,
+     *      每周期最多 +6), 8mm 只够 1~2 个控制周期 ⇒ 实际速度上不去; 而且细模式
+     *      到位死区只有 ≈1.8mm, 到点就冻结。
+     *   ⚠️ 想恢复"柔和"就把它置 0(见 Chassis.h 的 CH_SLOWDOWN_SKIP_FINE)。 */
+    if (CH_SLOWDOWN_SKIP_FINE)
+    {
+        for (int i = 0; i < W_NUM; i++)
+        {
+            DualPID_SetSlowdown(&s_pid[i], 0.0f, 0.0f);
+        }
+    }
+}
+
+void Chassis_Move_LeftFine(int32_t distance_mm)    { add_move_fine(0, distance_mm); }
+void Chassis_Move_RightFine(int32_t distance_mm)   { add_move_fine(0, -distance_mm); }
+void Chassis_Move_ForwardFine(int32_t distance_mm) { add_move_fine(distance_mm, 0); }
+void Chassis_Move_BackwardFine(int32_t distance_mm){ add_move_fine(-distance_mm, 0); }
+
 /* ⭐ 2026-10-09 新增: 右移 + 固定比例的“向后分量”(用途/原理见 Chassis.h 的声明注释)
  * 例: Chassis_Move_Right_WithBack(500, 0.085f) → 右移 500mm, 同时后退 42mm。
  * ⚠️ 与“右移后再单独后退一小步”不同: 这里四轮的目标是【同时】给出的,
@@ -1064,7 +1430,7 @@ void Chassis_Move_Right_WithBack(int32_t distance_mm, float back_comp)
 
     /* strafe_mm 取负 = 右移(同 Chassis_Move_Right); fwd_mm 取负 = 后退
      * (横移途中车往上漂 ⇒ 补的方向是“向后”)。 */
-    add_move_ex(-back_mm, -distance_mm, true);
+    add_move_ex(-back_mm, -distance_mm, true, CH_POS_THRESHOLD_COUNT);
 }
 
 void Chassis_Move_Diagonal(int32_t fwd_mm, int32_t strafe_mm)
@@ -1089,7 +1455,10 @@ void Chassis_Rotate(float delta_deg)
     s_steer_i_peak = 0.0f;   /* 清 I 项峰值, 本次转向重新记录 */
 
     s_turn_remaining = delta_deg;
-    s_turn_prev_yaw = *s_yaw;
+    s_turn_request   = fabsf(delta_deg);   /* ⭐ 2026-10-11: 膨胀保护的基准(见 CH_TURN_ABORT_EXTRA_DEG) */
+    s_turn_abort_cnt = 0;
+    s_turn_stuck_cnt = 0;
+    s_turn_prev_yaw = Chassis_YawFiltered();   /* ⭐ 2026-10-11: 用过了合理性检查的 yaw */
     s_turn_stable = 0;
     s_moving = false;
     s_turn_open = true;
@@ -1101,7 +1470,7 @@ void Chassis_Rotate_To(float target_deg)
     {
         return;
     }
-    float delta = wrap_180(target_deg - *s_yaw);
+    float delta = wrap_180(target_deg - Chassis_YawFiltered());   /* ⭐ 2026-10-11: 坏读数不参与算目标 */
     Chassis_Rotate(delta);
 }
 
@@ -1113,6 +1482,8 @@ void Chassis_Stop(void)
     s_moving = false;
     s_turn_open = false;
     s_turn_stable = 0;
+    s_turn_abort_cnt = 0;      /* ⭐ 2026-10-11: 膨胀保护的计数一起清 */
+    s_turn_stuck_cnt = 0;      /* ⭐ 2026-10-11: "推不动"计数一起清 */
     s_move_stable = 0;
     s_move_cycles = 0;
     s_heading_integral = 0.0f;
@@ -1144,7 +1515,7 @@ void Chassis_SetHeadingRef(float deg)
     s_heading_target = deg;
     if (s_yaw != NULL)
     {
-        s_heading_prev_yaw = *s_yaw;   /* 同步上一周期角度, 避免下个周期 dyaw 突变 */
+        s_heading_prev_yaw = Chassis_YawFiltered();   /* 同步上一周期角度, 避免下个周期 dyaw 突变 */
     }
     s_heading_integral = 0.0f;
 }
@@ -1209,13 +1580,25 @@ void Chassis_DebugLog(void)
 
 void Chassis_HeadingDebugLog(void)
 {
-    elog_i("HDG", "err=%.1f int=%.1f corr=%.1f trim=%ld vb=%d,%d,%d,%d",
+    elog_i("HDG", "err=%.1f int=%.1f corr=%.1f trim=%ld vb=%d,%d,%d,%d drift=%.3f",
            (double)s_heading_err_last,
            (double)s_heading_integral,
            (double)s_heading_corr_last,
            (long)s_heading_trim,
            (int)s_vel_bias_last[W_FL], (int)s_vel_bias_last[W_FR],
-           (int)s_vel_bias_last[W_BL], (int)s_vel_bias_last[W_BR]);
+           (int)s_vel_bias_last[W_BL], (int)s_vel_bias_last[W_BR],
+           (double)s_drift_dps);   /* ⭐ 2026-10-11: 静止漂移率(度/秒), 判温漂用 */
+}
+
+/**
+ * @brief  读取当前估计的 yaw 静止漂移率 (度/秒)
+ * @note   ⭐ 2026-10-11 新增: 车静止时真航向不变 ⇒ 这段时间 yaw 的变化率就是漂移率。
+ *         判"车头偏是不是温漂"就看它(主循环 I/HDG 行末尾也打):
+ *           ≲0.05°/s = 没问题(是机械/打滑); ≳0.2°/s = 温漂明显(5s 长段白歪 >1°)。
+ */
+float Chassis_GetYawDriftDps(void)
+{
+    return s_drift_dps;
 }
 
 /* ---- 转向环 PID 调试量 ---- */
@@ -1246,7 +1629,26 @@ float Chassis_GetSteerIPeak(void)
  */
 float Chassis_GetYaw(void)
 {
-    return (s_yaw != NULL) ? *s_yaw : 0.0f;
+    return Chassis_YawFiltered();   /* ⭐ 2026-10-11: 只给"过了跳变检查"的值(见 Chassis.h) */
+}
+
+/**
+ * @brief  读取转向环当前的剩余角 (度, 调试用)
+ * @note   正常转向应单调递减到 0; 若比本次请求角大很多 ⇒ 被坏读数污染
+ *         (见 Chassis.h 的 CH_TURN_ABORT_EXTRA_DEG)。
+ */
+float Chassis_GetTurnRemaining(void)
+{
+    return s_turn_remaining;
+}
+
+/**
+ * @brief  读取累计被丢弃的坏 yaw 读数个数 (调试用)
+ * @note   非 0 说明陀螺仪/软件 I2C 丢过帧(跳变被合理性检查挡下了)。
+ */
+uint32_t Chassis_GetYawGlitchCount(void)
+{
+    return s_yaw_glitches;
 }
 
 void Chassis_SteerDebugLog(void)

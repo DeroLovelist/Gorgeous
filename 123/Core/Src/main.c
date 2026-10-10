@@ -618,8 +618,12 @@ int main(void)
       logTick = HAL_GetTick();
       if (jy61p != NULL)
       {
-        elog_i("JY", "R=%.1f P=%.1f Y=%.1f",
-               jy61p->var.roll, jy61p->var.pitch, jy61p->var.yaw);
+        /* ⭐ 2026-10-11: 带上"I2C 事务失败次数" —— 排爆后那种"读数冻结/乱跳"
+         * 如果是读失败造成的, 这个计数会一直涨(硬件/走线/供电问题);
+         * 一直不涨却仍乱跳 ⇒ 是角度本身的问题(另一类)。 */
+        elog_i("JY", "R=%.1f P=%.1f Y=%.1f I2Cerr=%lu",
+               jy61p->var.roll, jy61p->var.pitch, jy61p->var.yaw,
+               (unsigned long)JY61P_GetReadFailCount());
       }
       elog_i("ENC", "M1=%ld M2=%ld M3=%ld M4=%ld",
              (long)Encoder_GetCount(1), (long)Encoder_GetCount(2),

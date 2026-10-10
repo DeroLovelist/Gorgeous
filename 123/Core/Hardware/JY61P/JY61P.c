@@ -98,44 +98,99 @@ void JY61P_Write2(JY61P_Driver *self, uint8_t RegAddress, uint8_t *WriteData)
     self->pere->i2c_driver->fun->MyI2C_Stop(self->pere->i2c_driver);
 }
 
+/* ⭐⭐ 2026-10-11 新增: I2C 事务的 ACK 检查 + 失败统计 ------------------------
+ * 背景(实车日志): 排爆后那次航向校正里 yaw 读数【冻结】了好几秒 —— 转向环
+ *   看不到转动就一直推(它的输出是每周期累加进位置目标的), 车被推着转出去
+ *   (+3.2° → -36° → +111°), 用户看到"转了几圈"; 之后读数又"跳"回去。
+ * 原因: 老代码 MyI2C 的 4 个 ACK 全都【不检查】—— 软件 I2C 事务失败时模块根本
+ *   不驱动 SDA, 采到的是上拉/残留电平 = 垃圾值, 而它被当成真角度喂给了闭环。
+ * 现在: 任何一步没 ACK 就算失败: ① 重读一次; ② 仍失败就补一串空时钟
+ *   (总线恢复, 防止从机把 SDA 拉死) 并【保持上一次的值】、计数加一。
+ * 计数由主循环的 I/JY 行打印出来 —— 非 0 说明确实是总线/供电被干扰(舵机、
+ * 电机、走线), 该从硬件上解决(电源去耦、走线远离动力线), 而不是靠软件。
+ * ⚠️ 只是"读失败"才保持旧值; 读成功但角度离奇(比如跳 100°)属于另一类问题,
+ *    由 Chassis 侧的"变化率合理性检查"挡(CH_YAW_MAX_RATE_DPS)。 */
+static uint32_t s_read_fail = 0;   /* I2C 事务失败次数(累计) */
+static uint8_t  s_read_ok   = 0;   /* 最后一次 Read 是否成功 */
+static int16_t  s_read_val_last = 0; /* 最后一次成功的原始值(读失败时返回它, 而不是垃圾) */
+
+uint32_t JY61P_GetReadFailCount(void)
+{
+    return s_read_fail;
+}
+
+/** 总线恢复: 从机把 SDA 拉死时, 补一串空时钟(8 个)让它松手 */
+static void jy61p_bus_recover(JY61P_Driver *self)
+{
+    self->pere->i2c_driver->fun->MyI2C_Start(self->pere->i2c_driver);
+    self->pere->i2c_driver->fun->MyI2C_Send_Byte(self->pere->i2c_driver, 0xFF);
+    self->pere->i2c_driver->fun->MyI2C_Stop(self->pere->i2c_driver);
+}
+
+/**
+ * @brief  读一个 16 位寄存器(带 ACK 检查/重试/总线恢复)
+ * @retval 读到的原始值; ⚠️ 失败时返回上一次成功读到的值(不是垃圾), 并置 s_read_ok=0
+ * @note   调用方(如 JY61P_YAW_GET)应先看 s_read_ok 再决定要不要用这个值。
+ *         ⚠️ 时序必须保持"重复起始(Repeated Start)": 写完寄存器【不能】先 Stop
+ *            再另起一次读, 那样从机的寄存器指针会回到 0x00, 读到的就不是这个寄存器。
+ */
 int16_t JY61P_Read(JY61P_Driver *self, uint8_t RegAddress)
 {
     uint8_t ack;
-    uint8_t DataL = 0, DataH = 0;  /* 初始化为0, 避免I2C读取失败时返回未定义乱码 */
+    uint8_t DataL = 0, DataH = 0;
     int16_t ReadData;
 
-    // 起始
-    self->pere->i2c_driver->fun->MyI2C_Start(self->pere->i2c_driver);
+    for (uint8_t try = 0; try < 2u; try++)
+    {
+        uint8_t ok = 1u;
 
-    // 发送地址(写)
-    self->pere->i2c_driver->fun->MyI2C_Send_Byte(self->pere->i2c_driver, self->pere->Address << 1);
-    self->pere->i2c_driver->fun->MyI2C_ReceiveAck(self->pere->i2c_driver, &ack);
+        self->pere->i2c_driver->fun->MyI2C_Start(self->pere->i2c_driver);
 
-    // 发送寄存器
-    self->pere->i2c_driver->fun->MyI2C_Send_Byte(self->pere->i2c_driver, RegAddress);
-    self->pere->i2c_driver->fun->MyI2C_ReceiveAck(self->pere->i2c_driver, &ack);
+        /* 地址(写) + ACK */
+        self->pere->i2c_driver->fun->MyI2C_Send_Byte(self->pere->i2c_driver, self->pere->Address << 1);
+        self->pere->i2c_driver->fun->MyI2C_ReceiveAck(self->pere->i2c_driver, &ack);
+        if (ack != 0u) { ok = 0u; }
 
-    // 重复起始
-    self->pere->i2c_driver->fun->MyI2C_Start(self->pere->i2c_driver);
+        /* 寄存器地址 + ACK */
+        if (ok)
+        {
+            self->pere->i2c_driver->fun->MyI2C_Send_Byte(self->pere->i2c_driver, RegAddress);
+            self->pere->i2c_driver->fun->MyI2C_ReceiveAck(self->pere->i2c_driver, &ack);
+            if (ack != 0u) { ok = 0u; }
+        }
 
-    // 发送地址(读)
-    self->pere->i2c_driver->fun->MyI2C_Send_Byte(self->pere->i2c_driver, (self->pere->Address << 1) | 1);
-    self->pere->i2c_driver->fun->MyI2C_ReceiveAck(self->pere->i2c_driver, &ack);
+        /* 重复起始 + 地址(读) + ACK */
+        if (ok)
+        {
+            self->pere->i2c_driver->fun->MyI2C_Start(self->pere->i2c_driver);
+            self->pere->i2c_driver->fun->MyI2C_Send_Byte(self->pere->i2c_driver, (self->pere->Address << 1) | 1);
+            self->pere->i2c_driver->fun->MyI2C_ReceiveAck(self->pere->i2c_driver, &ack);
+            if (ack != 0u) { ok = 0u; }
+        }
 
-    // 读低8位 -> ACK
-    self->pere->i2c_driver->fun->MyI2C_Receive_Byte(self->pere->i2c_driver, &DataL);
-    self->pere->i2c_driver->fun->MyI2C_SendAck(self->pere->i2c_driver, 0);
+        if (ok)
+        {
+            /* 读低8位 -> ACK, 读高8位 -> NACK */
+            self->pere->i2c_driver->fun->MyI2C_Receive_Byte(self->pere->i2c_driver, &DataL);
+            self->pere->i2c_driver->fun->MyI2C_SendAck(self->pere->i2c_driver, 0);
+            self->pere->i2c_driver->fun->MyI2C_Receive_Byte(self->pere->i2c_driver, &DataH);
+            self->pere->i2c_driver->fun->MyI2C_SendAck(self->pere->i2c_driver, 1);
+            self->pere->i2c_driver->fun->MyI2C_Stop(self->pere->i2c_driver);
 
-    // 读高8位 -> NACK
-    self->pere->i2c_driver->fun->MyI2C_Receive_Byte(self->pere->i2c_driver, &DataH);
-    self->pere->i2c_driver->fun->MyI2C_SendAck(self->pere->i2c_driver, 1);
+            ReadData = (int16_t)((DataH << 8) | DataL);
+            s_read_ok       = 1u;
+            s_read_val_last = ReadData;
+            return ReadData;
+        }
 
-    // 停止
-    self->pere->i2c_driver->fun->MyI2C_Stop(self->pere->i2c_driver);
+        self->pere->i2c_driver->fun->MyI2C_Stop(self->pere->i2c_driver);
+        jy61p_bus_recover(self);   /* 这一趟失败: 补一串空时钟, 再试一次 */
+    }
 
-    // 组合16位数据
-    ReadData = (DataH << 8) | DataL;
-    return ReadData;
+    /* 两趟都失败: 保持上一次成功的值, 只计数(绝不把垃圾当角度) */
+    s_read_ok = 0u;
+    s_read_fail++;
+    return s_read_val_last;
 }
 
 void JY61P_ROLL_GET(JY61P_Driver *self)
@@ -154,6 +209,15 @@ void JY61P_YAW_GET(JY61P_Driver *self)
 {
     double yaw;
     yaw = self->pere->Read(self, self->data.Yaw);
+
+    /* ⭐⭐ 2026-10-11: 读失败(没有 ACK)就【不要】动 var.yaw —— 保持上一次的
+     * 好值。老代码不检查, 失败时把垃圾/0 当成真角度喂给转向环与航向保持,
+     * 是"排爆后校正时读数冻结/乱跳、车被推着转出去"的直接来源。
+     * 失败次数由 JY61P_GetReadFailCount() 给出, 主循环 I/JY 行会打印。 */
+    if (s_read_ok == 0u)
+    {
+        return;
+    }
     self->var.yaw_last = self->var.yaw; // 更新上一次的yaw值
     self->var.yaw = yaw/32768.0f * 180.0f;
 }

@@ -93,4 +93,15 @@ struct JY61P_Driver
 };
 JY61P_Driver* JY61P_Create(uint8_t JY61P_Address, GPIO_TypeDef* SCL_port, uint16_t SCL_pin, GPIO_TypeDef* SDA_port, uint16_t SDA_pin);
 uint8_t JY61P_Check(JY61P_Driver *self);
+
+/**
+ * @brief  读取 I2C 事务失败次数 (累计, 调试用)
+ * @note   ⭐ 2026-10-11 新增: 软件 I2C 读 JY61P 失败时, 模块不驱动 SDA,
+ *         采到的是垃圾电平 —— 老代码不检查 ACK, 会把垃圾当角度用(实车表现为
+ *         "排爆后校正时读数冻结/乱跳, 车被推着转出去")。
+ *         现在失败会保持上一次的值并计数; 主循环 I/JY 行打印这个计数:
+ *           非 0 = 总线/供电确实被干扰(舵机/电机/走线), 要从硬件上解决;
+ *           一直为 0 = 读数"离奇"不是读失败, 而是角度本身的问题。
+ */
+uint32_t JY61P_GetReadFailCount(void);
 #endif /* __JY61P_H */
