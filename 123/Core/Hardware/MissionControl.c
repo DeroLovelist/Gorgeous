@@ -1030,7 +1030,12 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *    并给 ID4 加了 TARGET_ID4_STEP_FINE(15 码)。
  * ===================================================================== */
 #define TARGET_ALIGN_TOLERANCE  10      /* 打靶: |dx|,|dy| 都 < 它才算对准
-                                         * (必须 ≤ K230 的 TARGET_ALIGN_TOL_PIX=11px) */
+                                         * ⚠️ 必须 ≤ K230 的 TARGET_ALIGN_TOL_PIX(最新 = 11px),
+                                         *    否则本机先"认为够准了"不再动舵机 → 两边干等到
+                                         *    K230 的 ALIGN_SELF_TIMEOUT(14s) 才(盲)射一枪。
+                                         * ⚠️ 本宏与 TARGET_STOP_NUDGE_TOL_PX 要取【同一个值】:
+                                         *    "冻结"判据是 < 本宏, "该动一步"判据是 ≥ 本宏,
+                                         *    两者互补时才不会有"既不动也判不过"的夹缝。 */
 
 #define TARGET_ID1_STEP         80/*60*/      /* 每收到一次 L/R, 底座 ID1 转多少角度码。
                                          * 4096 码 = 360°, 所以 1° ≈ 11.4 码,
@@ -1082,13 +1087,24 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *   窗口取 ±2048 = 整圈, 与“基准落在 0~2048 内时的绝对 0~4095”可用范围等价。 */
 #define TARGET_ID1_POS_MIN  (-2048)     /* ID1 逻辑位置下限(【相对基准】的偏移) */
 #define TARGET_ID1_POS_MAX  ( 2047)     /* ID1 逻辑位置上限(【相对基准】的偏移) */
-#define TARGET_ID1_STEP_MAX     20      /* 🛡防卡死①: 最多转这么多步就强制认为已对准。
-                                         * (粗对准 20 步 × 30 码 = 600 码 ≈ 53°;
-                                         *  精对准 20 步 × 最多 60 码 = 1200 码 ≈ 105°) */
+#define TARGET_ID1_STEP_MAX     30      /* 🛡防卡死①: 精/粗对准最多转这么多步就强制认为已对准。
+                                         * ⭐⭐ 2026-10-11: 20 → 30。
+                                         * 为什么必须加大: K230 新代码里精对准有
+                                         *   ALIGN_SELF_TIMEOUT(14s) 自超时 —— 到点它【也会
+                                         *   fire_start() 点激光 + 发 FIRE/OK】。而本机每步要
+                                         *   TARGET_ID1_MOVE_MS(600)+TARGET_FINE_SETTLE_MS(250)
+                                         *   = 850ms ⇒ 20 步 = 17s > 14s(勉强够, 但两轴混着走时
+                                         *   ID4 那 20 步 = 13s 会先到)。
+                                         *   ⚠️ 若本上限【先到】, 本机就会"抬臂收尾"而没有激光 ⇒ 白打。
+                                         *   ⇒ 上限必须满足 步数 × 每步耗时 ≥ 14s(让 K230 的超时
+                                         *     发射先发生); 30 步 × 650ms(ID4) = 19.5s, 安全。
+                                         *   真正的硬上限仍是 TARGET_ID1_TIMEOUT_MS(20s)。 */
 #define TARGET_ID1_TIMEOUT_MS   20000   /* 🛡防卡死②: L/R 调整环节最长等这么久(ms),
                                          * 超时强制走 C 流程(摆 FIRE→LIFT→SCAN_RESET);
                                          * 也兜住“K230 一条都不回”的情况。
-                                         * 建议 10000~30000 */
+                                         * ⚠️ 必须 > K230 的 ALIGN_SELF_TIMEOUT(14s), 否则本机
+                                         *    先放弃 → K230 那枪 (超时) 发射没打出来就抬臂了。
+                                         * 建议 18000~30000 */
 /* ⭐ 打靶“精对准”开关(2026-10-05 新增, 适配新 K230 的激光逻辑):
  *   1 = 【当前】粗对准(按 C/L/R 转底座 ID1)收到 C 后, 再发 start_align 让 K230
  *       进入 ALIGN 状态; 之后按它回的 D:<x>,<y> 里的【横向误差 x】继续小步微调
@@ -1104,11 +1120,13 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  * ⭐⭐ 打靶精对准第二轴: 用 ID4(腕部) 修【竖直误差 dy】 (2026-10-06 新增)
  * ---------------------------------------------------------------------
  * 【为什么需要】
- *   K230(yolo_main.py)判定“打靶对准成功”的条件是【|dx|<20px 且 |dy|<20px】
- *   (2026-10-06 起 K230 已从 50px 收紧到 20px; 单片机用 TARGET_ALIGN_TOLERANCE
- *    同步跟随), 只有判定成功它才会 fire_start() 点激光 + 发 "FIRE"。
+ *   K230(yolo_main.py)判定“打靶对准成功”的条件是【|dx| 且 |dy| 都小于它的
+ *   TARGET_ALIGN_TOL_PIX】—— 2026-10-11 的最新代码里是 11px(曾经 50px → 20px),
+ *   而且要求【连续 2 帧、持续 ≥0.4s】都满足, 才会 fire_start() 点激光 + 发 "FIRE"。
+ *   单片机侧用 TARGET_ALIGN_TOLERANCE 同步跟随(⚠️ 必须 ≤ K230 的值)。
  *   而底座 ID1 只能修横向 dx —— 竖直 dy 没人管 ⇒ K230 永远等不到“成功”
- *   ⇒ 只能等它自己 12s 自超时发一个 OK(而 FIRE_ON_TIMEOUT=False ⇒ 不点激光)。
+ *   ⇒ 只能等它自己自超时(现在 ALIGN_SELF_TIMEOUT = 14s; 最新代码【超时也会点激光
+ *     再发 FIRE+OK】, 旧版超时只回 OK 不点)。
  *   (2026-10-06 实测日志就是这现象: x=0 刷了十几次一直不发 FIRE)
  *   ⇒ 现在让 ID4(腕部) 去修 dy, 两个轴交替修, K230 才能真判成功。
  * ---------------------------------------------------------------------
@@ -1157,7 +1175,11 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 #define TARGET_ID4_POS_MIN      1050    /* ID4 行程限幅(角度码), 防越界堵转。
                                          * 姿态表注释: id4 物理限幅 1050~3010 */
 #define TARGET_ID4_POS_MAX      3010
-#define TARGET_ID4_STEP_MAX     20      /* 🛡防卡死: ID4 最多转这么多步 */
+#define TARGET_ID4_STEP_MAX     30      /* 🛡防卡死: ID4 最多转这么多步。
+                                         * ⭐⭐ 2026-10-11: 20 → 30 —— 与 TARGET_ID1_STEP_MAX
+                                         * 同一理由: 20 步 × (400+250)ms = 13s < K230 的
+                                         * ALIGN_SELF_TIMEOUT(14s), 会在 K230 超时发射之前
+                                         * 先"抬臂收尾" ⇒ 白打一枪。30 步 = 19.5s 安全。 */
 
 /* ⭐⭐ 2026-10-11 新增(用户要求): 打靶"丢靶"自恢复 —— 让 ID4 上下动一下去把靶子找回来 --
  * 【现象】精对准时 ID1 跟着画面一步步入(每步 400~600ms), 转到某一步之后 K230
@@ -1182,7 +1204,23 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *    可能几百 ms 才一帧): 建议 1000~2000。
  * ⚠️ 搜完还没信号就会一直等到防卡死兜底 —— 若实测"搜了也没用", 把 MAX 调到 0 关掉。 */
 #define TARGET_LOST_SEARCH_ENABLE      1     /* 1 = 开启丢靶自恢复; 0 = 直接干等(老行为) */
-#define TARGET_LOST_SILENCE_MS         1500  /* 距上次收到 K230 数据超过它 → 判为丢靶 */
+#define TARGET_LOST_SILENCE_MS         3500  /* 距上次收到 K230 数据超过它 → 判为丢靶。
+                                              * ⭐⭐ 2026-10-11: 1500 → 3500(对齐 K230 新代码)。
+                                              * 为什么必须放大: 新 yolo_main.py 在精对准里
+                                              *   【本来就是断续发帧】的 ——
+                                              *     · 每发一帧 D 之后就静默 ALIGN_SETTLE(1.2s);
+                                              *     · 两帧 D 之间至少隔 ALIGN_SEND_IVL(1.0s);
+                                              *     · 若两帧算出来的误差【一模一样】(靶子没动,
+                                              *       但还差一点没进窗口) 则要等
+                                              *       ALIGN_RETRY_IVL(3.0s) 才重发。
+                                              *   再加上它判成功前要"连续稳定 0.4s", 没进窗口时
+                                              *   它可能安静 3~4 秒 —— 这些都是【正常】的。
+                                              * ⚠️ 静默门限若小于上面这段正常间隔, 就会出现
+                                              *   【误判丢靶】: 我们拿 ID4 上下甩 40 码去找靶,
+                                              *   正好把 K230 那 0.4s 的稳定性打断 ⇒ 它永远判不过、
+                                              *   我们已经对好的位置也被搜跑 ⇒ 表现就是"激光乱晃"。
+                                              * ⇒ 取 3500 > 3.0s(ALIGN_RETRY_IVL), 只有真丢靶
+                                              *   (K230 一行都不发) 才会触发。 */
 #define TARGET_LOST_MIN_ID1_STEPS      1     /* ID1 至少跟画面动过这么多步才启用 */
 #define TARGET_LOST_ID4_STEP           40    /* 每次"上下动一下"的幅度(角度码)。
                                               * 参考: 常规竖直步长是 15/30/45 ⇒ 40 是"大步" */
@@ -1244,29 +1282,39 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *            设太大 → 白等。 */
 #define K230_FIRE_GRACE_MS      1500
 
-/* ⭐ 收到 K230 的 "OK" 之后, 【保持当前对准姿态】这么久再抬臂。
+/* ⭐ 收到 K230 的 "OK"/"FIRE" 之后, 【保持当前对准姿态】这么久再抬臂。
  * 为什么需要: 激光是 K230 在它判“对准成功”那一刻自己点亮的, 而抬臂会【立刻】
  *   改变摄像头/激光的朝向 —— 实测“刚收到 OK 就抬臂”时激光只闪了一下,
  *   靶上打不出稳定的点。
- * 取值/推荐: 2000~4000(默认 3000)。设小→激光照得短; 设大→白耗时。 */
+ * ⚠️⚠️ 必须 ≥ K230 侧的 FIRE_DURATION_MS(现在 = 2500ms): 那是它把激光
+ *   【一直点亮】多久。本值比它小的话, 激光还没灭我们就开始抬臂 ⇒ 后半段
+ *   打在别处。3000 比 2500 多留 500ms 余量。
+ * 取值/推荐: 3000(需 ≥ 2500)。设小→激光照得短/后半截打偏; 设大→白耗时。 */
 #define TARGET_FIRE_HOLD_MS     3000
 
-/* ⭐⭐ 2026-10-11(用户实测反馈): 打靶【冻结带】—— 够准了就别再动舵机 -----------------
+/* ⭐⭐ 2026-10-11(用户实测反馈 + K230 新代码对齐): 打靶【冻结带】——够准了就别再动舵机 --
  * 【现象】"摄像头瞄准靶心之后 ID4 还在抖, 激光出靶子"。
  * 【两个来源】
  *   ① K230 判成功后会先发 "FIRE"(点激光)再发 "OK"。老代码收到 FIRE 只是记个时间戳,
- *      【继续拿后面的 D 帧微调】⇒ 激光亮着的那 1.5s 里 ID4 还在一步几码地转, 腕部余振
+ *      【继续拿后面的 D 帧微调】⇒ 激光亮着的那 2.5s 里 ID4 还在一步几码地转, 腕部余振
  *      把激光点晃出靶心。⇒ 现在收到 FIRE 【立刻冻结姿态】(见 TARGET_FINE_IDLE)。
- *   ② 即使还没 FIRE, 只要两轴误差都很小, 我们仍按 TARGET_ALIGN_TOLERANCE(10px) 继续
- *      "蹭" ⇒ 舵机一直在动, 抖动不停。K230 自己的开火窗口是 ±50px, 所以误差已经在
- *      20px 内时【它随时会打】—— 这时继续微调是负收益。
- * 【做法】本宏 = 冻结带(px): |x| 和 |y| 【都】小于它 ⇒ 不再动 ID1/ID4, 只等 OK/FIRE。
- * 【取值】20(px)。0 = 关闭(回到"一直微调到 10px 或收到 OK 为止", 会有抖动风险)。
- *   ⚠️ 必须 ≥ TARGET_ALIGN_TOLERANCE(10), 否则本保护形同虚设(先被容差分支吃掉)。
- *   ⚠️ 调大(如 30) → 更早冻结、更稳, 但最终画面精度略降;
- *      调小(如 12) → 更准, 但接近靶心时舵机会继续动。
+ *   ② 即使还没 FIRE, 只要两轴误差还够小, 我们仍按 TARGET_ALIGN_TOLERANCE 继续"蹭"
+ *      ⇒ 舵机一直在动, 抖动不停。
+ * 【K230 新代码(2026-10-11 yolo_main.py)的判成功条件 —— 本宏必须跟着它对】
+ *   K230 判成功 = |dx| < TARGET_ALIGN_TOL_PIX(11) 且 |dy| < 11, 而且要
+ *   【连续 OK_STABLE_FRAMES(2) 帧、持续 ≥ OK_STABLE_HOLD(0.4s)】才 fire_start() + "FIRE"。
+ *   ⇒ 本宏必须 ≤ 11(K230 的窗口), 两边才对得齐:
+ *        · 两轴都 < 本宏时立刻停手 ⇒ 舵机一动不动, K230 这 0.4s 里能连判 2 帧成功
+ *          (腕部不动 = 画面不抖 = 激光不晃);
+ *        · 若本宏【大于】K230 的窗口, 我们就会"冻在 K230 判不过的位置" ⇒ 它一直等到
+ *          ALIGN_SELF_TIMEOUT(14s) 自超时才盲射一枪 —— 又慢又不准。
+ *   ⚠️ 老值 20 是配【旧 K230】(那时窗口 50px)定的; 换新代码后 20 就是上面第二种情况,
+ *      所以改成 10(= TARGET_ALIGN_TOLERANCE, 与 K230 的 11px 对齐)。
+ * 【取值】10。0 = 关闭(回到"一直微调到容差或收到 OK 为止", 会有抖动风险)。
+ *   ⚠️ 可以调小(如 6)换更高精度, 代价是接近靶心时还会多动几下(多晃几下);
+ *      不要往大调(> 11 就冻在 K230 判不过的地方)。
  * --------------------------------------------------------------------- */
-#define TARGET_STOP_NUDGE_TOL_PX   20
+#define TARGET_STOP_NUDGE_TOL_PX   10
 
 /* ⭐ 打靶两轴标定(mode 6)专用: 1 = 只标竖直轴(ID4), 横向(ID1)完全不动。
  * 用途: ID1 标好之后, 单独标 ID4 的符号 / 步长。
@@ -1451,7 +1499,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  * 作用状态 = STATE_15_TURN_FOR_HOSTAGE。
  * ⭐ 2026-10-08 实车调整: 这个宏可正可负(符号约定同 Route_MinStep), 且与 ⑨⑪ 各自独立;
  *    实车最后定的是 80 —— 即“转完 90° 后先往救援区那一侧送 80mm”。 */
-#define ROUTE_RESCUE_AFTER_TURN_MM   75     /* 车头【前进】80mm(实际约 75.5mm); 0 = 关掉这一步 */
+#define ROUTE_RESCUE_AFTER_TURN_MM   90     /* 车头【前进】80mm(实际约 75.5mm); 0 = 关掉这一步 */
 
 /* ⭐⭐ 2026-10-11 新增(用户要求): 转完 90° 后那一步(上面那个 75mm)的【冲击保护】------
  * 【为什么要】这一步是"刚掉完头、贴着边界往救援区送一段", 只有 75mm:
@@ -1745,7 +1793,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 #define TARGET_STOP_SETTLE_MS   200
 
 /* ---------- 救援(掉头) ---------- */
-#define ROUTE_14_TO_HOSTAGE_MM      /* 950 */  965  /* 救援前横移距离(mm)。⚠️ 2026-10-07 起:
+#define ROUTE_14_TO_HOSTAGE_MM      /* 950 */  985  /* 救援前横移距离(mm)。⚠️ 2026-10-07 起:
                                              * 车头先【右转 90°】, 这一段的动作由
                                              * 原来的“后退”改成“右移”(距离不变) */
 /* ⭐⭐ 2026-10-09 新增(用户要求): ④ 右移进救援区【中途插一次航向校准】 ------------
@@ -5959,9 +6007,14 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
 #if !MISSION_TEST_NO_VISION
             case TARGET_FINE_IDLE:
                 /* 已发 start_align, 等 K230 的 D:<x>,<y> / OK。
-                 * (K230 在 ALIGN_TARGET 里: 偏了发 D[只发误差大的那一个轴],
-                 *  两轴都 <50px 时才会先 "FIRE"(点激光) 再 "OK";
-                 *  若它一直对不上, 12s 自超时后只发 "OK" —— ⚠️ 此时不会点激光) */
+                 * ⭐⭐ 2026-10-11(对齐 K230 新代码 yolo_main.py):
+                 *   · 偏了就发 D:<x>,<y> —— 【两个轴都报真实值】(旧版只报误差大的那一轴);
+                 *     节奏: 每帧至少隔 ALIGN_SEND_IVL(1.0s), 发完静默 ALIGN_SETTLE(1.2s),
+                 *           若两帧误差完全相同则要等 ALIGN_RETRY_IVL(3.0s) 才重发。
+                 *   · 判成功 = |dx| 和 |dy| 都 < TARGET_ALIGN_TOL_PIX(11px) 且连续稳定
+                 *     0.4s ⇒ 那一刻它先 fire_start() 点激光 + 发 "FIRE", 紧接着发 "OK"。
+                 *   · 它一直对不上时: ALIGN_SELF_TIMEOUT(14s) 自超时 —— 也是【先发射
+                 *     再发 FIRE+OK】(⚠️ 和旧版不同: 旧版超时只回 OK、不点激光)。 */
                 /* ⭐ K230 发完 FIRE 后既不回 OK、也不再发误差 —— 给它宽限时间,
                  * 到点就当打靶完成, 免得白等到 TARGET_ID1_TIMEOUT_MS(20s) 才收尾。 */
                 if (target_fire_tick != 0 &&
@@ -6014,31 +6067,57 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                             target_fine_d_seen = 1;   /* ⭐ 2026-10-11: 摄像头能看到 ⇒ 之后"没数据"才算丢靶 */
 
                             /* ⭐ 两个轴分工: 横向(ID1 底座) / 竖直(ID4 腕部)。
-                             *    K230 每帧只发一个轴(它挑绝对值大的那个), 所以正常只一个非 0;
-                             *    这里按“先横向、后竖直”【串行】处理 —— 一次只动一个舵机,
+                             *    K230 新代码【每帧两个轴都报真实值】(见上面 fix_axis 的说明),
+                             *    所以下面按 fix_axis 决定"这一帧动哪一个" —— 一次只动一个舵机,
                              *    因为转腕部(ID4)会同时影响画面横向(横滚耦合), 同时发会互相干扰。
-                             * ⚠️ 容差用 TARGET_ALIGN_TOLERANCE(20), 与 K230 新收紧的窗口一致 */
-                            /* ⭐⭐ 2026-10-11(用户实测反馈): 【冻结带】—— 两轴都已经足够小
-                             *    (够 K230 判成功并点激光)就【不再动舵机】, 只等它的 OK/FIRE。
-                             *    为什么要: 在靶心附近还一步几码地"蹭", 舵机/腕部的余振会一直
-                             *    存在, 激光点就跟着晃 —— 实测"瞄准靶心之后 ID4 还在抖, 激光出靶子"。
-                             *    取值见 TARGET_STOP_NUDGE_TOL_PX(默认 20px, 0 = 关闭本保护)。 */
+                             * ⚠️ 容差用 TARGET_ALIGN_TOLERANCE(10), 与 K230 的 11px 窗口对齐 */
+                            /* ⭐⭐ 2026-10-11: 【冻结带】—— 两轴都已经小到 K230 能判成功
+                             *    (见 TARGET_STOP_NUDGE_TOL_PX 的取值说明)就【不再动舵机】,
+                             *    只等它的 OK/FIRE。为什么要: 在靶心附近还一步几码地"蹭",
+                             *    舵机/腕部的余振会一直存在, 激光点就跟着晃 ——
+                             *    实测"瞄准靶心之后 ID4 还在抖, 激光出靶子"。 */
                             uint8_t freeze_here =
                                 (uint8_t)(TARGET_STOP_NUDGE_TOL_PX > 0 &&
                                           abs(err_x) < (int)TARGET_STOP_NUDGE_TOL_PX &&
                                           abs(err_y) < (int)TARGET_STOP_NUDGE_TOL_PX);
 
+                            /* ⭐⭐ 2026-10-11(对齐 K230 新代码): 【本帧该修哪一轴】
+                             *   新 yolo_main.py 每帧把【两个轴都报真实值】(它自己注释里写的
+                             *   "★ 两轴都报真实值(原来只报误差大的那一轴, 另一轴填 0)"),
+                             *   所以老的"先横向、后竖直"固定顺序不再合适 —— 两轴都超窗时
+                             *   纵向永远排不上队(每帧都被横向那条分支吃掉)。
+                             *   改成:
+                             *     两轴都超窗 → 先修【误差大的】那一轴(收敛快、少走步数);
+                             *     只有一轴超窗 → 只动那一轴, 不去碰已在窗口内的轴
+                             *                     (多动一下 = 多晃一下激光)。
+                             *   ⚠️ 一次只动一个舵机: 转 ID4(腕部)会同时改变画面的横向
+                             *      (横滚耦合), 两条指令同时发会互相干扰, 所以不能并行修两轴。 */
+                            uint8_t fix_axis;   /* 0 = 冻结; 1 = 动 ID1(横向); 2 = 动 ID4(竖直) */
                             if (freeze_here) {
+                                fix_axis = 0;
+                            } else if (abs(err_x) >= TARGET_ALIGN_TOLERANCE &&
+                                       abs(err_x) >= abs(err_y)) {
+                                fix_axis = 1;
+                            } else if (abs(err_y) >= TARGET_ALIGN_TOLERANCE) {
+                                fix_axis = 2;
+                            } else {
+                                fix_axis = 1;   /* 只剩横向超窗(y 已在窗口内) */
+                            }
+
+                            if (fix_axis == 0) {
                                 if (!target_freeze_warned) {
                                     target_freeze_warned = 1;
-                                    MLOG("[靶] 两轴已进入【冻结带】±%dpx (x=%d, y=%d) -> "
-                                         "不再动 ID1/ID4, 冻结姿态等 K230 的 OK/FIRE",
-                                         (int)TARGET_STOP_NUDGE_TOL_PX, err_x, err_y);
+                                    MLOG("[靶] 两轴已进【冻结带】±%dpx (x=%d, y=%d) -> 不再动 ID1/ID4, "
+                                         "冻结姿态让 K230 连判成功(它要 |dx|,|dy| 都 <%dpx 且稳定 0.4s)后打激光; "
+                                         "若它一直不回 OK/FIRE, 就是它那边判不过 —— 见 TARGET_STOP_NUDGE_TOL_PX",
+                                         (int)TARGET_STOP_NUDGE_TOL_PX, err_x, err_y,
+                                         (int)TARGET_ALIGN_TOLERANCE);
                                 }
-                            } else if (abs(err_x) >= TARGET_ALIGN_TOLERANCE) {
+                            } else if (fix_axis == 1) {
                                 /* 画面偏左(err_x>0) 等价于接近阶段的 'L', 方向一致。
                                  * ⭐ 步长按误差大小自适应(见 Target_Id1StepFor) ——
-                                 *    一律用 60 码会在容差窗口(±50px)里来回摆。 */
+                                 *    一律用大步会在容差窗口里来回摆(窗口现在只有
+                                 *    TARGET_ALIGN_TOLERANCE=10px)。 */
                                 int32_t d1 = Target_Id1StepFor(err_x);
                                 uint8_t flip_x = 0;
 #if TARGET_FINE_MICRO_ENABLE
@@ -6075,7 +6154,9 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                                 target_sub_state = TARGET_FINE_MOVING;
                             }
 #if TARGET_FIX_DY_WITH_ID4
-                            else if (abs(err_y) >= TARGET_ALIGN_TOLERANCE) {
+                            else if (fix_axis == 2) {
+                                /* ⚠️ 走到这里 = 两轴都超窗且竖直误差更大, 或只有竖直超窗
+                                 *    (见上面 fix_axis 的说明) */
                                 /* ⭐ 竖直: y>0 = 目标偏画面下, 用 ID4(腕部) 修。
                                  *    ⚠️ 方向由 TARGET_ID4_DY_SIGN 决定(见宏注释), 实测反了就取反。
                                  *    ⭐ 步长按误差大小自适应(见 Target_Id4StepFor):
@@ -6127,9 +6208,10 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                             }
 #endif
                             else if (!target_fine_xok_warned) {
-                                /* 两个轴都进容差了 → K230 应该马上回 OK/FIRE。
-                                 * 若它还在发 D, 说明它自己还有一轴判不过去(例如 ID4 到限幅了),
-                                 * 只提示一次, 免得刷屏。 */
+                                /* ⚠️ 正常【走不到这里】: 上面 fix_axis 已经把"冻结 / 修横向 /
+                                 *    修竖直"三种情况分完了。只有把 TARGET_FIX_DY_WITH_ID4
+                                 *    关掉(=0, 竖直不修)时, "只有 y 超窗"才会落到这里 ——
+                                 *    只提示一次, 免得刷屏。 */
                                 target_fine_xok_warned = 1;
                                 MLOG("[靶] 两轴都已在容差(%dpx)内 (x=%d, y=%d), 等 K230 回 OK/FIRE; "
                                      "若一直不回, 就是 K230 那边判不通过(它现在要求 |dx| 和 |dy| 都 <%dpx)",
@@ -6192,14 +6274,28 @@ static void Handle_Vision_Alignment(uint8_t expected_task_number)
                  *    丢了就只能等到精对准超时(20s)才收尾 */
                 {
                     uint8_t ok_seen = 0;
+                    uint8_t fire_seen = 0;
                     while (Mission_GetNewLine(line, sizeof(line))) {
-                        if (strncmp(line, "OK", 2) == 0 || strncmp(line, "FIRE", 4) == 0) {
+                        if (strncmp(line, "FIRE", 4) == 0) {
+                            fire_seen = 1;
+                            ok_seen = 1;
+                        } else if (strncmp(line, "OK", 2) == 0) {
                             ok_seen = 1;
                         }
                     }
                     if (ok_seen) {
-                        MLOG("[靶] 在挪舵机期间就收到OK -> 保持姿态 %dms 后抬臂",
-                             (int)TARGET_FIRE_HOLD_MS);
+                        /* ⭐⭐ 2026-10-11: 在【舵机还在走】的时候就收到 FIRE/OK —— 说明 K230
+                         *    是在我们这一步动作【还没走完】时判的成功。这一步的剩余行程我们
+                         *    已经发出去了, 没法撤, 腕部/底座还要再动完这一段 ⇒ 激光跟着晃。
+                         *    ⚠️ 正常不该出现: K230 要"连续 2 帧(≥0.4s)都在 ±11px 内"才判成功,
+                         *       而我们每步只给 400~600ms + 静置 250ms。真出现这行就说明
+                         *       ① 步长太大, 走到半路就已经进了 K230 的窗口, 或者
+                         *       ② K230 判成功时我们刚好在动。
+                         *    对策(按优先级): 把 TARGET_ID4_STEP_FINE / TARGET_ID1_STEP_FINE
+                         *       调小, 或把 TARGET_FINE_SETTLE_MS 加大, 让它"停稳了再判"。 */
+                        MLOG("[靶] ⚠ 舵机还没走完就收到 %s -> 保持姿态 %dms 后抬臂 "
+                             "(这一步的剩余行程会让激光晃一下; 常出现就把 *_STEP_FINE 调小)",
+                             fire_seen ? "FIRE" : "OK", (int)TARGET_FIRE_HOLD_MS);
                         target_sub_state = TARGET_HOLD;
                     } else if ((HAL_GetTick() - target_id1_move_tick) >= target_fine_move_ms) {
                         target_sub_state = TARGET_FINE_IDLE;
@@ -6961,13 +7057,13 @@ static void TargetCalib_Update(void)
                     }
 #endif
                     else if (TCAL_ONLY_Y && abs(err_x) >= TARGET_ALIGN_TOLERANCE) {
-                        /* 只标竖直模式: K230 现在报的是横向(它每帧只发误差大的那个轴),
+                        /* 只标竖直模式: K230 新代码【两个轴都会报】(不再"只报误差大的那一轴"),
                          * 而我们又不许动 ID1 → 只能提示人工把靶子横向摆正 */
                         if (!s_tc_xignore_warned) {
                             s_tc_xignore_warned = 1;
                             MLOG("打靶两轴标定[只标竖直]: 现在 K230 报的是横向 x=%dpx"
-                                 " (它每帧只发误差大的那个轴); 请把靶子【横向】挪到画面中间"
-                                 "(|x|<%dpx), 它才会改报竖直误差 y",
+                                 " (新 K230 两个轴都会报); 请把靶子【横向】挪到画面中间"
+                                 "(|x|<%dpx), 免得横向误差一直占着这一步不放",
                                  err_x, (int)TARGET_ALIGN_TOLERANCE);
                         }
                     }
