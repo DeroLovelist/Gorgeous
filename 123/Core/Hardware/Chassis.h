@@ -926,6 +926,19 @@ float Chassis_GetTurnRemaining(void);
 uint32_t Chassis_GetYawGlitchCount(void);
 
 /**
+ * @brief  读取某一轮的累计位置计数 (前进为正, 已乘过 CH_ENC_DIR)
+ * @param  wheel_idx 轮序号: 0 = 左前(FL) 1 = 右前(FR) 2 = 左后(BL) 3 = 右后(BR)
+ * @retval 该轮自上电以来的累计计数; wheel_idx 非法返回 0
+ * @note   ⭐ 2026-10-11 新增: 给任务层做"这一步到底走了多少毫米"的核对 ——
+ *         四次调用取平均再除以 CH_COUNTS_PER_MM 就是净位移, 能一眼区分
+ *         "指令发了但车没动"和"动了但没看清"(见 MissionControl.c 的 Route_MinStep)。
+ *         ⚠️ 这里返回的是【位置】, 要算某一段的位移必须在发指令前存一份基准再相减;
+ *            主循环 I/ENC 打印的 M1~M4 是【电机原始计数】, 极性与本函数相反
+ *            (CH_ENC_DIR 里 FL/FR/BL 是 -1, 只有 BR 是 +1), 别直接拿来对比。
+ */
+int32_t Chassis_GetWheelCount(uint8_t wheel_idx);
+
+/**
  * @brief  读取当前估计的 yaw 静止漂移率 (度/秒, 调试用)
  * @note   ⭐ 2026-10-11: 车静止时真航向不可能变 ⇒ 这段时间的 yaw 变化率 = 漂移率
  *         (含噪声)。用来判"车头偏是不是温漂": ≲0.05°/s = 不是(机械/打滑);

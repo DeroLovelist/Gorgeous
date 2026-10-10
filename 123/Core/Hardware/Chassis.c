@@ -1879,6 +1879,16 @@ uint32_t Chassis_GetYawGlitchCount(void)
     return s_yaw_glitches;
 }
 
+/* ⭐ 2026-10-11 新增: 取某轮"前进为正"的累计位置计数(见 Chassis.h 的声明注释) */
+int32_t Chassis_GetWheelCount(uint8_t wheel_idx)
+{
+    if (wheel_idx >= W_NUM)
+    {
+        return 0;
+    }
+    return s_pos[wheel_idx];
+}
+
 void Chassis_SteerDebugLog(void)
 {
     elog_i("STEER", "on=%d err=%.2f P=%.2f I=%.2f D=%.2f out=%.2f integ=%.1f",

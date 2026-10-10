@@ -3303,11 +3303,21 @@ static void Route_MinStep(int32_t mm)
 {
     uint32_t t0;
     float yaw_before;
+    int32_t cnt_before;
+    int32_t cnt_after;
+    int32_t moved_mm;
 
     if (mm == 0) {
         return;   /* 关掉这一步: 直接回“到位就直接转正”的老行为 */
     }
     yaw_before = Chassis_GetYaw();   /* 平移那段攒下的航向偏差(挪之前) */
+    /* ⭐⭐ 2026-10-11 新增(用户反馈"转弯后看不到车往前走"): 发指令前记一份四轮
+     *   平均位置, 走完再相减 → 日志里直接给出【实测走了多少毫米】。
+     *   为什么要: 光看"耗时 900ms" 分不清"指令发了没动"和"动了几十毫米没看清"
+     *   (底盘自己的 MOVE 日志不会打印, 见下)。四轮取平均 = 平移净位移;
+     *   若实测远小于请求值, 那才是真的没走(该查限速/死区/打滑/被转向环顶掉)。 */
+    cnt_before = (Chassis_GetWheelCount(0) + Chassis_GetWheelCount(1) +
+                  Chassis_GetWheelCount(2) + Chassis_GetWheelCount(3)) / 4;
     t0 = HAL_GetTick();
     if (mm > 0) {
         Chassis_Move_Forward(mm);
@@ -3317,16 +3327,31 @@ static void Route_MinStep(int32_t mm)
     while (!Chassis_Task_Is_Complete() && (HAL_GetTick() - t0) < 3500u) {
         Mission_Coop_Wait(20);
     }
+    cnt_after = (Chassis_GetWheelCount(0) + Chassis_GetWheelCount(1) +
+                 Chassis_GetWheelCount(2) + Chassis_GetWheelCount(3)) / 4;
+    moved_mm = (int32_t)((float)(cnt_after - cnt_before) / CH_COUNTS_PER_MM
+                         + ((cnt_after >= cnt_before) ? 0.5f : -0.5f));
     /* 这一步【必须】自己打日志: 底盘的 MOVE 行是中断里攒、由
      * Chassis_FlushPendingLog() 打印的, 而那个函数本工程【没有任何地方调用】
      * (既有问题, 不是这次改的) ⇒ 这一段挪的距离不会自己出现在日志里。
      * 读这两个 yaw: 挪之前 = 这段平移攒了多少航向偏差; 挪之后 = 这一步
      * 被航向保持纠掉/带偏了多少(剩下的交给紧接着的转正动作)。
-     * ⭐ 日志里带“车头前进/车头后退”字样, 实车一眼就能核对方向有没有给反。 */
-    MLOG("救援: 纠正前先挪 %dmm(%s; 耗时 %lums; yaw %.1f° -> %.1f°)",
-         (int)mm, (mm > 0) ? "车头前进" : "车头后退",
+     * ⭐ 日志里带“车头前进/车头后退”字样, 实车一眼就能核对方向有没有给反;
+     *    “实测”是四轮计数反算出来的真实位移, 正常应 ≈ 请求值(差 3~5mm 属死区)。 */
+    MLOG("救援: 纠正前先挪 %dmm(%s; 实测 %+dmm; 耗时 %lums; yaw %.1f° -> %.1f°)",
+         (int)mm, (mm > 0) ? "车头前进" : "车头后退", (int)moved_mm,
          (unsigned long)(HAL_GetTick() - t0),
          (double)yaw_before, (double)Chassis_GetYaw());
+    /* 实测明显不足(不足请求的 70%)= 指令发了但车几乎没走, 单独立一条醒目的警告,
+     * 免得淹没在上面那行里(常见原因: 被转向环的差速顶掉 / 轮子打滑 / 顶到边界)。 */
+    if (moved_mm < 0) moved_mm = -moved_mm;
+    {
+        int32_t want = (mm < 0) ? -mm : mm;
+        if (moved_mm * 10 < want * 7) {
+            MLOG("⚠ 救援: 这一步只走了 %dmm(请求 %dmm) —— 检查限速/死区/打滑, 或上传日志核对",
+                 (int)moved_mm, (int)want);
+        }
+    }
 }
 
 /* ================= 机械臂动作序列 ================= */
