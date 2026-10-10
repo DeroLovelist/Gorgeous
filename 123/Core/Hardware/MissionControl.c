@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file    MissionControl.c
  * @brief   比赛任务主状态机(适配本 STM32F407 工程)
  *
@@ -1579,6 +1579,10 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *    转向更有力) 或调小底盘到位死区 CH_POS_THRESHOLD_COUNT —— 那是另一条路,
  *    改完可以把这个门槛调小试试。 */
 #define TURN_SKIP_DEG                2.0f
+
+/* ⭐⭐ 2026-10-11(用户要求): 航向保持两套方案的总开关 —— 已上移到
+ *    MissionControl.h(项目级开关: main.c 里"是否注入 gz / 是否读 GZ / 是否打
+ *    GBIAS 日志"也要看它), 这里不再重复定义。详见 MissionControl.h 里的说明。 */
 
 /* ---------- 打靶路线 (2026-10-04 改版后只剩两段真正在用) ----------
  * ⭐ 2026-10-09: 每一段右移都【对半拆开走】(实测: 一次右移 850mm 会攒下约 5° 航向误差,
@@ -7248,7 +7252,10 @@ void Mission_Update(void)
              *    ⚠️ Route_MinStep 内部【阻塞等到位】, 所以紧接着发转向是安全的;
              *       转向到位由转移检查里的 Chassis_Task_Is_Complete() 等。 */
             case STATE_11A_HEADING_CORRECT:
-                Chassis_GyroBias_Start();   /* ⭐ 2026-10-11: 排爆后起锚 —— 打靶平移段开始零偏在线估计 */
+#if GYRO_BIAS_TGT_ON
+                /* ⭐ 方案②且在打靶走位段启用: 排爆后起锚, 打靶平移段开始零偏在线估计 */
+                Chassis_GyroBias_Start();
+#endif
                 MLOG("排爆后: 航向校正(先挪 %+dmm, 再转到 0°)", (int)ROUTE_BOMB_AFTER_STEP_MM);
                 Route_MinStep(ROUTE_BOMB_AFTER_STEP_MM);
                 /* ⭐⭐ 2026-10-11(用户要求): 改成"转到位 → 停稳 → 再压一次"的阻塞式写法。
@@ -7487,7 +7494,10 @@ void Mission_Update(void)
              *    ⚠️ 必须同时把【航向基准】改成 -90°: 下面④的 Chassis_Move_Right
              *       是靠“航向保持”走直线的, 基准还是 0° 的话车会被一路拽回原朝向。 */
             case STATE_14_MOVE_FORWARD_B:
-                Chassis_GyroBias_Stop();    /* ⭐ 2026-10-11: 打靶平移段结束停锚 —— 救援段恢复用原始 yaw */
+#if GYRO_BIAS_TGT_ON
+                /* ⭐ 方案②且在打靶走位段启用: 打靶平移段结束停锚, 救援段恢复用原始 yaw */
+                Chassis_GyroBias_Stop();
+#endif
                 Chassis_SetHeadingRef(RESCUE_HEADING_DEG);
                 Chassis_Rotate_To(RESCUE_HEADING_DEG);
                 MLOG("救援①: 车头右转 90° -> 目标航向 %.1f° (航向基准已同步)",
@@ -7511,7 +7521,11 @@ void Mission_Update(void)
              *    (那时横移的航向保持会拿残余角当基准 → 越走越斜)。
              *    ⚠️ 顺序是“先到位、后计时”, 不是“最多等 3 秒”。 */
             case STATE_15C_RESCUE_ALIGN_SETTLE:
-                Chassis_GyroBias_Start();   /* ⭐ 2026-10-11: 救援区起锚 —— 停稳这一段先做 ZUPT, 右移走 trim 加速 + 零偏估计 */
+#if GYRO_BIAS_TGT_ON
+                /* ⭐ 方案②且在打靶走位段启用: 救援区停稳期间顺手起锚(先做 ZUPT),
+                 *    这样后面的 ④ 右移就已经有零偏估计了(与救援区右移同一套) */
+                Chassis_GyroBias_Start();
+#endif
                 Chassis_Stop();
                 s_rescue_align_tick = HAL_GetTick();
                 MLOG("救援③: 航向已校准到位, 原地停稳 %dms 再右移 (当前 yaw=%.1f°, 目标 %.1f°)",
@@ -7591,6 +7605,13 @@ void Mission_Update(void)
              *       只按绝对角把车头摆正(-90°, 顺带重同步航向基准), 让后面 1614mm 长距离更直;
              *    ⑩ 那一步才是一次性连续右移(⑩+⑫ 合并), 中途不再停车、不再校正。 */
             case STATE_17_RESCUE_RIGHT_B:
+#if GYRO_BIAS_TAIL_ON
+                /* ⭐⭐ 2026-10-11(用户要求): 【抓取人质后】才启用陀螺仪零偏方案 ——
+                 *    从这一步(⑥ 抓完后的第 1 个状态)起锚, 一路用到终点(⑫ 停锚)。
+                 *    起锚时会把软件航向 corrected_yaw 对齐到当前航向, 所以紧接着的
+                 *    Heading_AlignTo(-90°) 和后面的右移都以它为基准, 不会跳变。 */
+                Chassis_GyroBias_Start();
+#endif
                 MLOG("救援: 抓完人质 -> 先原地校一次航向(挪步 %+dmm, 目标 %.1f°)",
                      (int)ROUTE_RESCUE_FWD_MM, (double)RESCUE_HEADING_DEG);
                 Route_MinStep(ROUTE_RESCUE_FWD_MM);
@@ -7704,7 +7725,11 @@ void Mission_Update(void)
                 Heading_AlignTo(RESCUE_HEADING_DEG);
                 break;
             /* ⑫ 停下 → 结束(转移里置 MISSION_STATE_COMPLETE) */
-            case STATE_19_RESCUE_RIGHT_D:          break;
+            case STATE_19_RESCUE_RIGHT_D:
+#if GYRO_BIAS_TAIL_ON
+                Chassis_GyroBias_Stop();   /* ⭐ 2026-10-11: 任务走完, 停锚恢复默认(trim 步长也回默认) */
+#endif
+                break;
 
             /* ⚠️ 下面这几个状态本流程不再经过(留空防误入) */
             case STATE_16A_RESCUE_HEADING_CORRECT: break;   /* 未使用 */

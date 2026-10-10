@@ -70,6 +70,38 @@
 #define CHASSIS_ENC_CALIB        0
 #define ENC_CALIB_DIST_MM        1000   /* 标定时人工推车的距离(mm), 自己用卷尺量准 */
 
+/* =====================================================================
+ * ⭐⭐ 2026-10-11(用户要求): 航向保持的【两套方案】总开关 (二选一, 绝不混用)
+ * ---------------------------------------------------------------------
+ * 方案① GYRO_BIAS_SCHEME = 0 (★默认): 本地源文件现有做法 ——
+ *        航向保持用【原始 yaw(过了跳变合理性检查)】+ trim 纠偏;
+ *        Chassis 里的陀螺仪零偏估计【一次都不会起锚】(s_gyro_bias_on 恒 0),
+ *        连 gz 数据源注入 / 每 20ms 读 GZ / GBIAS 日志 都编译掉了
+ *        ⇒ 行为与"移植零偏代码之前"逐字节一致。
+ * 方案② GYRO_BIAS_SCHEME = 1: 用零偏估计出来的 corrected_yaw 做航向保持
+ *        (gyro_z − bias 软件积分), 抵消 bias 被 JY61P 内部积分造成的 yaw 虚增
+ *        —— 逻辑与分支 ver/tuoluoyi 的提交 f8106e7「改好了陀螺仪」一致。
+ * 【作用范围】方案② 下再选"哪些段用", 两个子开关独立(默认: 只在抓取人质后):
+ *        GYRO_BIAS_SCOPE_TAIL   = 1  抓取人质后 → 终点(⑥⑧⑩⑫ 那一段)
+ *        GYRO_BIAS_SCOPE_TARGET = 0  打靶走位段(排爆后 → 救援前) —— 默认不用,
+ *                                    打靶段仍走方案① 的现有做法
+ * 【起锚/停锚】由 MissionControl.c 的状态机按上面的开关调 GyroBias_Start/Stop;
+ *   两个方案的切换只有一个变量(Chassis 内部的 s_gyro_bias_on), 结构上不可能混用。
+ * ⚠️ 只想整体回到方案①: GYRO_BIAS_SCHEME 置 0(一行)。
+ * ⚠️ 想让打靶走位段也用方案②: SCHEME=1 + SCOPE_TARGET=1。
+ * ===================================================================== */
+#define GYRO_BIAS_SCHEME            0     /* 0 = 方案①本地现有(★默认); 1 = 方案②陀螺仪零偏 */
+#define GYRO_BIAS_SCOPE_TAIL        1     /* 方案②下: 抓取人质后→终点 是否启用 */
+#define GYRO_BIAS_SCOPE_TARGET      0     /* 方案②下: 打靶走位段 是否启用 */
+
+#if GYRO_BIAS_SCHEME
+#define GYRO_BIAS_TAIL_ON           GYRO_BIAS_SCOPE_TAIL
+#define GYRO_BIAS_TGT_ON            GYRO_BIAS_SCOPE_TARGET
+#else
+#define GYRO_BIAS_TAIL_ON           0     /* 方案①: 一律不起锚 */
+#define GYRO_BIAS_TGT_ON            0
+#endif
+
 #if MISSION_DEBUG_ARM_SEQ && MISSION_TEST_NO_ARM
 #error "MISSION_DEBUG_ARM_SEQ 需要 MISSION_TEST_NO_ARM=0 (机械臂必须启用)"
 #endif

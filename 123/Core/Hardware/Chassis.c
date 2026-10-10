@@ -984,8 +984,11 @@ void Chassis_Update_Control(void)
 
     float dt = CH_CTRL_PERIOD_MS / 1000.0f;
 
-    /* ⭐ 2026-10-11: 陀螺仪零偏在线估计(ZUPT + 编码器辅助) —— 在航向保持之前更新 bias/corr_yaw */
+    /* ⭐ 2026-10-11: 陀螺仪零偏在线估计(ZUPT + 编码器辅助) —— 在航向保持之前更新 bias/corr_yaw。
+     * ⚠️ 用 CH_GYRO_BIAS_ENABLE 包住: 关闭时连这几次浮点运算都不做(与移植前完全一致)。 */
+#if CH_GYRO_BIAS_ENABLE
     gyro_bias_update(dt);
+#endif
 
     /* ⭐⭐ 2026-09-30/10-01: "卡住"检测 (位置环与航向环都用它)
      * 判定: 连续 CH_STALL_DETECT_CYCLES 个周期都满足

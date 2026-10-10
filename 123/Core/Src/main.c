@@ -306,7 +306,11 @@ int main(void)
   if (jy61p != NULL)
   {
     Chassis_SetYawSource(&jy61p->var.yaw);     /* 注入航向角数据源(转向闭环用) */
-    Chassis_SetGyroZSource(&jy61p->var.gz);    /* ⭐ 2026-10-11: 注入 z 轴角速度源(零偏在线估计用) */
+#if GYRO_BIAS_SCHEME
+    /* ⭐ 2026-10-11: 注入 z 轴角速度源(零偏在线估计用)。
+     * ⚠️ 只在【方案②】下注入 —— 方案①(默认)连数据源都不给, 保证零偏模块完全不工作。 */
+    Chassis_SetGyroZSource(&jy61p->var.gz);
+#endif
   }
   Chassis_Init();
   /* ⭐ 底盘最大平移速度(mm/s): 整场比赛所有走位的默认“车速”。
@@ -566,8 +570,11 @@ int main(void)
       if (HAL_GetTick() >= JY_WARMUP_MS)
       {
         JY61P_ReadYaw();
-        /* ⭐ 2026-10-11: 同步读 z 轴角速度, 供零偏在线估计(ZUPT/编码器辅助)用 */
+#if GYRO_BIAS_SCHEME
+        /* ⭐ 2026-10-11: 同步读 z 轴角速度(零偏在线估计用)。
+         * ⚠️ 只在方案②下读 —— 方案①不增加任何 I2C 事务, 时序与原来完全一致。 */
         if (jy61p != NULL) jy61p->fun->GZ_GET(jy61p);
+#endif
       }
     }
 
@@ -632,7 +639,9 @@ int main(void)
              (long)Encoder_GetCount(1), (long)Encoder_GetCount(2),
              (long)Encoder_GetCount(3), (long)Encoder_GetCount(4));
       Chassis_HeadingDebugLog();
+#if GYRO_BIAS_SCHEME
       Chassis_GyroBias_DebugLog();   /* ⭐ 2026-10-11: 零偏估计 on/bias/corr/yaw/cyaw/slip */
+#endif
       Chassis_SteerDebugLog();   /* 转向环 PID: err/P/I/D/out/积分值 */
     }
 #endif
