@@ -265,6 +265,8 @@ extern "C" {
  * --------------------------------------------------------------------- */
 #define CH_HEADING_TRIM_MAX         215//250              /* 微调量绝对上限 (计数, 0=关闭) */
 #define CH_HEADING_TRIM_STEP       2// 3               /* 每周期微调量最大变化 (计数/周期) */
+#define CH_HEADING_TRIM_STEP_TARGET 5                 /* ⭐ 排爆区后打靶段专用: 起锚期间 trim 步长(更快建立
+                                                       * 纠偏, 治横移稳态误差); 停锚恢复 CH_HEADING_TRIM_STEP。 */
 /* ---------------------------------------------------------------------
  * ⭐ 2026-09-30 新增: 段末"卡住"检测 (航向环的抗饱和)
  * ---------------------------------------------------------------------
@@ -372,6 +374,28 @@ extern "C" {
 #define CH_SYNC_MAX                 12      /* 2026-10-01: 10 → 12 (上限别超 13!) */
 
 /* ---------------------------------------------------------------------
+ * ⭐ 2026-10-11 陀螺仪零偏在线估计 (ZUPT + 编码器辅助)
+ * ---------------------------------------------------------------------
+ * 背景: 排爆区之后的打靶平移段, 陀螺仪零偏 bias(静止时读数≠0)会被 JY61P
+ *   内部积分进 yaw → yaw 虚增 → 航向保持环误以为车头歪了, 反向"纠正"把车
+ *   真的拧斜。这里按 ZUPT 思路在平移段在线估计 bias, 并用修正后的角速度
+ *   (gyro_z - bias) 软件积分出 corrected_yaw, 供【平移段】航向保持用。
+ * ⚠️ 只修 bias, 不修 yaw: 不改硬件 yaw 读数、不重置、不钳位、不用低通冒充。
+ * 手段:
+ *   ① 静止(ZUPT): 真实角速度=0 → 取 gyro_z 均值 = bias;
+ *   ② 平移直行:   编码器差速 omega_enc 与 (gyro_z-bias) 比对, 乘小 Ki 慢修;
+ *   ③ 转弯/打滑:  暂停 bias 更新。
+ * 生效范围: 只由 MissionControl 在 STATE_11A(排爆后) 起锚、STATE_14(救援前)
+ *   停锚; 其他阶段 s_gyro_bias_on=0 → 航向保持仍用原始 yaw(原行为不变)。
+ * --------------------------------------------------------------------- */
+#define CH_GYRO_BIAS_ENABLE             1      /* 总开关: 0=完全关闭(原行为), 1=启用 */
+#define CH_GYRO_BIAS_ZUPT_SAMPLES       25     /* 静止均值样本数 (控制周期 20ms → 25≈0.5s) */
+#define CH_GYRO_BIAS_STATIC_SPEED       2      /* 判"静止"的速度阈值 (计数/周期, 低通后) */
+#define CH_GYRO_BIAS_ENC_Ki             0.02f  /* 编码器辅助慢修增益 (很小, 慢修) */
+#define CH_GYRO_BIAS_SLIP_THRESH_DPS    20.0f  /* 打滑判据: |gyro_z-bias-omega_enc| 超过则暂停 (°/s) */
+#define CH_ENC_OMEGA_COUNTS_PER_RAD     1500.0f/* 编码器 wk(计数) → rad 换算 (经验标定) */
+
+/* ---------------------------------------------------------------------
  * 航向保持 (陀螺仪): 运动时实时修正车头方向漂移(输出为速度环偏置)。
  * ⭐ 已改为"分段参数": 直行与平移各一套 —— 见 Chassis.c 顶部的
  *    ChassisPidCfg_t / s_cfg_straight(直行, 已调好勿动) / s_cfg_strafe(平移, 调这个)。
@@ -395,6 +419,54 @@ void Chassis_Init(void);
  * @param yaw_addr 若为 NULL 则禁用转向功能
  */
 void Chassis_SetYawSource(const float *yaw_addr);
+
+/* ---------------- 陀螺仪零偏在线估计 (ZUPT, 2026-10-11) ---------------- */
+
+/**
+ * @brief 注入陀螺仪 z 轴角速度数据源 (指向 jy61p->var.gz 的地址, 单位: 度/秒)
+ * @param gz_addr 若为 NULL 则零偏估计模块不工作
+ */
+void Chassis_SetGyroZSource(const float *gz_addr);
+
+/**
+ * @brief 起锚: 使能零偏估计 (仅在排爆区后打靶平移段调用, 见 MissionControl.c)
+ * @note  会把软件积分航向 corrected_yaw 对齐到当前硬件 yaw;
+ *        内部受 CH_GYRO_BIAS_ENABLE 总开关约束
+ */
+void Chassis_GyroBias_Start(void);
+
+/**
+ * @brief 停锚: 关闭零偏估计, 航向保持恢复使用原始 yaw
+ */
+void Chassis_GyroBias_Stop(void);
+
+/**
+ * @brief 零偏估计当前是否已起锚 (调试用)
+ */
+bool Chassis_GyroBias_IsOn(void);
+
+/**
+ * @brief 读取当前零偏估计值 (度/秒)
+ */
+float Chassis_GetGyroBias(void);
+
+/**
+ * @brief 读取软件积分航向 corrected_yaw (度)
+ */
+float Chassis_GetCorrectedYaw(void);
+
+/**
+ * @brief 打印零偏估计调试信息 (bias / corrected / yaw / corrected_yaw), 供诊断
+ * @note  需在主循环中周期调用, 勿在中断中调用
+ */
+void Chassis_GyroBias_DebugLog(void);
+
+/**
+ * @brief 设置航向保持 trim 的每周期限幅 (计数/周期)
+ * @param step 每周期 trim 最大变化量; 排爆区后起锚时设 CH_HEADING_TRIM_STEP_TARGET,
+ *             停锚恢复 CH_HEADING_TRIM_STEP
+ */
+void Chassis_SetHeadingTrimStep(int32_t step);
 
 /**
  * @brief 设置底盘最大平移速度

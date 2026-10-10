@@ -1022,7 +1022,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  *      → ⑤右移 ROUTE_14_TO_HOSTAGE_MM(进救援区, ⭐ 现在拆两段、中途校一次)
  *        → 停等3s → 摆 HOSTAGE_LOOK
  * ⚠️ 走到②时车头还是 0° ⇒ 用的是“后退”(Chassis_Move_Backward)。 */
-#define ROUTE_12_P2_BACK_MM         25
+#define ROUTE_12_P2_BACK_MM         25       /* 2026-10-11 用户要求: 放完球后的后退值归 0 */
                                            
 #define ROUTE_12_P2_B_MM            200    /* (已废弃) */
 #define ROUTE_12_P2_C_MM            200    /* (已废弃) */
@@ -1108,6 +1108,12 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
 #define ROUTE_17_RIGHT_B_MM         650    /* ⭐ 抓完后第 1 段右移(mm)(原来叫“后退”) */
 #define ROUTE_18_RIGHT_C_MM         /* 890 */  964    /* ⭐ 抓完后第 2 段右移(mm)(原来叫“后退”) */
 
+/* ⭐⭐ 2026-10-11 救援撒退段降速: 抱人质后重心偏移, 350mm/s 横移刮地扰动大 +
+ *   段末单对角甩尾大(实测 53 段段末甩 +5.9°)。撒退两段(51/53)降到 200 减小扰动
+ *   与甩尾; 200 时 max_vel≈26.5 > 转向限幅 22, 不影响 52/54 的转向速度。 */
+#define ROUTE_RESCUE_RETURN_SPEED_MMPS   250   /* 撒退段车速(mm/s): 2026-10-11 由 200 提到 250 */
+#define ROUTE_DEFAULT_SPEED_MMPS         350   /* 默认车速(mm/s), 与 main.c Chassis_SetMaxSpeed(350) 一致 */
+
 /* ⭐⭐ 救援段(阶段四): ② 【转完 90° 之后】航向校准前的“挪最小一步”(mm) ----------
  *  作用状态 = STATE_15_TURN_FOR_HOSTAGE(即“①转完 90° → ②校准”里的 ②),
  *  位置在“转完 → 挪一步 → 校准 → 停稳 → 右移进救援区”之间, 也就是:
@@ -1143,7 +1149,7 @@ static uint16_t hold_time = 500;    /* 机械臂动作间停顿(ms) */
  * ⚠️ 底盘到位死区 ≈ CH_POS_THRESHOLD_COUNT(30 计数) ≈ 4.5mm ⇒
  *      【实际位移 ≈ |本值| − 4.5mm】: 填 6 → 实际约 1.5mm。
  *      ⚠️ 绝对值别小于 6 —— 会被死区吃掉、等于没动(还白等一次)。 */
-#define ROUTE_RESCUE_FWD_MM         -30     /* ⑨: 车头前进 6mm */
+#define ROUTE_RESCUE_FWD_MM         0       /* ⑨: 原 -30(后退), 2026-10-11 用户要求改 0 = 不挪步 */
 #define ROUTE_RESCUE_LAST_STEP_MM   0    /* ⑪(最后一次): 车头前进 6mm。
                                            * 负数 = 后退; 0 = 关掉这一步。 */
 
@@ -2429,6 +2435,7 @@ void Mission_Init(void)
     Chassis_SyncTarget();
     /* ⭐ 平移时的航向基准 = 0°(与全程各处 "航向校正到 0°" 一致)。
      * 以前是每段平移各自以"当前朝向"为基准 → 校不完的误差被继承, 越跑越偏 */
+    Chassis_GyroBias_Stop();      /* ⭐ 复位零偏估计(回未起锚状态), 保证干净上电 */
     Chassis_SetHeadingRef(0.0f);
     Chassis_Stop();
     Laser_Off();
@@ -5433,6 +5440,7 @@ void Mission_Update(void)
              *    ⚠️ Route_MinStep 内部【阻塞等到位】, 所以紧接着发转向是安全的;
              *       转向到位由转移检查里的 Chassis_Task_Is_Complete() 等。 */
             case STATE_11A_HEADING_CORRECT:
+                Chassis_GyroBias_Start();   /* ⭐ 排爆后起锚: 打靶平移段开始零偏在线估计 */
                 MLOG("排爆后: 航向校正(先挪 %+dmm, 再转到 0°)", (int)ROUTE_BOMB_AFTER_STEP_MM);
                 Route_MinStep(ROUTE_BOMB_AFTER_STEP_MM);
                 Turn_Angle_Compat(0.1f);
@@ -5589,6 +5597,7 @@ void Mission_Update(void)
              *    ⚠️ 必须同时把【航向基准】改成 -90°: 下面④的 Chassis_Move_Right
              *       是靠“航向保持”走直线的, 基准还是 0° 的话车会被一路拽回原朝向。 */
             case STATE_14_MOVE_FORWARD_B:
+                Chassis_GyroBias_Stop();    /* ⭐ 打靶平移段结束停锚: 救援段恢复用原始 yaw */
                 Chassis_SetHeadingRef(RESCUE_HEADING_DEG);
                 Chassis_Rotate_To(RESCUE_HEADING_DEG);
                 MLOG("救援①: 车头右转 90° -> 目标航向 %.1f° (航向基准已同步)",
@@ -5607,6 +5616,7 @@ void Mission_Update(void)
              *    (那时横移的航向保持会拿残余角当基准 → 越走越斜)。
              *    ⚠️ 顺序是“先到位、后计时”, 不是“最多等 3 秒”。 */
             case STATE_15C_RESCUE_ALIGN_SETTLE:
+                Chassis_GyroBias_Start();   /* ⭐ 救援区起锚: 停稳 2s 先做 ZUPT, 右移走 trim 加速 + 零偏估计 */
                 Chassis_Stop();
                 s_rescue_align_tick = HAL_GetTick();
                 MLOG("救援③: 航向已校准到位, 原地停稳 %dms 再右移 (当前 yaw=%.1f°, 目标 %.1f°)",
@@ -5652,7 +5662,10 @@ void Mission_Update(void)
             case STATE_20_PERFORMING_HOSTAGE_RESCUE: break;
             /* ⑧⑨⑩⑪ 抓完后的撒退: 右移650 → 航向 → 右移890 → 航向
              * (原来是“后退 ×2”; 车头已右转 90°, 所以右移 = 原来的后退方向) */
-            case STATE_17_RESCUE_RIGHT_B:          Chassis_Move_Right(ROUTE_17_RIGHT_B_MM); break;
+            case STATE_17_RESCUE_RIGHT_B:
+                Chassis_SetMaxSpeed(ROUTE_RESCUE_RETURN_SPEED_MMPS);   /* ⭐ 撒退段降速 */
+                Chassis_Move_Right(ROUTE_17_RIGHT_B_MM);
+                break;
             case STATE_17A_RESCUE_HEADING_CORRECT:
                 Route_MinStep(ROUTE_RESCUE_FWD_MM);   /* ⭐ 转正前先挪一步(+6 = 车头前进) */
                 Heading_AlignTo(RESCUE_HEADING_DEG);
@@ -5664,7 +5677,10 @@ void Mission_Update(void)
                 Heading_AlignTo(RESCUE_HEADING_DEG);
                 break;
             /* ⑫ 停下 → 结束(转移里置 MISSION_STATE_COMPLETE) */
-            case STATE_19_RESCUE_RIGHT_D:          break;
+            case STATE_19_RESCUE_RIGHT_D:
+                Chassis_GyroBias_Stop();      /* ⭐ 救援区停锚 */
+                Chassis_SetMaxSpeed(ROUTE_DEFAULT_SPEED_MMPS);   /* ⭐ 恢复默认车速(下次任务从 350 开始) */
+                break;
 
             /* ⚠️ 下面这几个状态本流程不再经过(留空防误入) */
             case STATE_16A_RESCUE_HEADING_CORRECT: break;   /* 未使用 */

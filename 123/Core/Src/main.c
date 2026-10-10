@@ -305,7 +305,8 @@ int main(void)
   /* ---- 底盘运动控制（麦克纳姆轮, 位置闭环） ---- */
   if (jy61p != NULL)
   {
-    Chassis_SetYawSource(&jy61p->var.yaw);   /* 注入航向角数据源(转向闭环用) */
+    Chassis_SetYawSource(&jy61p->var.yaw);     /* 注入航向角数据源(转向闭环用) */
+    Chassis_SetGyroZSource(&jy61p->var.gz);    /* 注入 z 轴角速度数据源(零偏估计用) */
   }
   Chassis_Init();
   /* ⭐ 底盘最大平移速度(mm/s): 整场比赛所有走位的默认“车速”。
@@ -565,6 +566,7 @@ int main(void)
       if (HAL_GetTick() >= JY_WARMUP_MS)
       {
         JY61P_ReadYaw();
+        if (jy61p != NULL) jy61p->fun->GZ_GET(jy61p);   /* ⭐ 同步读 gyro_z, 供零偏在线估计用 */
       }
     }
 
@@ -625,6 +627,7 @@ int main(void)
              (long)Encoder_GetCount(1), (long)Encoder_GetCount(2),
              (long)Encoder_GetCount(3), (long)Encoder_GetCount(4));
       Chassis_HeadingDebugLog();
+      Chassis_GyroBias_DebugLog();   /* ⭐ 零偏估计: bias / corrected / yaw / cyaw */
       Chassis_SteerDebugLog();   /* 转向环 PID: err/P/I/D/out/积分值 */
     }
 #endif
