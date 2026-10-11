@@ -65,6 +65,30 @@
 #define GYRO_BIAS_RESCUE_ON         0     /* 方案① 或 本段不启用: 一律不起锚 */
 #endif
 
+/* ⭐⭐ 2026-10-11 修"抓取人质之后航向校准偏得很严重": 【起锚后必须先静置一段, 让 ZUPT 估出零偏】
+ * 【为什么必须有这一段】方案②的本质是把航向换成软件积分:
+ *       corrected_yaw = ∫(gyro_z − bias)·dt
+ *   起锚那一刻 bias 还是【0】、corrected_yaw 只是"对齐到当前硬件 yaw"。要把 bias 估出来只有两条路:
+ *     ① ZUPT: 车静止时真实角速度=0 ⇒ 取 gyro_z 均值当 bias。Chassis 侧需要
+ *        【连续 CH_GYRO_BIAS_ZUPT_SAMPLES(25) 个控制周期(20ms)= 500ms】都判"静止";
+ *     ② 编码器辅助: 直行时用轮速差反算角速度慢修 bias —— ⚠️ 但它在【横移】时被主动禁用
+ *        (麦轮辊子侧向打滑会把 omega_enc 污染, 见 s_move_is_strafe)。
+ *   而救援撤退段走的正是【右移(横移)】⇒ ②全程关闭 ⇒ 【只剩 ZUPT 这条路】。
+ * 【原来的坑】起锚点从 STATE_15C 挪到 STATE_17 之后, 这一步的动作是"校航向 + 立刻右移":
+ *   若那次校航向被 TURN_SKIP_DEG(2°) 跳过 ⇒ 车一步都没停, 直接开始横移 ⇒
+ *   ZUPT 一个样本都收不到 ⇒ bias 恒为 0 ⇒ corrected_yaw 拿【没扣零偏】的 gyro_z 积分,
+ *   一路漂; 横移又不用编码器辅助 ⇒ 整段都没有任何机会把 bias 修回来。
+ *   量级: 零偏 1°/s 时, 最后那 8s 就白漂 8° —— 航向保持会一路把车往回拽,
+ *   表现出来就是"抓完人质之后校准偏得很严重"。
+ * 【取值】1200ms。分解: 前 ~200ms 等 |轮速| 低通值(s_speed_filt, IIR α=1/4)从"刚停"
+ *   衰减到 < CH_GYRO_BIAS_STATIC_SPEED(2), 之后 ZUPT 才可能开始计数; 再 25 个周期
+ *   (500ms) 采满样本; 余下 ~500ms 是余量。0 = 关掉这段静置(不推荐, 等于回到上面那个坑)。
+ *   ⚠️ 别按"500ms 就够"来设 —— 轮速低通没落下去的那几拍 ZUPT 是【不计数】的。
+ *   ⚠️ 起锚点到真正开始移动之间【必须】有 ≥500ms 静止, 否则方案②等于没用。
+ *   ⚠️ 只有 STATE_17 这个起锚点需要补: STATE_15C 那个起锚点后面本来就跟着
+ *      RESCUE_ALIGN_SETTLE_MS(3000ms) 原地停稳, ZUPT 天然够(RESCUE_ON=1 时)。 */
+#define GYRO_BIAS_ZUPT_WAIT_MS      1200
+
 /* ================= 全局变量定义 ================= */
 volatile MissionState_t g_mission_state = MISSION_STATE_IDLE;   // 任务状态机当前状态
 volatile uint8_t g_vision_task_in_progress = 0;                 // 视觉子状态机任务号 (0=无任务, 1=排爆, 2=打靶, 3=救援)
@@ -106,7 +130,7 @@ char g_qr_code_string[8];                                       // 扫码结果�
  * ⚠️ 嫌总时间太长 → 按比例调这三个宏(例如 2900/2300/2900 + hold 500)。
  * ⚠️ 想完全回退到改之前: 三个宏改回 2500/2000/2500, ARM_HOLD_MS_GRAB 改回 450。 */
 #define ARM_GRAB_PRE_MS             3200   /* BALL_PRE   抓夹伸到小球前(原 2500) */
-#define ARM_GRAB_CLOSE_MS           2600   /* BALL_CLOSE 合夹爪夹紧(原 2000) */
+#define ARM_GRAB_CLOSE_MS           2000   /* BALL_CLOSE 合夹爪夹紧(原 2000) */
 #define ARM_GRAB_LIFT_MS            3200   /* BALL_LIFT  抓着球抬大臂(原 2500) */
 #define ARM_HOLD_MS_GRAB            600    /* 抓球这三步各自的保持时间(原来走 ARM_HOLD_MS_OTHER=450) */
 
@@ -1731,7 +1755,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 #define ROUTE_12_MID_ALIGN_TIMEOUT_MS   8000
 #define ROUTE_12_P1_A_HALF_MM      (ROUTE_12_P1_A_MM / 2)                      /* 第1段 前半(走完由 CORRECT_A 校正) */
 #define ROUTE_12_P1_A_HALF2_MM     (ROUTE_12_P1_A_MM - ROUTE_12_P1_A_HALF_MM)  /* 第1段 后半(走完由 CORRECT_A2 校正) */
-#define ROUTE_12_P1_B_MM            /*860 */  844    /* ⭐ 打靶第 2 段右移【总长】(mm): 航向校正完再右移这么多 */
+#define ROUTE_12_P1_B_MM            /*844 */  874    /* ⭐ 打靶第 2 段右移【总长】(mm): 航向校正完再右移这么多 */
 #define ROUTE_12_P1_B_HALF_MM      (ROUTE_12_P1_B_MM / 2)                      /* 第2段 前半(走完由 CORRECT_B 校正) */
 #define ROUTE_12_P1_B_HALF2_MM     (ROUTE_12_P1_B_MM - ROUTE_12_P1_B_HALF_MM)  /* 第2段 后半(走完由 CORRECT_B2 校正) */
 
@@ -7883,6 +7907,19 @@ void Mission_Update(void)
                  *    ⚠️ 若 GYRO_BIAS_SCOPE_RESCUE=1, 起锚已提前到 STATE_15C,
                  *       这里就不再重复起锚(见 GYRO_BIAS_SCOPE_RESCUE 处的说明)。 */
                 Chassis_GyroBias_Start();
+#if GYRO_BIAS_ZUPT_WAIT_MS > 0
+                /* ⭐⭐ 2026-10-11(修"抓完人质后校准偏得很严重"): 起锚后【先原地静置】
+                 *    让 ZUPT 把零偏 bias 估出来 —— 这一段是必须的, 原因见
+                 *    GYRO_BIAS_ZUPT_WAIT_MS 处的说明(横移时编码器辅助被禁用,
+                 *    ZUPT 是唯一的路; 不静置就 bias=0 ⇒ corrected_yaw 一路漂)。
+                 *    Chassis_Stop() 是为了保证 "s_moving / s_turn_open 都是 0"(ZUPT 的前提)。 */
+                Chassis_Stop();
+                Mission_Coop_Wait(GYRO_BIAS_ZUPT_WAIT_MS);
+                MLOG("救援⑧: 零偏起锚后静置 %dms 做 ZUPT -> bias=%.3f°/s "
+                     "(≈0 说明这 %dms 里没收到静止样本, 航向会开始漂; 看 I/GBIAS 的 cyaw 是否跟着 yaw)",
+                     (int)GYRO_BIAS_ZUPT_WAIT_MS, (double)Chassis_GetGyroBias(),
+                     (int)GYRO_BIAS_ZUPT_WAIT_MS);
+#endif
 #endif
                 MLOG("救援: 抓完人质 -> 先原地校一次航向(挪步 %+dmm, 目标 %.1f°)",
                      (int)ROUTE_RESCUE_FWD_MM, (double)RESCUE_HEADING_DEG);
