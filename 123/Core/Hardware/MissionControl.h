@@ -279,9 +279,9 @@ typedef enum {
     STATE_15A_RESCUE_STOP_WAIT,              // ⑤ 原地停等 RESCUE_STOP_WAIT_MS(3000ms)
     STATE_16_RESCUE_RIGHT_A,                 // ⑥ 到人质处: 进入动作 = 先退 ROUTE_RESCUE_GRAB_BACK_MM + 摆 ARM_POSE_HOSTAGE_LOOK
     STATE_16A_RESCUE_HEADING_CORRECT,        // (未使用) 备用航向校正
-    STATE_17_RESCUE_RIGHT_B,                 // ⑧ (开关=1: 只校航向不移动; =0: 第 1 段右移 ROUTE_17_RIGHT_B_MM)
-    STATE_17A_RESCUE_HEADING_CORRECT,        // (仅 RESCUE_TAIL_ONESHOT=0 用) ⑨ 先挪 ROUTE_RESCUE_FWD_MM, 再校到 -90°
-    STATE_18_RESCUE_RIGHT_C,                 // ⑩ (开关=1: ⑧+⑩ 合并成一段, 且对半走、中点校航向+前进20mm; =0: 第 2 段右移 ROUTE_18_RIGHT_C_MM)
+    STATE_17_RESCUE_RIGHT_B,                 // ⑧ 开关=1: 抓完人质【停稳一下】(默认不校航向, 见 RESCUE_TAIL_GRAB_ALIGN_ENABLE); =0: 第 1 段右移 ROUTE_17_RIGHT_B_MM
+    STATE_17A_RESCUE_HEADING_CORRECT,        // (仅 RESCUE_TAIL_ONESHOT=0 用) ⑨ 先挪 ROUTE_RESCUE_FWD_MM, 再校到 RESCUE_HEADING_DEG
+    STATE_18_RESCUE_RIGHT_C,                 // ⑩ 开关=1: ⑧+⑩ 合并成【一次连续右移直达终点】(默认不校航向, 见 RESCUE_TAIL_MID_CORRECT_ENABLE); =0: 第 2 段右移 ROUTE_18_RIGHT_C_MM
     STATE_18A_RESCUE_HEADING_CORRECT,        // (仅开关=0 用) ⑪ 先挪 ROUTE_RESCUE_LAST_STEP_MM, 再校到 -90°
     STATE_19_RESCUE_RIGHT_D,                 // ⑫ 停下 → MISSION_STATE_COMPLETE
     STATE_19A_RESCUE_HEADING_CORRECT,        // (未使用)

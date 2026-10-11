@@ -1890,8 +1890,10 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *       “挪一步 + 航向校准”, 见 ROUTE_14_MID_MM / ROUTE_RESCUE_MID_STEP_MM)
  *     → ⑤停等 RESCUE_STOP_WAIT_MS
  *  → ⑥摆 HOSTAGE_LOOK → ⑦视觉对准 + 抓取
- *  → ⑧右移 ROUTE_17_RIGHT_B_MM → ⑨航向校准
- *  → ⑩右移 ROUTE_18_RIGHT_C_MM → ⑪航向校准 → ⑫停下
+ *  → ⑧停稳一下【不校航向】→ ⑩【一次连续右移】直达终点 → ⑫停下
+ *     (⭐ 2026-10-11 用户要求: 抓完人质后删掉两个横向校准 —— ⑧ 那次和 ⑩ 中点那次,
+ *      停一下就直奔终点; 两个开关见 RESCUE_TAIL_GRAB_ALIGN_ENABLE /
+ *      RESCUE_TAIL_MID_CORRECT_ENABLE, 各自改回 1 即可恢复对应的那一次。) → ⑫停下
  *  ⭐ ⑦ 抓取 (2026-10-06): 底盘不动, 靠底座 ID1 小步转对准人质; 对准完
  *     (收到 C, 或步数/时长超时兜底)按 ID1 的【累计偏移量】选左/中/右一侧,
  *     再执行该侧的【抓取 → 抱紧 → 抬起】三个姿态(共 9 个姿态, 待示教标定,
@@ -1915,16 +1917,54 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 #define ROUTE_DEFAULT_SPEED_MMPS         350   /* 默认车速(mm/s), 与 main.c Chassis_SetMaxSpeed(350) 一致 */
 
 /* ⭐⭐ 2026-10-10(用户要求): 救援【抓完人质 → 终点】的走法 ---------------------
- *   【1(★当前)】抓完人质 → ⑧【先原地校一次航向(不挪步)】→ ⑩【一段走到终点】→ ⑫停下:
- *        · ⑧ 只校航向: Heading_AlignTight(RESCUE_HEADING_DEG = -90°);
- *          校前那一步挪多少 = ROUTE_RESCUE_FWD_MM(当前 = 0 ⇒ 不挪, 只原地摆正)。
- *        · ⑩ = ROUTE_17_RIGHT_B_MM + ROUTE_18_RIGHT_C_MM【合并成一次连续右移】,
- *          中途不再停车、不再校正航向; 走完直接进 ⑫ 停车 → 任务完成。
+ *   【1(★当前)】抓完人质 → ⑧【停稳一下(不校航向)】→ ⑩【一段走到终点】→ ⑫停下。
+ *      ⭐⭐ 2026-10-11(用户要求, 最新): 抓完人质后【删掉两个横向校准】, 停一下就直奔终点。
+ *         · ⑧ 那一次航向校正: RESCUE_TAIL_GRAB_ALIGN_ENABLE = 0 ⇒ 不校;
+ *         · ⑩ 走到一半那次航向校正: RESCUE_TAIL_MID_CORRECT_ENABLE = 0 ⇒ 不校;
+ *         · ⑩ 变成【一次连续右移 1614mm】, 中途不停车、不转向, 航向靠"航向保持"整段守。
+ *         (两个开关各自独立, 想恢复哪一次就把它改回 1, 见各自宏说明。)
+ *      ⚠️ ⑧ 的"停稳"仍然保留 —— 它是用户要的"停止一下", 同时兼任方案②的 ZUPT 窗口;
+ *         ⚠️ 注意 ⑧ 也【不再校航向】了 ⇒ 起点若有一点角度偏差, 由后面 1614mm 的
+ *            航向保持一路慢慢纠回来(而不是原地先转正)。
  *   【0】老做法: ⑧右移 → ⑨校 → ⑩右移 → ⑪校 → ⑫停(两段各自走完 + 各校一次)。
  *   ⚠️ 两种走法【总距离一样】(⑧ 的 650mm 只是挪进 ⑩ 里一起走)。
  *   ⚠️ 置 1 时 STATE_17A/STATE_18A 不会被进入 ⇒ ROUTE_RESCUE_LAST_STEP_MM(⑪ 的挪步)
  *      用不到; ROUTE_RESCUE_FWD_MM 仍用于 ⑧ 的"校前挪步"。 */
 #define RESCUE_TAIL_ONESHOT         1
+
+/* ⭐⭐ 2026-10-11(用户要求): 抓完人质 → 终点, 【不做横向校准, 停一下就直奔终点】--------
+ * 【用户要求】"抓取人质之后有两个横向校准到达终点, 删除抓取人质之后的横向校准,
+ *   直接到达终点 —— 就是说抓取人质之后停止一下, 直接右移走到终点。"
+ * 【原来的两个横向校准】(都在 RESCUE_TAIL_ONESHOT=1 这条走法里)
+ *   ① STATE_17(⑧) 抓完人质【立刻】Heading_AlignTight(RESCUE_HEADING_DEG);
+ *   ② STATE_18(⑩) 走到【一半】再 Heading_AlignTight + 往前进 20mm
+ *      (RESCUE_TAIL_MID_CORRECT_ENABLE)。
+ * ⇒ 本宏 + RESCUE_TAIL_MID_CORRECT_ENABLE 都为 0 时, 尾部流程变成:
+ *      抓完人质 → 【原地停稳一下】→ 一次连续右移直达终点(⑫)→ 任务完成
+ *   (航向靠【航向保持】一路守住, 不再中途停车转向。)
+ * 【为什么可以不要它们】航向保持本来就在整段横移中持续纠偏(trim/vel_bias);
+ *   而中途转向本身也有代价: 转向把车停一下、再起步, 每次起步都会带来新的横向扰动,
+ *   而且"转到位"允许 ~10°/s 的残余角速度, 停稳前那点滑行又会带一点偏差。
+ *   ⇒ 长段横移如果一次走完更干净, 就把它去掉。
+ * 【本宏取值】0(★当前, 用户要求) = 抓完人质不校航向, 停一下直接走;
+ *             1 = 老行为(抓完人质先原地校一次, 再走)。
+ * 【"停一下"由谁负责】见 STATE_17 里那段 Chassis_Stop() + 等待: 它同时承担
+ *   ① 用户要的"停止一下"; ② 方案②(陀螺仪零偏)的 ZUPT 采样窗口 —— 两者共用一次等待,
+ *   不会叠加(RESCUE_TAIL_GRAB_STOP_MS / GYRO_BIAS_ZUPT_WAIT_MS)。
+ * ⚠️ 被去掉的 ① 里原本还会挪一步 ROUTE_RESCUE_FWD_MM(当前 = 0, 本来就没挪);
+ *    所以关掉本宏只少了"原地转一下", 不会少距离。
+ * ⚠️ 与 RESCUE_TAIL_MID_CORRECT_ENABLE 是【两个独立的开关】:
+ *    想只留中点那次校正 → 本宏 = 0 且 MID_CORRECT = 1;
+ *    想只留抓完那一次     → 本宏 = 1 且 MID_CORRECT = 0。 */
+#define RESCUE_TAIL_GRAB_ALIGN_ENABLE   0     /* 1 = 抓完人质先原地校一次航向(老行为); 0 = 不校(★当前) */
+
+/* 抓完人质那一下的"停稳"时长(ms) —— 只在【没有启用方案②的 ZUPT 等待】时用它。
+ * (启用方案②时由 GYRO_BIAS_ZUPT_WAIT_MS = 1200ms 承担, 那个更长、且有自己的目的;
+ *  两者共用同一次等待, 不会叠加成 1500ms。)
+ * 为什么要停: 抓取/抱紧/抬起那一串机械臂大电流动作刚做完, 车身/悬架还在晃,
+ *   直接起步横移会让起点的航向误差变大。300ms 够余振衰减。
+ * 取值: 0 = 不停(不推荐)。 */
+#define RESCUE_TAIL_GRAB_STOP_MS        300
 
 /* ⭐⭐ 2026-10-11 新增(用户要求): 抓完人质后【最后这一段右移】带一个“车头左方分量” -------
  * 【作用位置】= 抓完人质 → 一路走到底的那一次连续右移(= ⑧+⑩ 的距离, 见 RESCUE_TAIL_ONESHOT),
@@ -1954,27 +1994,31 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 #define RESCUE_TAIL_TOTAL_MM        (ROUTE_17_RIGHT_B_MM + ROUTE_18_RIGHT_C_MM)
 
 /* ⭐⭐ 2026-10-11(用户要求): 最后一段的【中点】插一次“航向校正 + 往前进 20mm” ----
- * 【最终定稿的做法(2026-10-11 用户确认)】抓取人质后 → ①【校一次航向】→
+ * 【原来的做法(2026-10-11 早些时候)】抓取人质后 → ①【校一次航向】→
  *   ② 走到【一半】再【校一次航向 + 往前进 20mm】→ ③ 剩下的一次性冲到终点。
  *   (之前试过"全程按比例补左分量"作为终点偏差的补偿, 实测会让车头歪 ⇒ 已关闭,
- *    见 RESCUE_TAIL_LEFT_COMP = 0; 现在改成"两次校正", 偏差就地清掉、不残留。)
- * 【为什么中点要校】这一段(⑧+⑩ 合并 ≈1614mm)是全程最长的一次连续右移:
+ *    见 RESCUE_TAIL_LEFT_COMP = 0; 改成"两次校正", 偏差就地清掉、不残留。)
+ *   ⭐⭐ 2026-10-11(用户要求, 最新): 现在【= 0】—— 用户要求"抓完人质之后删掉两个横向校准,
+ *      停一下就直奔终点", 所以中点这次校正也去掉了(另一次见 RESCUE_TAIL_GRAB_ALIGN_ENABLE)。
+ *      要恢复中点校正就把它改回 1。
+ * 【为什么中点要校(恢复时看)】这一段(⑧+⑩ 合并 ≈1614mm)是全程最长的一次连续右移:
  *   横移时辊子侧向刮地本来就会让车头慢慢偏, 走 1.6m 攒下的偏差比短段大;
  *   且这一段的偏差【没有后续校正】兜底(走完就 🏁 结束), 所以在中点清一次。
  * 【做法】把这段【对半拆成两段走】, 中间做:
  *     ① 阻塞等前半段走完(超时也往下走, 但会强制停车, 见 RESCUE_TAIL_HALF_TIMEOUT_MS);
- *     ② Heading_AlignTight(RESCUE_HEADING_DEG = -90°): 按绝对角把车头摆正
+ *     ② Heading_AlignTight(RESCUE_HEADING_DEG): 按绝对角把车头摆正
  *        —— 顺带【重新同步航向基准】(Chassis_SetHeadingRef), 后半段按新基准走直线;
- *        ⚠️ 偏差 ≤ TURN_SKIP_DEG(2°) 时它会自动跳过转向, 只同步基准(见该宏);
+ *        ⚠️ 偏差在小门槛内时它会自动跳过转向, 只同步基准(见该宏/TURN_SKIP_DEG 说明);
  *     ③ Route_MinStep(RESCUE_TAIL_MID_STEP_MM = +20): 【往车头前方】挪 20mm
- *        (此刻车头 -90° ⇒ 车头前方 = 场地右方, 与"右移"垂直), 把轮子带活,
+ *        (此刻车头已转 90° ⇒ 车头前方 = 场地右方, 与"右移"垂直), 把轮子带活,
  *        同时也是一次位置微调(Route_MinStep 内部阻塞到位, 自带日志)。
  *     ④ 剩下的路【一次性冲到终点】(不再停车、不再校正)。
  * 【怎么关】RESCUE_TAIL_MID_CORRECT_ENABLE 置 0 ⇒ 回到"一段走到底, 中途不停不校正"。
+ * ⭐⭐ 2026-10-11(用户要求, 最新): 现在【= 0】—— 见上面那段说明(用户要求删掉两个横向校准)。
  * ⚠️ 只在 RESCUE_TAIL_ONESHOT = 1(当前)这条走法里生效 —— 老做法(两段各自校一次)
  *    本来就有 ⑪ 那次校正, 不需要这个。
  * ⚠️ 总距离不变: 前半 + 后半 = 原来那一段(现在 LEFT_COMP = 0 ⇒ 就是 ⑧+⑩ 全长的对半)。 */
-#define RESCUE_TAIL_MID_CORRECT_ENABLE  1     /* 1 = 中点插一次校正 + 前进一小步; 0 = 一段走到底 */
+#define RESCUE_TAIL_MID_CORRECT_ENABLE  0     /* 1 = 中点插一次校正 + 前进一小步; 0 = 一段走到底(★当前) */
 #define RESCUE_TAIL_MID_STEP_MM         20    /* 中点校正【之后】挪的一小步(mm):
                                                * ⭐ 用户定值 20(2026-10-11);
                                                * 正 = 车头前进(此处 = 场地右方), 负 = 车头后退 */
@@ -7931,14 +7975,17 @@ void Mission_Update(void)
              *      → ④'【中途一次航向校准】(挪 ROUTE_RESCUE_MID_STEP_MM + 校准到 -90°)
              *      → 第二段 ROUTE_14_MID2_MM(进救援区) → ⑤停下等 RESCUE_STOP_WAIT_MS
              * → ⑥摆 ARM_POSE_HOSTAGE_LOOK → ⑦视觉对准 + 抓取(子状态机)
-             * → ⑧右移 ROUTE_17_RIGHT_B_MM → ⑨航向校准
-             * → ⑩右移 ROUTE_18_RIGHT_C_MM → ⑪航向校准 → ⑫停下(任务完成)
+             * → ⑧停稳一下【不校航向】→ ⑩【一次连续右移】直达终点 → ⑫停下(任务完成)
+             *   ⭐ 2026-10-11 用户要求: 抓完人质后【删掉两个横向校准】(⑧ 那次 + ⑩ 中点那次),
+             *      停一下就直奔终点。两个开关: RESCUE_TAIL_GRAB_ALIGN_ENABLE /
+             *      RESCUE_TAIL_MID_CORRECT_ENABLE, 各自改回 1 就恢复对应那次校正。
              * ⭐ 航向纠正之前都先挪一小步(Route_MinStep), 车停死后原地转正容易转不到位,
              *    先让轮子滚起来更好转(取值见各宏):
              *      ②  ROUTE_RESCUE_AFTER_TURN_MM(转完后车头前进)
              *      ④' ROUTE_RESCUE_MID_STEP_MM  (右移中途; ★2026-10-09 新增)
              *      ⑨  ROUTE_RESCUE_FWD_MM        ⑪ ROUTE_RESCUE_LAST_STEP_MM
-             *    ⚠️ 现在“进救援区 → 终点”一共 4 处航向纠正(④' ⑨ ⑪ + ② 转完那次)。
+             *    ⚠️ 现在“进救援区 → 抓取”一共 3 处航向纠正(④' + ② 转完那次 + ③' 右移前那次);
+             *       “抓完人质 → 终点”当前【0 处】(两个开关都为 0, 见上)。
              * ⭐ 为什么“后退”全改成“右移”: 车头右转 90°(顺时针)之后, 车体的
              *    【右】方向正好等于原来的【后】方向 ⇒ 轨迹不变、只是车身姿态转了 90°。
              * ⚠️ ⑦ 的对准方式由 RESCUE_SCHEME_ID1 切换(1=转 ID1 车不动 / 0=动底盘)。
@@ -8069,32 +8116,52 @@ void Mission_Update(void)
                 Chassis_SetMaxSpeed(ROUTE_RESCUE_RETURN_SPEED_MMPS);
                 MLOG("救援⑧: 进入撤退段, 车速降到 %dmm/s(抱人质后减扰动/甩尾)",
                      (int)ROUTE_RESCUE_RETURN_SPEED_MMPS);
+
 #if (GYRO_BIAS_TAIL_ON && !GYRO_BIAS_RESCUE_ON)
                 /* ⭐⭐ 2026-10-11(用户要求): 【抓取人质后】才启用陀螺仪零偏方案 ——
                  *    从这一步(⑥ 抓完后的第 1 个状态)起锚, 一路用到终点(⑫ 停锚)。
-                 *    起锚时会把软件航向 corrected_yaw 对齐到当前航向, 所以紧接着的
-                 *    Heading_AlignTo(-90°) 和后面的右移都以它为基准, 不会跳变。
+                 *    起锚时会把软件航向 corrected_yaw 对齐到当前航向, 所以后面的右移
+                 *    以它为基准, 不会跳变。
                  *    ⚠️ 若 GYRO_BIAS_SCOPE_RESCUE=1, 起锚已提前到 STATE_15C,
                  *       这里就不再重复起锚(见 GYRO_BIAS_SCOPE_RESCUE 处的说明)。 */
                 Chassis_GyroBias_Start();
-#if GYRO_BIAS_ZUPT_WAIT_MS > 0
-                /* ⭐⭐ 2026-10-11(修"抓完人质后校准偏得很严重"): 起锚后【先原地静置】
-                 *    让 ZUPT 把零偏 bias 估出来 —— 这一段是必须的, 原因见
-                 *    GYRO_BIAS_ZUPT_WAIT_MS 处的说明(横移时编码器辅助被禁用,
-                 *    ZUPT 是唯一的路; 不静置就 bias=0 ⇒ corrected_yaw 一路漂)。
-                 *    Chassis_Stop() 是为了保证 "s_moving / s_turn_open 都是 0"(ZUPT 的前提)。 */
+#endif
+
+                /* ⭐⭐ 2026-10-11(用户要求): 【抓完人质先停一下】—— 然后(默认)直接右移走到终点。
+                 *    这一次等待【一个 stop 干两件事】, 不会叠加:
+                 *      ① 用户要的"停止一下"(抓取/抱紧/抬起那串大电流动作刚做完, 车身还在晃);
+                 *      ② 方案②(陀螺仪零偏)的 ZUPT 采样窗口 —— 它【必须】有 ≥500ms 静止,
+                 *         否则 bias 估不出来, corrected_yaw 会一路漂(见 GYRO_BIAS_ZUPT_WAIT_MS)。
+                 *    所以: 起锚了就用 ZUPT 那个时长(更长, 且是必须的); 没起锚才用 GRAB_STOP_MS。
+                 *    ⚠️ Chassis_Stop() 是必须的: ZUPT 的前提是 s_moving/s_turn_open 都为 0。 */
                 Chassis_Stop();
+#if (GYRO_BIAS_TAIL_ON && !GYRO_BIAS_RESCUE_ON) && (GYRO_BIAS_ZUPT_WAIT_MS > 0)
                 Mission_Coop_Wait(GYRO_BIAS_ZUPT_WAIT_MS);
-                MLOG("救援⑧: 零偏起锚后静置 %dms 做 ZUPT -> bias=%.3f°/s "
+                MLOG("救援⑧: 抓完人质 -> 停稳 %dms(同时做 ZUPT 估零偏) -> bias=%.3f°/s "
                      "(≈0 说明这 %dms 里没收到静止样本, 航向会开始漂; 看 I/GBIAS 的 cyaw 是否跟着 yaw)",
                      (int)GYRO_BIAS_ZUPT_WAIT_MS, (double)Chassis_GetGyroBias(),
                      (int)GYRO_BIAS_ZUPT_WAIT_MS);
+#else
+                Mission_Coop_Wait(RESCUE_TAIL_GRAB_STOP_MS);
+                MLOG("救援⑧: 抓完人质 -> 停稳 %dms", (int)RESCUE_TAIL_GRAB_STOP_MS);
 #endif
-#endif
+
+#if RESCUE_TAIL_GRAB_ALIGN_ENABLE
+                /* 老行为(开关=1): 停稳后再【原地校一次航向】再走。
+                 * ⚠️ 校前那一步挪多少 = ROUTE_RESCUE_FWD_MM(当前 = 0 ⇒ 只原地摆正, 不挪)。 */
                 MLOG("救援: 抓完人质 -> 先原地校一次航向(挪步 %+dmm, 目标 %.1f°)",
                      (int)ROUTE_RESCUE_FWD_MM, (double)RESCUE_HEADING_DEG);
                 Route_MinStep(ROUTE_RESCUE_FWD_MM);
                 Heading_AlignTight(RESCUE_HEADING_DEG);
+#else
+                /* ★当前(开关=0): 不校航向, 停稳后【直接右移走到终点】。
+                 *   航向由【航向保持】在整段横移中持续守(基准仍是 STATE_14/15D 设的
+                 *   RESCUE_HEADING_DEG), 中途不再停车转向。 */
+                MLOG("救援: 抓完人质 -> 停稳后【不校航向, 直接右移走到终点】(目标基准 %.1f°, "
+                     "当前 yaw=%.1f°, 起点偏差 %+.1f° 交给航向保持一路纠)",
+                     (double)RESCUE_HEADING_DEG, (double)Chassis_GetYaw(),
+                     (double)(Chassis_GetYaw() - RESCUE_HEADING_DEG));
+#endif
                 break;
 #else
             case STATE_17_RESCUE_RIGHT_B:
@@ -8185,6 +8252,11 @@ void Mission_Update(void)
                         Chassis_Move_Right_WithBack(half2, -(RESCUE_TAIL_FWD_COMP));
                     }
 #else
+                    /* ★当前(用户要求): 抓完人质停一下就【一次连续右移直达终点】——
+                     *   中途不停车、不校正航向, 航向完全交给"航向保持"。 */
+                    MLOG("救援: 抓完人质后【一次连续右移 %dmm 直达终点】(中途不停车/不校正, "
+                         "航向保持一路纠偏; 当前 yaw=%.1f°, 基准 %.1f°)",
+                         (int)net_mm, (double)Chassis_GetYaw(), (double)RESCUE_HEADING_DEG);
                     Chassis_Move_Right_WithBack(net_mm, -(RESCUE_TAIL_FWD_COMP));
 #endif
                 }
