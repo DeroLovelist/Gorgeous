@@ -1690,8 +1690,31 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *   ⚠️ 别太大: 力度越大越容易冲过头/甩尾(本处已有"停稳 + 二次压正"兜着, 但仍建议 30~45)。
  *   ⚠️ 只影响 STATE_11A 那两次转向(Chassis_SetNextTurnAdjust 是一次性的),
  *      其它地方的转向力度不变; 想整场都加大请改 Chassis.h 的 CH_MAX_TURN_ADJUST。
- *   ⚠️ 置 0 = 不覆盖(用全局默认 22, 即老行为)。 */
+ *   ⚠️ 置 0 = 不覆盖(用全局默认 22, 即老行为)。
+ *   ⭐⭐ 2026-10-11 补(用户反馈"已经在 0 点边缘了小车还是旋转起来校准, 幅度很大"):
+ *     大力度【只用在残差真的大的时候】—— 残差 ≤ BOMB_AFTER_ALIGN_BOOST_FROM_DEG 时
+ *     用默认 22。为什么: 转向环的输出是"每周期往四轮位置目标里加 adj(计数)"——
+ *     残差 2~4° 折算到轮子只要几十个计数, 用 35 计数/周期会【一两拍就把目标冲到位】,
+ *     车带着大角速度被判"到位"后 Chassis_Stop() 只是【冻结滑行】⇒ 冲过头 → 反向再修
+ *     → 在 0° 附近来回摆(看起来就是"幅度很大地转来转去"), 最后撞 3s 上限带着偏差往下走。
+ *     残差大(> 8°)时轮子本来就走得多, 那时加大力度是为了"啃动静摩擦", 才有必要。 */
 #define BOMB_AFTER_ALIGN_TURN_ADJUST   35.0f
+
+/* ⭐⭐ 2026-10-11 新增: STATE_11A(排爆放球后那次校 0°) 专用的两个门槛 ---------------
+ * ① BOMB_AFTER_ALIGN_SKIP_DEG —— 残差 ≤ 它【就不转】了, 直接进打靶走位。
+ *    为什么可以放过: 这一处后面跟着的 854mm 长距离右移是靠【航向保持】走直线的,
+ *    航向保持本身会一路把残留角往回收 —— 2~3° 的残留在这段里能纠掉大半,
+ *    而为了这 2~3° 去做原地转的风险是"转不动⇒积分打满⇒突然撒手甩一圈"
+ *    (实测日志: 10s 内轮子走 781mm、车头从 +1.3° 甩到 −18.7°), 得不偿失。
+ *    ⚠️ 这是【取舍】不是最优解: 取大 = 不会甩, 但进打靶走位时朝向会偏这么几度;
+ *       取小 = 校得更准, 但小残差原地转又会冒"甩一圈"的险。
+ *       ★3.0 是折中(只放过"确实已经在 0° 边缘"的情况, 3° 以上还是去校一次)。
+ *       要"尽可能校准"就填 2.0(与全程统一门槛一样), 要"绝不甩"就填 5.0~6.0。
+ *       0 = 关掉(无论如何都转)。
+ * ② BOMB_AFTER_ALIGN_BOOST_FROM_DEG —— 残差 > 它才把转向力度加大(见上面那条)。
+ *    ⚠️ 必须 > BOMB_AFTER_ALIGN_SKIP_DEG, 否则这条永远用不上(先被跳过/被小残差吃掉)。 */
+#define BOMB_AFTER_ALIGN_SKIP_DEG       3.0f
+#define BOMB_AFTER_ALIGN_BOOST_FROM_DEG 8.0f
 
 /* ⭐⭐ 2026-10-11 新增: 航向校正的“小角度跳过”门槛 (单位: 度) ---------------------
  * 【为什么需要】实车日志(排爆后那次)铁证: 请求只 0.5~1.3° 的校正【根本完不成】——
@@ -1705,8 +1728,10 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *   ⇒ 这种"转也转不动、还容易失控"的微校正, 直接跳过最安全:
  *     1~2° 的残留本来就在全程各段校正的残差量级里(日志里各段 yaw 都在 ±1.5° 内)。
  * 【做法】Turn_SkipIfTiny(): |目标 − 当前 yaw| ≤ 本宏 ⇒ 不发转向指令, 只打一行日志。
- *   作用点: Turn_Angle_Compat(0.1f)(全程各处校 0°)、Heading_AlignTo(-90°)、
- *          STATE_11A(排爆后那次)。
+ *   作用点: Turn_Angle_Compat(0.1f)(全程各处校 0°)、Heading_AlignTo(-90°)。
+ *   ⚠️ STATE_11A(排爆后那次)【不走本宏】—— 它后面跟着 854mm 长距离右移, 残留角会由
+ *      航向保持往回收, 所以用更宽的门槛 BOMB_AFTER_ALIGN_SKIP_DEG(4°), 免得为了
+ *      2~4° 的微校正去冒"转不动⇒积分打满⇒突然撒手甩一圈"的风险。
  * 【取值】2.0(度)。调大→更省时间但残留角变大; 调小→又把 1~2° 的校正交回给
  *   那个"转不动"的环; 0 = 关闭(恢复"无论如何都发转向")。
  * ⚠️ 想让小角度校正【真的转得动】的正确做法是调大 CH_MAX_TURN_ADJUST(如 22→35,
@@ -2904,25 +2929,69 @@ static uint32_t K230_RxSilenceMs(void)
 }
 
 /**
- * @brief  ⭐⭐ 2026-10-11 新增: 航向校正前的“小角度跳过”判断
+ * @brief  ⭐⭐ 2026-10-11 新增: 航向校正前的“小角度跳过”判断(可指定门槛)
  * @param  target_deg 目标绝对航向(度)
- * @retval 1 = 偏差 ≤ TURN_SKIP_DEG, 【不要】再发转向指令; 0 = 需要真正转向
- * @note   为什么要有它(1~2° 的校正"转不动还容易失控"), 见 TURN_SKIP_DEG 的说明。
- *         用 Chassis_GetYaw()(已过跳变检查), 所以坏读数不会让它误判成"已正"。
+ * @param  skip_deg   跳过门槛(度): |目标 − 当前| ≤ 它 ⇒ 不转; ≤0 = 不跳过
+ * @retval 1 = 【不要】再发转向指令; 0 = 需要真正转向
+ * @note   取角经 Chassis_GetYaw()(已过跳变检查), 所以坏读数不会让它误判成"已正"。
+ *         ⚠️ 为什么要能指定门槛: "转不动 + 积分打满后突然撒手" 这个坑在不同场合
+ *            能接受的残留角不一样 —— 全程其它校正用 TURN_SKIP_DEG(2°);
+ *            而 STATE_11A(排爆后那次) 后面跟着 854mm 长距离右移, 那段本来就会
+ *            用【航向保持】把残留角慢慢纠回来, 所以它可以用更大的门槛(见
+ *            BOMB_AFTER_ALIGN_SKIP_DEG), 免得为了 2~4° 又去冒一次"甩一圈"的风险。
  */
-static uint8_t Turn_SkipIfTiny(float target_deg)
+static uint8_t Turn_SkipIfSmall(float target_deg, float skip_deg)
 {
     float e = target_deg - Chassis_GetYaw();
 
     while (e > 180.0f)  e -= 360.0f;
     while (e < -180.0f) e += 360.0f;
 
-    if (TURN_SKIP_DEG > 0.0f && e <= TURN_SKIP_DEG && e >= -TURN_SKIP_DEG) {
-        MLOG("航向校正: 偏差 %+.2f° 已在 ±%.2f° 内 → 跳过本次转向(见 TURN_SKIP_DEG)",
-             (double)e, (double)TURN_SKIP_DEG);
+    if (skip_deg > 0.0f && e <= skip_deg && e >= -skip_deg) {
+        MLOG("航向校正: 偏差 %+.2f° 已在 ±%.2f° 内 → 跳过本次转向",
+             (double)e, (double)skip_deg);
         return 1u;
     }
     return 0u;
+}
+
+/**
+ * @brief  同上, 用全程统一的 TURN_SKIP_DEG(2°) 当门槛
+ * @note   全程各处校 0°(Turn_Angle_Compat) / 校 -90°(Heading_AlignTo) 走这里;
+ *         STATE_11A 走 Turn_SkipIfSmall() 用自己的门槛。
+ */
+static uint8_t Turn_SkipIfTiny(float target_deg)
+{
+    return Turn_SkipIfSmall(target_deg, TURN_SKIP_DEG);
+}
+
+/**
+ * @brief  ⭐⭐ 2026-10-11 新增: 排爆后那次校正(STATE_11A) 按【残差大小】决定本次转向力度
+ * @note   残差 > BOMB_AFTER_ALIGN_BOOST_FROM_DEG(8°) → 用加大后的
+ *         BOMB_AFTER_ALIGN_TURN_ADJUST(35): 轮子要走得多, 需要啃动静摩擦;
+ *         残差 ≤ 它 → 用全局默认 CH_MAX_TURN_ADJUST(22): 小残差配大力度会
+ *         "一两拍冲到目标 + 冻结滑行冲过头", 在 0° 附近来回摆。
+ *         ⚠️ 残差 ≤ BOMB_AFTER_ALIGN_SKIP_DEG 的情况【根本不会走到这里】(已被跳过)。
+ *         ⚠️ 必须在紧接着的 Chassis_Rotate_To() 【之前】调用: 覆盖是"下一次转向"消耗掉的。
+ */
+static void BombAfterAlignTurnAdjust(void)
+{
+    float e = 0.0f - Chassis_GetYaw();
+
+    while (e > 180.0f)  e -= 360.0f;
+    while (e < -180.0f) e += 360.0f;
+
+    if (BOMB_AFTER_ALIGN_TURN_ADJUST > 0.0f &&
+        (e > BOMB_AFTER_ALIGN_BOOST_FROM_DEG || e < -BOMB_AFTER_ALIGN_BOOST_FROM_DEG)) {
+        Chassis_SetNextTurnAdjust(BOMB_AFTER_ALIGN_TURN_ADJUST);
+        MLOG("排爆后校正: 残差 %+.2f° > %.1f° → 本次转向力度加大到 %.0f (默认 %.0f)",
+             (double)e, (double)BOMB_AFTER_ALIGN_BOOST_FROM_DEG,
+             (double)BOMB_AFTER_ALIGN_TURN_ADJUST, (double)CH_MAX_TURN_ADJUST);
+    } else {
+        MLOG("排爆后校正: 残差 %+.2f° 不大 → 用默认转向力度 %.0f "
+             "(大力度配小残差会冲过头, 见 BOMB_AFTER_ALIGN_BOOST_FROM_DEG)",
+             (double)e, (double)CH_MAX_TURN_ADJUST);
+    }
 }
 
 /**
@@ -7630,11 +7699,15 @@ void Mission_Update(void)
                  *      超时后转向环【还开着】(剩余角 126°), 紧接着的右移就变成
                  *      "边走边转", 走出弧线(日志 STEER on=1 err=126 out=192)。 */
                 {
-                    /* ⭐ 2026-10-11: 偏差 ≤ TURN_SKIP_DEG 就别发了(1~2° 的校正
-                     *    在这台车上转不动、还会把位置目标越积越大, 见 TURN_SKIP_DEG)。 */
-                    if (!Turn_SkipIfTiny(0.0f)) {
-                        /* ⭐⭐ 用户要求: 【放完球这次校正力度加大】(见 BOMB_AFTER_ALIGN_TURN_ADJUST) */
-                        Chassis_SetNextTurnAdjust(BOMB_AFTER_ALIGN_TURN_ADJUST);
+                    /* ⭐⭐ 2026-10-11(用户反馈"已经在 0 点边缘了小车还是旋转起来校准, 幅度很大"):
+                     *    本处的跳过门槛改用【自己的】BOMB_AFTER_ALIGN_SKIP_DEG(3°),
+                     *    比全程统一的 TURN_SKIP_DEG(2°) 宽一点 —— 残差 2~3° 去做原地转,
+                     *    风险是"转不动 ⇒ 积分打满 ⇒ 突然撒手甩一圈"(实测车头能甩到 −18.7°),
+                     *    而这点残留后面 854mm 右移的【航向保持】本来就会往回收, 不值得冒。 */
+                    if (!Turn_SkipIfSmall(0.0f, BOMB_AFTER_ALIGN_SKIP_DEG)) {
+                        /* ⭐⭐ 力度只在大残差时才加大(见 BombAfterAlignTurnAdjust 的说明):
+                         *    小残差用默认 22 —— 用 35 会一两拍冲到位 + 冻结滑行, 冲过头再反向修。 */
+                        BombAfterAlignTurnAdjust();
                         Chassis_Rotate_To(0.0f);
                         Chassis_WaitTurnDone(BOMB_AFTER_ALIGN_TIMEOUT_MS);
                     }
@@ -7642,11 +7715,29 @@ void Mission_Update(void)
                          (double)Chassis_GetYaw(), (int)BOMB_AFTER_ALIGN_SETTLE_MS);
                     Mission_Coop_Wait(BOMB_AFTER_ALIGN_SETTLE_MS);
 
-                    if (!Turn_SkipIfTiny(0.0f)) {
-                        /* ⭐ 压正这次同样加大力度(否则"停稳后剩的那点残余"照样转不动) */
-                        Chassis_SetNextTurnAdjust(BOMB_AFTER_ALIGN_TURN_ADJUST);
+                    if (!Turn_SkipIfSmall(0.0f, BOMB_AFTER_ALIGN_SKIP_DEG)) {
+                        /* ⭐ 压正这次同样只在大残差时加大力度 */
+                        BombAfterAlignTurnAdjust();
                         Chassis_Rotate_To(0.0f);
                         Chassis_WaitTurnDone(BOMB_AFTER_ALIGN_TIMEOUT_MS);
+                    }
+                    /* ⭐⭐ 收敛核对: 两次压正之后残差还超过跳过门槛 = 这次没校好(多半是撞了
+                     *    BOMB_AFTER_ALIGN_TIMEOUT_MS 的上限)。单独立一条醒目日志,
+                     *    免得淹没在"第2次(压正)结束"那行里 —— 这一段的偏差会直接带进
+                     *    后面 854mm 的右移。 */
+                    {
+                        float e = 0.0f - Chassis_GetYaw();
+
+                        while (e > 180.0f)  e -= 360.0f;
+                        while (e < -180.0f) e += 360.0f;
+                        if (e > BOMB_AFTER_ALIGN_SKIP_DEG || e < -BOMB_AFTER_ALIGN_SKIP_DEG) {
+                            MLOG("⚠ 排爆后校正【没收敛】: 最终 yaw=%.2f°(残差 %+.2f° > %.1f°) —— "
+                                 "照旧进打靶走位, 这段 854mm 右移的航向保持会继续往回收; "
+                                 "若实测这段走斜/出界, 把 BOMB_AFTER_ALIGN_SKIP_DEG 调小(多校一次) "
+                                 "或 BOMB_AFTER_ALIGN_TIMEOUT_MS 加大",
+                                 (double)Chassis_GetYaw(), (double)e,
+                                 (double)BOMB_AFTER_ALIGN_SKIP_DEG);
+                        }
                     }
                     MLOG("排爆后: 第2次(压正)结束, 最终 yaw=%.1f° -> 开始右移",
                          (double)Chassis_GetYaw());
