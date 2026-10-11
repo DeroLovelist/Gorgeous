@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>   /* fabsf (Heading_AlignTight 打残差用) */
 #include "Serial.h"
 #include "Chassis.h"
 #include "ServoArm.h"
@@ -110,7 +111,7 @@ char g_qr_code_string[8];                                       // 扫码结果�
  * ⚠️ 保持时间【太短】的典型症状: 下一帧视觉还没稳定/舵机还在回间隙就动了下一动作
  *    (看起来"动作被吃掉一步"或"对准后又偏了") —— 那就把对应那一档加大。 */
 #define ARM_HOLD_MS_TARGET          200    /* 打靶那几步的保持时间(ms) */
-#define ARM_HOLD_MS_OTHER           450    /* 其它所有姿态的保持时间(ms) */
+#define ARM_HOLD_MS_OTHER           200    /* 其它所有姿态的保持时间(ms) */
 
 /* "打靶准备位"(ARM_POSE_TARGET_READY)算哪一档?
  * ⚠️ 它的执行时机比较特殊: 它在【排爆的最后】被摆出来(放完球 → 摆 TARGET_READY
@@ -130,9 +131,9 @@ char g_qr_code_string[8];                                       // 扫码结果�
  * ⚠️ 嫌总时间太长 → 按比例调这三个宏(例如 2900/2300/2900 + hold 500)。
  * ⚠️ 想完全回退到改之前: 三个宏改回 2500/2000/2500, ARM_HOLD_MS_GRAB 改回 450。 */
 #define ARM_GRAB_PRE_MS             3200   /* BALL_PRE   抓夹伸到小球前(原 2500) */
-#define ARM_GRAB_CLOSE_MS           2000   /* BALL_CLOSE 合夹爪夹紧(原 2000) */
-#define ARM_GRAB_LIFT_MS            3200   /* BALL_LIFT  抓着球抬大臂(原 2500) */
-#define ARM_HOLD_MS_GRAB            600    /* 抓球这三步各自的保持时间(原来走 ARM_HOLD_MS_OTHER=450) */
+#define ARM_GRAB_CLOSE_MS           1000   /* BALL_CLOSE 合夹爪夹紧(原 2000) */
+#define ARM_GRAB_LIFT_MS            2500   /* BALL_LIFT  抓着球抬大臂(原 2500) */
+#define ARM_HOLD_MS_GRAB            200    /* 抓球这三步各自的保持时间(原来走 ARM_HOLD_MS_OTHER=450) */
 
 #if !MISSION_TEST_NO_ARM
 /**
@@ -706,7 +707,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 
 /* ---- ③ 停下等待时间(ms): 右移 + 航向校正好之后先停一会儿,
  *      等车体晃动停下来再让机械臂摆出去, 免得抓的时候还在晃 ---- */
-#define RESCUE_STOP_WAIT_MS     3000
+#define RESCUE_STOP_WAIT_MS     2000
 
 /* ---- ③' ⭐ 2026-10-07 新增: 右转 90° 且航向校准【到位】之后, 先原地停稳这么久
  *      才允许右移进救援区。
@@ -718,7 +719,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *   再原地停车开始计时; 计时到点才右移 —— 即“先校准到位, 后额外停稳 3 秒”。
  *   ⚠️ 不是“最多等 3 秒”(那样没等它真到位就跑了)。
  * 建议 2000~4000(默认 3000); 0 = 关闭(校准完立刻右移)。 */
-#define RESCUE_ALIGN_SETTLE_MS  3000
+#define RESCUE_ALIGN_SETTLE_MS  1500
 
 /* ---- 【方案二】转 ID1 专用参数(和打靶那套完全同构) ---- */
 /* ⭐⭐ 2026-10-08 重新示教得到的【三个对准/抓取位置】(用户实测) ------------
@@ -740,7 +741,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 #define RESCUE_ID1_RIGHT_OFF    (RESCUE_ID1_RIGHT_POS - RESCUE_ID1_MID_POS) /* +444 */
 #define RESCUE_ID1_OFF_MARGIN   80      /* 限幅余量(码): 允许略微超过示教范围, 防抖动卡死 */
 
-#define RESCUE_ID1_STEP         60      /* 每收到一次 L/R, 底座 ID1 转多少角度码
+#define RESCUE_ID1_STEP         80      /* 每收到一次 L/R, 底座 ID1 转多少角度码
                                          * (4096 码 = 360°, 60 码 ≈ 5.3°)。
                                          * 建议 30~120。从中间到最左约 8 步(-498/60)、
                                          * 到最右约 7 步(+444/60), 都在 STEP_MAX 之内 */
@@ -1095,7 +1096,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 #define TARGET_ID1_LR_SIGN    (-1)      /* “收到 L”时 ID1 的增量符号:
                                          *  -1 = 数值减小 = 向左(当前实测值)
                                          *  +1 = 数值增大 = 向左(装反了就改这个) */
-#define TARGET_ID1_MOVE_MS      600 /*300*/     /* ID1 每步的转动时间(ms)。这期间主循环
+#define TARGET_ID1_MOVE_MS      300 /*300*/     /* ID1 每步的转动时间(ms)。这期间主循环
                                          * 【忽略并丢弃】K230 新帧, 等舵机停稳再取
                                          * 下一帧; 否则会拿“转之前”的旧画面连续累加
                                          * → 直接冲过头。建议 200~500, 要与上面
@@ -1116,12 +1117,12 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
                                          * 为什么必须加大: K230 新代码里精对准有
                                          *   ALIGN_SELF_TIMEOUT(14s) 自超时 —— 到点它【也会
                                          *   fire_start() 点激光 + 发 FIRE/OK】。而本机每步要
-                                         *   TARGET_ID1_MOVE_MS(600)+TARGET_FINE_SETTLE_MS(250)
-                                         *   = 850ms ⇒ 20 步 = 17s > 14s(勉强够, 但两轴混着走时
-                                         *   ID4 那 20 步 = 13s 会先到)。
+                                         *   TARGET_ID1_MOVE_MS(300)+TARGET_FINE_SETTLE_MS(250)
+                                         *   = 550ms ⇒ 30 步 = 16.5s > 14s(勉强够, 但两轴混着走时
+                                         *   ID4 那 30 步 = 19.5s 会先到)。
                                          *   ⚠️ 若本上限【先到】, 本机就会"抬臂收尾"而没有激光 ⇒ 白打。
                                          *   ⇒ 上限必须满足 步数 × 每步耗时 ≥ 14s(让 K230 的超时
-                                         *     发射先发生); 30 步 × 650ms(ID4) = 19.5s, 安全。
+                                         *     发射先发生); 30 步 × 350ms(ID4) = 10.5s, 安全。
                                          *   真正的硬上限仍是 TARGET_ID1_TIMEOUT_MS(20s)。 */
 #define TARGET_ID1_TIMEOUT_MS   20000   /* 🛡防卡死②: L/R 调整环节最长等这么久(ms),
                                          * 超时强制走 C 流程(摆 FIRE→LIFT→SCAN_RESET);
@@ -1194,16 +1195,16 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 #define TARGET_ID4_DY_SIGN    (-1)      /* dy>0(目标偏画面下)时 ID4 的增量符号:
                                          *  -1 = 数值减小(往下低) ★正确值
                                          *  +1 = 数值增大(往上抬) —— 装配反了才用 */
-#define TARGET_ID4_MOVE_MS      400     /* ID4 每步转动时间(ms); 这期间把 K230
+#define TARGET_ID4_MOVE_MS      200     /* ID4 每步转动时间(ms); 这期间把 K230
                                          * 旧帧全丢掉, 免得拿“转之前”的误差累加 */
 #define TARGET_ID4_POS_MIN      1050    /* ID4 行程限幅(角度码), 防越界堵转。
                                          * 姿态表注释: id4 物理限幅 1050~3010 */
 #define TARGET_ID4_POS_MAX      3010
 #define TARGET_ID4_STEP_MAX     30      /* 🛡防卡死: ID4 最多转这么多步。
                                          * ⭐⭐ 2026-10-11: 20 → 30 —— 与 TARGET_ID1_STEP_MAX
-                                         * 同一理由: 20 步 × (400+250)ms = 13s < K230 的
+                                         * 同一理由: 20 步 × (200+250)ms = 900ms < K230 的
                                          * ALIGN_SELF_TIMEOUT(14s), 会在 K230 超时发射之前
-                                         * 先"抬臂收尾" ⇒ 白打一枪。30 步 = 19.5s 安全。 */
+                                         * 先"抬臂收尾" ⇒ 白打一枪。30 步 = 15s 安全。 */
 
 /* ⭐⭐ 2026-10-11 新增(用户要求): 打靶"丢靶"自恢复 —— 让 ID4 上下动一下去把靶子找回来 --
  * 【现象】精对准时 ID1 跟着画面一步步入(每步 400~600ms), 转到某一步之后 K230
@@ -1552,7 +1553,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 /* ③' 停稳之后、④ 右移进救援区之前: 【再纯校一次航向】
  * 作用状态 = STATE_15D_RESCUE_RECORRECT(夹在 STATE_15C_RESCUE_ALIGN_SETTLE 与
  *            STATE_15B_RESCUE_APPROACH_RIGHT 之间), 进入动作 = Route_MinStep(本宏)
- *            → Heading_AlignTo(RESCUE_HEADING_DEG)。
+ *            → Heading_AlignTight(RESCUE_HEADING_DEG)。
  * 为什么要它: ① 原地右转 90° 本身可能把车身带偏一点(麦轮原地转的残余角/回正不足);
  *   ②(转完那次校准)之后又挪了一小步 + 停稳 3s, 期间车身也可能轻微走动
  *   ⇒ 真正开始右移之前再按绝对角校一次, 免得带着偏差一路横移进救援区。
@@ -1689,30 +1690,8 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *   ⚠️ 别太大: 力度越大越容易冲过头/甩尾(本处已有"停稳 + 二次压正"兜着, 但仍建议 30~45)。
  *   ⚠️ 只影响 STATE_11A 那两次转向(Chassis_SetNextTurnAdjust 是一次性的),
  *      其它地方的转向力度不变; 想整场都加大请改 Chassis.h 的 CH_MAX_TURN_ADJUST。
- *   ⚠️ 置 0 = 不覆盖(用全局默认 22, 即老行为)。
- *   ⭐⭐ 2026-10-11 补(用户反馈"已经在 0 点边缘了小车还是旋转起来校准, 幅度很大"):
- *     大力度【只用在残差真的大的时候】—— 残差 ≤ BOMB_AFTER_ALIGN_BOOST_FROM_DEG 时
- *     用默认 22。为什么: 转向环的输出是"每周期往四轮位置目标里加 adj(计数)"——
- *     残差 2~4° 折算到轮子只要几十个计数, 用 35 计数/周期会【一两拍就把目标冲到位】,
- *     车带着大角速度被判"到位"后 Chassis_Stop() 只是【冻结滑行】⇒ 冲过头 → 反向再修
- *     → 在 0° 附近来回摆(看起来就是"幅度很大地转来转去"), 最后撞 3s 上限带着偏差往下走。
- *     残差大(> 8°)时轮子本来就走得多, 那时加大力度是为了"啃动静摩擦", 才有必要。 */
+ *   ⚠️ 置 0 = 不覆盖(用全局默认 22, 即老行为)。 */
 #define BOMB_AFTER_ALIGN_TURN_ADJUST   35.0f
-
-/* ⭐⭐ 2026-10-11 新增: STATE_11A(排爆放球后那次校 0°) 专用的两个门槛 ---------------
- * ① BOMB_AFTER_ALIGN_SKIP_DEG —— 残差 ≤ 它【就不转】了, 直接进打靶走位。
- *    ★★ 用户选择 = 2.0, 即【与全程统一的 TURN_SKIP_DEG 一样】: 只要能校就校,
- *       不放过 2~3° 的残差(代价见下)。
- *    为什么曾经想放过: 这一处后面跟着的 854mm 长距离右移是靠【航向保持】走直线的,
- *    航向保持本来会一路把残留角往回收; 而为了 2~3° 去做原地转的风险是
- *    "转不动⇒积分打满⇒突然撒手甩一圈"(实测日志: 10s 内轮子走 781mm、车头 +1.3° 甩到 −18.7°)。
- *    ⇒ 既然选择了"不放过", 真正压住"甩"的就是下面 ②(大力度不再用在 2~8° 的小残差上) ——
- *      这里保留独立宏只是为了将来能单独放宽(填 4~6), 不动全程统一门槛。
- *    ⚠️ 填 0 = 关掉跳过(无论如何都转, 连 0.5° 也转)。
- * ② BOMB_AFTER_ALIGN_BOOST_FROM_DEG —— 残差 > 它才把转向力度加大(见上面那条)。
- *    ⚠️ 必须 > BOMB_AFTER_ALIGN_SKIP_DEG, 否则这条永远用不上(先被跳过/被小残差吃掉)。 */
-#define BOMB_AFTER_ALIGN_SKIP_DEG       2.0f
-#define BOMB_AFTER_ALIGN_BOOST_FROM_DEG 8.0f
 
 /* ⭐⭐ 2026-10-11 新增: 航向校正的“小角度跳过”门槛 (单位: 度) ---------------------
  * 【为什么需要】实车日志(排爆后那次)铁证: 请求只 0.5~1.3° 的校正【根本完不成】——
@@ -1726,10 +1705,8 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *   ⇒ 这种"转也转不动、还容易失控"的微校正, 直接跳过最安全:
  *     1~2° 的残留本来就在全程各段校正的残差量级里(日志里各段 yaw 都在 ±1.5° 内)。
  * 【做法】Turn_SkipIfTiny(): |目标 − 当前 yaw| ≤ 本宏 ⇒ 不发转向指令, 只打一行日志。
- *   作用点: Turn_Angle_Compat(0.1f)(全程各处校 0°)、Heading_AlignTo(-90°)。
- *   ⚠️ STATE_11A(排爆后那次)【不走本宏】—— 它后面跟着 854mm 长距离右移, 残留角会由
- *      航向保持往回收, 所以用更宽的门槛 BOMB_AFTER_ALIGN_SKIP_DEG(4°), 免得为了
- *      2~4° 的微校正去冒"转不动⇒积分打满⇒突然撒手甩一圈"的风险。
+ *   作用点: Turn_Angle_Compat(0.1f)(全程各处校 0°)、Heading_AlignTo(-90°)、
+ *          STATE_11A(排爆后那次)。
  * 【取值】2.0(度)。调大→更省时间但残留角变大; 调小→又把 1~2° 的校正交回给
  *   那个"转不动"的环; 0 = 关闭(恢复"无论如何都发转向")。
  * ⚠️ 想让小角度校正【真的转得动】的正确做法是调大 CH_MAX_TURN_ADJUST(如 22→35,
@@ -1877,7 +1854,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  * ⚠️ 航向基准: 掉头后必须把航向基准也改成 RESCUE_HEADING_DEG(-90°),
  *    否则后续横移的“航向保持”会按旧基准(0°)把车硬拽回原朝向 ——
  *    90° 掉头就白做了(见 Heading_AlignTo())。 */
-#define RESCUE_HEADING_DEG          (-90.1f) /* 救援阶段车头朝向(绝对角, 度):
+#define RESCUE_HEADING_DEG          (-86.5f) /* 救援阶段车头朝向(绝对角, 度):
                                              * 正=逆时针/左转, 负=顺时针/右转
                                              * ⇒ -90 = 右转 90°。
                                              * 后续所有平移的航向基准 + 航向校准
@@ -1915,7 +1892,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
 
 /* ⭐⭐ 2026-10-10(用户要求): 救援【抓完人质 → 终点】的走法 ---------------------
  *   【1(★当前)】抓完人质 → ⑧【先原地校一次航向(不挪步)】→ ⑩【一段走到终点】→ ⑫停下:
- *        · ⑧ 只校航向: Heading_AlignTo(RESCUE_HEADING_DEG = -90°);
+ *        · ⑧ 只校航向: Heading_AlignTight(RESCUE_HEADING_DEG = -90°);
  *          校前那一步挪多少 = ROUTE_RESCUE_FWD_MM(当前 = 0 ⇒ 不挪, 只原地摆正)。
  *        · ⑩ = ROUTE_17_RIGHT_B_MM + ROUTE_18_RIGHT_C_MM【合并成一次连续右移】,
  *          中途不再停车、不再校正航向; 走完直接进 ⑫ 停车 → 任务完成。
@@ -1962,7 +1939,7 @@ static uint16_t Arm_HoldMs(uint8_t pose_idx)
  *   且这一段的偏差【没有后续校正】兜底(走完就 🏁 结束), 所以在中点清一次。
  * 【做法】把这段【对半拆成两段走】, 中间做:
  *     ① 阻塞等前半段走完(超时也往下走, 但会强制停车, 见 RESCUE_TAIL_HALF_TIMEOUT_MS);
- *     ② Heading_AlignTo(RESCUE_HEADING_DEG = -90°): 按绝对角把车头摆正
+ *     ② Heading_AlignTight(RESCUE_HEADING_DEG = -90°): 按绝对角把车头摆正
  *        —— 顺带【重新同步航向基准】(Chassis_SetHeadingRef), 后半段按新基准走直线;
  *        ⚠️ 偏差 ≤ TURN_SKIP_DEG(2°) 时它会自动跳过转向, 只同步基准(见该宏);
  *     ③ Route_MinStep(RESCUE_TAIL_MID_STEP_MM = +20): 【往车头前方】挪 20mm
@@ -2113,18 +2090,18 @@ static const uint16_t s_servo_pos_max[SERVO_COUNT] = { 4095, 2300, 3100, 3010, 6
  *   下标与 ArmPose_t 一一对应; 下面先给一套默认值, 实测后逐个改。 */
 static uint16_t s_arm_pose_time[ARM_POSE_COUNT] = {
     1500,   /* HOME          复位 */
-    6000,   /* SCAN          扫码 */
-    2500,   /* SCAN_RESET    扫码之后复位 */
-    2500,   /* BALL_LOOK     看球 */
+    2000,   /* SCAN          扫码 */
+    1500,   /* SCAN_RESET    扫码之后复位 */
+    2000,   /* BALL_LOOK     看球 */
     ARM_GRAB_PRE_MS,   /* BALL_PRE      抓夹到小球前(⭐2026-10-11 由 2500 加长, 见 ARM_GRAB_*_MS) */
     ARM_GRAB_CLOSE_MS, /* BALL_CLOSE    夹紧(只有夹爪动; ⭐2026-10-11 由 2000 加长) */
     ARM_GRAB_LIFT_MS,  /* BALL_LIFT     抓完抬起(⭐2026-10-11 由 2500 加长) */
-    2500,   /* BUCKET_CARRY  携带姿态 */
-    2500,   /* BUCKET_LOOK   看桶 */
-    2500,   /* PLACE_PRE     移到放置位 */
-    2000,   /* PLACE_OPEN    松开(只有夹爪动) */
-    2500,   /* PLACE_LIFT    放完抬起 */
-    2500,   /* TARGET_READY  准备识别靶子 */
+    1500,   /* BUCKET_CARRY  携带姿态 */
+    1500,   /* BUCKET_LOOK   看桶 */
+    1500,   /* PLACE_PRE     移到放置位 */
+    500,   /* PLACE_OPEN    松开(只有夹爪动) */
+    1500,   /* PLACE_LIFT    放完抬起 */
+    1500,   /* TARGET_READY  准备识别靶子 */
     2000,   /* TARGET_LOOK   识别靶子 */
     2000,   /* TARGET_FIRE   激光发射位 */
     2000,   /* TARGET_LIFT   发射完抬起。
@@ -2134,21 +2111,21 @@ static uint16_t s_arm_pose_time[ARM_POSE_COUNT] = {
              *    这里放慢到 6000ms, 并配合 Arm_Start_Target_Lift() 的【分两步】
              *    下发(先 ID1/2/3 再 ID4/5), 把峰值电流压下来。
              *    验证完(若不薓了)可以改回 4000~5000 省时间。 */
-    2500,   /* HOSTAGE_LOOK  识别人质 */
+    1500,   /* HOSTAGE_LOOK  识别人质 */
     2500,   /* HOSTAGE_PRE   准备抱人质 */
-    2000,   /* HOSTAGE_CLOSE 抱紧(只有夹爪动) */
-    2500,   /* HOSTAGE_LIFT  抱起抬起 */
+    1500,   /* HOSTAGE_CLOSE 抱紧(只有夹爪动) */
+    2000,   /* HOSTAGE_LIFT  抱起抬起 */
     2500,   /* HOSTAGE_GRAB_L 抓取位[左](同 PRE 的 2500) */
     2500,   /* HOSTAGE_GRAB_M 抓取位[中] */
     2500,   /* HOSTAGE_GRAB_R 抓取位[右] */
-    2000,   /* HOSTAGE_GRAB_L_CLOSE 抱紧[左](同 HOSTAGE_CLOSE 的 2000;
+    1500,   /* HOSTAGE_GRAB_L_CLOSE 抱紧[左](同 HOSTAGE_CLOSE 的 2000;
              * ⚠️ 示教后若这一行整臂动作很大(不只是夹爪), 调大到 3000) */
-    2000,   /* HOSTAGE_GRAB_M_CLOSE 抱紧[中] */
-    2000,   /* HOSTAGE_GRAB_R_CLOSE 抱紧[右] */
-    2500,   /* HOSTAGE_GRAB_L_LIFT  抬起[左](同 HOSTAGE_LIFT 的 2500) */
-    2500,   /* HOSTAGE_GRAB_M_LIFT  抬起[中] */
-    2500,   /* HOSTAGE_GRAB_R_LIFT  抬起[右] */
-    2500    /* HOSTAGE_RETURN       回程姿态(收臂)。
+    1500,   /* HOSTAGE_GRAB_M_CLOSE 抱紧[中] */
+    1500,   /* HOSTAGE_GRAB_R_CLOSE 抱紧[右] */
+    2000,   /* HOSTAGE_GRAB_L_LIFT  抬起[左](同 HOSTAGE_LIFT 的 2500) */
+    2000,   /* HOSTAGE_GRAB_M_LIFT  抬起[中] */
+    2000,   /* HOSTAGE_GRAB_R_LIFT  抬起[右] */
+    2000    /* HOSTAGE_RETURN       回程姿态(收臂)。
              * ⚠️ 抱起人质后 ID2 从 1843降到 1753 / ID3 从 878升到 1205,
              *    带着负载动作, 实测抖就调到 3000。 */
 };
@@ -2927,69 +2904,25 @@ static uint32_t K230_RxSilenceMs(void)
 }
 
 /**
- * @brief  ⭐⭐ 2026-10-11 新增: 航向校正前的“小角度跳过”判断(可指定门槛)
+ * @brief  ⭐⭐ 2026-10-11 新增: 航向校正前的“小角度跳过”判断
  * @param  target_deg 目标绝对航向(度)
- * @param  skip_deg   跳过门槛(度): |目标 − 当前| ≤ 它 ⇒ 不转; ≤0 = 不跳过
- * @retval 1 = 【不要】再发转向指令; 0 = 需要真正转向
- * @note   取角经 Chassis_GetYaw()(已过跳变检查), 所以坏读数不会让它误判成"已正"。
- *         ⚠️ 为什么要能指定门槛: "转不动 + 积分打满后突然撒手" 这个坑在不同场合
- *            能接受的残留角不一样 —— 全程其它校正用 TURN_SKIP_DEG(2°);
- *            而 STATE_11A(排爆后那次) 后面跟着 854mm 长距离右移, 那段本来就会
- *            用【航向保持】把残留角慢慢纠回来, 所以它可以用更大的门槛(见
- *            BOMB_AFTER_ALIGN_SKIP_DEG), 免得为了 2~4° 又去冒一次"甩一圈"的风险。
+ * @retval 1 = 偏差 ≤ TURN_SKIP_DEG, 【不要】再发转向指令; 0 = 需要真正转向
+ * @note   为什么要有它(1~2° 的校正"转不动还容易失控"), 见 TURN_SKIP_DEG 的说明。
+ *         用 Chassis_GetYaw()(已过跳变检查), 所以坏读数不会让它误判成"已正"。
  */
-static uint8_t Turn_SkipIfSmall(float target_deg, float skip_deg)
+static uint8_t Turn_SkipIfTiny(float target_deg)
 {
     float e = target_deg - Chassis_GetYaw();
 
     while (e > 180.0f)  e -= 360.0f;
     while (e < -180.0f) e += 360.0f;
 
-    if (skip_deg > 0.0f && e <= skip_deg && e >= -skip_deg) {
-        MLOG("航向校正: 偏差 %+.2f° 已在 ±%.2f° 内 → 跳过本次转向",
-             (double)e, (double)skip_deg);
+    if (TURN_SKIP_DEG > 0.0f && e <= TURN_SKIP_DEG && e >= -TURN_SKIP_DEG) {
+        MLOG("航向校正: 偏差 %+.2f° 已在 ±%.2f° 内 → 跳过本次转向(见 TURN_SKIP_DEG)",
+             (double)e, (double)TURN_SKIP_DEG);
         return 1u;
     }
     return 0u;
-}
-
-/**
- * @brief  同上, 用全程统一的 TURN_SKIP_DEG(2°) 当门槛
- * @note   全程各处校 0°(Turn_Angle_Compat) / 校 -90°(Heading_AlignTo) 走这里;
- *         STATE_11A 走 Turn_SkipIfSmall() 用自己的门槛。
- */
-static uint8_t Turn_SkipIfTiny(float target_deg)
-{
-    return Turn_SkipIfSmall(target_deg, TURN_SKIP_DEG);
-}
-
-/**
- * @brief  ⭐⭐ 2026-10-11 新增: 排爆后那次校正(STATE_11A) 按【残差大小】决定本次转向力度
- * @note   残差 > BOMB_AFTER_ALIGN_BOOST_FROM_DEG(8°) → 用加大后的
- *         BOMB_AFTER_ALIGN_TURN_ADJUST(35): 轮子要走得多, 需要啃动静摩擦;
- *         残差 ≤ 它 → 用全局默认 CH_MAX_TURN_ADJUST(22): 小残差配大力度会
- *         "一两拍冲到目标 + 冻结滑行冲过头", 在 0° 附近来回摆。
- *         ⚠️ 残差 ≤ BOMB_AFTER_ALIGN_SKIP_DEG 的情况【根本不会走到这里】(已被跳过)。
- *         ⚠️ 必须在紧接着的 Chassis_Rotate_To() 【之前】调用: 覆盖是"下一次转向"消耗掉的。
- */
-static void BombAfterAlignTurnAdjust(void)
-{
-    float e = 0.0f - Chassis_GetYaw();
-
-    while (e > 180.0f)  e -= 360.0f;
-    while (e < -180.0f) e += 360.0f;
-
-    if (BOMB_AFTER_ALIGN_TURN_ADJUST > 0.0f &&
-        (e > BOMB_AFTER_ALIGN_BOOST_FROM_DEG || e < -BOMB_AFTER_ALIGN_BOOST_FROM_DEG)) {
-        Chassis_SetNextTurnAdjust(BOMB_AFTER_ALIGN_TURN_ADJUST);
-        MLOG("排爆后校正: 残差 %+.2f° > %.1f° → 本次转向力度加大到 %.0f (默认 %.0f)",
-             (double)e, (double)BOMB_AFTER_ALIGN_BOOST_FROM_DEG,
-             (double)BOMB_AFTER_ALIGN_TURN_ADJUST, (double)CH_MAX_TURN_ADJUST);
-    } else {
-        MLOG("排爆后校正: 残差 %+.2f° 不大 → 用默认转向力度 %.0f "
-             "(大力度配小残差会冲过头, 见 BOMB_AFTER_ALIGN_BOOST_FROM_DEG)",
-             (double)e, (double)CH_MAX_TURN_ADJUST);
-    }
 }
 
 /**
@@ -3033,6 +2966,29 @@ static void Route_ApplyStopMode(int mode)
 #define RESCUE_TURN_SETTLE_MS        300    /* 两次转正之间的原地停稳(ms); 0 = 不等待 */
 #define RESCUE_TURN_TIMEOUT_MS       6000   /* 每次转正的等待上限(ms) */
 #define RESCUE_TURN_TIGHT_DEG        1.0f   /* 压正这一步的"够正"门槛(度), 不跟 TURN_SKIP_DEG(2°) */
+
+/* ⭐⭐ 2026-10-11 新增: 救援段各处【航向校正】的走法开关(实现见 Heading_AlignTight) -----
+ * 背景(用户实测"抓完人质之后转动的角度和我设置的不一样"):
+ *   救援段那几处校正"转不到位", 原因都在【车停死后原地转不动】这一个物理事实上:
+ *   ① 麦轮原地转只需轮子走 1~3mm, 静止时被辊子静摩擦咬住 ⇒ 转向环那点输出推不动车
+ *      ⇒ 40 个周期(0.8s)后 Chassis 的"推不动就收手"把它【中止】了
+ *      (日志: `⚠ 转向推不动(...) 收手停车(本次校正作废)`) ⇒ 朝向停在旧值;
+ *   ② 就算差 2° 以内, Heading_AlignTo 会因为 TURN_SKIP_DEG(2°)【直接跳过】,
+ *      连试都不试 ⇒ 那 2° 稳态偏差一路被带到底。
+ * 而本工程航向校正家族的既定做法本来是"先挪一小步再转正"(车停死时转不动) ——
+ * 偏偏救援段那几处挪步宏(ROUTE_RESCUE_FWD_MM / _LAST_STEP_MM / _MID_STEP_MM /
+ * _PRE_RIGHT_STEP_MM)现在【全被填成 0】⇒ 这一步没了。
+ * RESCUE_CAL_TIGHT_ALIGN = 1(★当前): 走 Heading_AlignTight ——
+ *   ① 先"前进 X 再后退 X"把静摩擦【松动】掉(净位移≈0, 不改路线几何);
+ *   ② 转向用 Turn_AlignTightBlocking: 跳过门槛收到 1°, 且"转正→停稳→再压正"两次机会;
+ *   ③ 打完把【目标/实到/残差】打一行日志, 一眼看出到底差多少。
+ * = 0: 回到老行为(Heading_AlignTo, 只有"同步基准 + 非阻塞发转向")。
+ * --------------------------------------------------------------------- */
+#define RESCUE_CAL_TIGHT_ALIGN      1     /* 1 = 救援段校正走"松动 + 紧门槛 + 压正两次" */
+#define RESCUE_CAL_ANTISTICK_MM     6     /* 松动的单程距离(mm), 前进来回一次后净位移≈0。
+                                           * 0 = 不松动(只做紧门槛那部分)。
+                                           * ⚠️ 别小于 6: 到位死区 CH_POS_THRESHOLD_COUNT
+                                           *    ≈4.5mm 会把它吃掉、等于没动(还白等一次)。 */
 
 /* 前置声明: 定义在下面"转向辅助"那一段(Chassis_WaitTurnDone 附近) */
 static uint8_t Chassis_WaitTurnDone(uint32_t timeout_ms);
@@ -3268,7 +3224,10 @@ static uint8_t Chassis_WaitTurnDone(uint32_t timeout_ms)
  *         用法: 进入动作里调一次(非阻塞), 转移条件里等
  *               Chassis_Task_Is_Complete() 即可。
  *         ⭐ 2026-10-11: 偏差 ≤ TURN_SKIP_DEG 时只同步基准、不发转向(见 TURN_SKIP_DEG)。
+ *   ⚠️ 救援段各处【不再用它】: 换成了 Heading_AlignTight(见 RESCUE_CAL_TIGHT_ALIGN 的说明)
+ *      —— 所以 RESCUE_CAL_TIGHT_ALIGN=1 时本函数【不参与编译】(否则会"定义了没用到"的警告)。
  */
+#if !RESCUE_CAL_TIGHT_ALIGN
 static void Heading_AlignTo(float heading_deg)
 {
     Chassis_SetHeadingRef(heading_deg);     /* 基准一定要同步(平移时航向保持用它) */
@@ -3277,6 +3236,7 @@ static void Heading_AlignTo(float heading_deg)
     }
     Chassis_Rotate_To(heading_deg);
 }
+#endif /* !RESCUE_CAL_TIGHT_ALIGN */
 
 /**
  * @brief  打靶走位途中: 航向校正【之前】的“挪最小一步”(阻塞版, 可正可负)
@@ -3492,6 +3452,59 @@ static void Route_MinStep(int32_t mm)
                  (int)moved_mm, (int)want);
         }
     }
+}
+
+/* ⭐⭐ 2026-10-11 新增: 救援段各处【航向校正】专用入口 ----------------------------
+ * 【为什么不能直接用 Heading_AlignTo】救援段这几处校正"转不到位"有两个原因, 都在
+ *   【车停死后原地转不动】这一个物理事实上:
+ *   ① 麦轮原地转只需轮子走 1~3mm, 静止时被辊子静摩擦咬住 ⇒ 转向环输出的那点差值
+ *      推不动车 ⇒ 40 个周期(0.8s)后 Chassis 的"推不动就收手"把它【中止】了
+ *      (日志: `⚠ 转向推不动(...) 收手停车(本次校正作废)`) ⇒ 最终朝向停在旧值;
+ *   ② 就算差 2° 以内, Heading_AlignTo 会因为 TURN_SKIP_DEG(2°) 【直接跳过】,
+ *      连试都不试 ⇒ 那 2° 稳态偏差一路被带到底。
+ *   (抱上人质之后重心偏、轮子负载更大, ①更容易发生 ⇒ "抓完人质校准偏得很严重")
+ * 【本函数做两件事】
+ *   ① 【松动】前进 RESCUE_CAL_ANTISTICK_MM 再后退同样距离 —— 净位移 ≈ 0(不改变路线几何!),
+ *      只是让四个辊子滚一下、把静摩擦破坏掉, 之后再原地转就转得动了。
+ *      这本来就是本工程航向校正家族的既定做法("先挪一小步再转正"), 只是救援段那几处
+ *      挪步宏现在全被填成 0 ⇒ 这一步没了。用"净位移 0"而不是恢复原来的挪步, 是为了
+ *      【不改变已经调好的路线几何】。
+ *   ② 转向用 Turn_AlignTightBlocking(): 跳过门槛收紧到 RESCUE_TURN_TIGHT_DEG(1°,
+ *      不被 TURN_SKIP_DEG 的 2° 放过), 而且是"转正 → 停稳 300ms → 再压正"两次机会,
+ *      专门抵消"到位后滑行"和"第一次没转够"。
+ *   ⚠️ 本函数是【阻塞】的(内部 Chassis_WaitTurnDone), 与 STATE_14 那次大转角同一套写法。
+ *      调用它的状态在转移检查里等 Chassis_Task_Is_Complete() —— 阻塞完立刻就是"完成",
+ *      所以状态机不会卡住, 只是"进入动作"多花这几百毫秒。
+ *   ⚠️ 想回老行为: RESCUE_CAL_TIGHT_ALIGN 置 0 ⇒ 直接退回原来的 Heading_AlignTo。
+ */
+static void Heading_AlignTight(float heading_deg)
+{
+#if RESCUE_CAL_TIGHT_ALIGN
+    float e;
+
+    if (RESCUE_CAL_ANTISTICK_MM > 0) {
+        /* 松动: 前进 X 再后退 X。⚠️ 两次都要【阻塞等到位】才发下一条,
+         * 否则第二条指令会覆盖第一条(见 Route_MinStep 的说明)。
+         * 净位移 ≈ 0 ⇒ 不影响后面右移的总里程。 */
+        Route_MinStep((int32_t)RESCUE_CAL_ANTISTICK_MM);
+        Route_MinStep(-(int32_t)RESCUE_CAL_ANTISTICK_MM);
+    }
+
+    /* 转正(紧门槛 1° + 停稳后压正一次); 内部已同步航向基准 */
+    Turn_AlignTightBlocking(heading_deg);
+
+    /* 把"到底校到多少"打出来 —— 只看到目标角是没法判断"为什么不一样"的 */
+    e = heading_deg - Chassis_GetYaw();
+    while (e > 180.0f)  e -= 360.0f;
+    while (e < -180.0f) e += 360.0f;
+    MLOG("救援航向校正结束: 目标 %.2f°, 实到 %.2f°, 残差 %+.2f° %s",
+         (double)heading_deg, (double)Chassis_GetYaw(), (double)e,
+         (fabsf(e) <= RESCUE_TURN_TIGHT_DEG) ? "(达标)"
+         : (fabsf(e) <= TURN_SKIP_DEG) ? "(在 2° 跳过门槛内, 但没进 1°)"
+         : "(⚠ 没转够 —— 看上面有没有 '转向推不动' 那行)");
+#else
+    Heading_AlignTo(heading_deg);   /* 老行为 */
+#endif
 }
 
 /* ================= 机械臂动作序列 ================= */
@@ -7617,14 +7630,11 @@ void Mission_Update(void)
                  *      超时后转向环【还开着】(剩余角 126°), 紧接着的右移就变成
                  *      "边走边转", 走出弧线(日志 STEER on=1 err=126 out=192)。 */
                 {
-                    /* ⭐⭐ 2026-10-11(用户反馈"已经在 0 点边缘了小车还是旋转起来校准, 幅度很大"):
-                     *    本处的跳过门槛用 BOMB_AFTER_ALIGN_SKIP_DEG —— 用户选择 = 2.0,
-                     *    与全程统一门槛一致(能校就校, 不放过 2~3° 的残差)。
-                     *    ⇒ 真正压住"旋转幅度很大"的是下面那步: 【力度只在大残差时才加大】。 */
-                    if (!Turn_SkipIfSmall(0.0f, BOMB_AFTER_ALIGN_SKIP_DEG)) {
-                        /* ⭐⭐ 力度只在大残差时才加大(见 BombAfterAlignTurnAdjust 的说明):
-                         *    小残差用默认 22 —— 用 35 会一两拍冲到位 + 冻结滑行, 冲过头再反向修。 */
-                        BombAfterAlignTurnAdjust();
+                    /* ⭐ 2026-10-11: 偏差 ≤ TURN_SKIP_DEG 就别发了(1~2° 的校正
+                     *    在这台车上转不动、还会把位置目标越积越大, 见 TURN_SKIP_DEG)。 */
+                    if (!Turn_SkipIfTiny(0.0f)) {
+                        /* ⭐⭐ 用户要求: 【放完球这次校正力度加大】(见 BOMB_AFTER_ALIGN_TURN_ADJUST) */
+                        Chassis_SetNextTurnAdjust(BOMB_AFTER_ALIGN_TURN_ADJUST);
                         Chassis_Rotate_To(0.0f);
                         Chassis_WaitTurnDone(BOMB_AFTER_ALIGN_TIMEOUT_MS);
                     }
@@ -7632,29 +7642,11 @@ void Mission_Update(void)
                          (double)Chassis_GetYaw(), (int)BOMB_AFTER_ALIGN_SETTLE_MS);
                     Mission_Coop_Wait(BOMB_AFTER_ALIGN_SETTLE_MS);
 
-                    if (!Turn_SkipIfSmall(0.0f, BOMB_AFTER_ALIGN_SKIP_DEG)) {
-                        /* ⭐ 压正这次同样只在大残差时加大力度 */
-                        BombAfterAlignTurnAdjust();
+                    if (!Turn_SkipIfTiny(0.0f)) {
+                        /* ⭐ 压正这次同样加大力度(否则"停稳后剩的那点残余"照样转不动) */
+                        Chassis_SetNextTurnAdjust(BOMB_AFTER_ALIGN_TURN_ADJUST);
                         Chassis_Rotate_To(0.0f);
                         Chassis_WaitTurnDone(BOMB_AFTER_ALIGN_TIMEOUT_MS);
-                    }
-                    /* ⭐⭐ 收敛核对: 两次压正之后残差还超过跳过门槛 = 这次没校好(多半是撞了
-                     *    BOMB_AFTER_ALIGN_TIMEOUT_MS 的上限)。单独立一条醒目日志,
-                     *    免得淹没在"第2次(压正)结束"那行里 —— 这一段的偏差会直接带进
-                     *    后面 854mm 的右移。 */
-                    {
-                        float e = 0.0f - Chassis_GetYaw();
-
-                        while (e > 180.0f)  e -= 360.0f;
-                        while (e < -180.0f) e += 360.0f;
-                        if (e > BOMB_AFTER_ALIGN_SKIP_DEG || e < -BOMB_AFTER_ALIGN_SKIP_DEG) {
-                            MLOG("⚠ 排爆后校正【没收敛】: 最终 yaw=%.2f°(残差 %+.2f° > %.1f°) —— "
-                                 "照旧进打靶走位, 这段 854mm 右移的航向保持会继续往回收; "
-                                 "若实测这段走斜/出界, 把 BOMB_AFTER_ALIGN_SKIP_DEG 调小(多校一次) "
-                                 "或 BOMB_AFTER_ALIGN_TIMEOUT_MS 加大",
-                                 (double)Chassis_GetYaw(), (double)e,
-                                 (double)BOMB_AFTER_ALIGN_SKIP_DEG);
-                        }
                     }
                     MLOG("排爆后: 第2次(压正)结束, 最终 yaw=%.1f° -> 开始右移",
                          (double)Chassis_GetYaw());
@@ -7890,7 +7882,7 @@ void Mission_Update(void)
                                   ROUTE_RESCUE_AFTER_TURN_SPEED_CAP_MMPS,
                                   ROUTE_RESCUE_AFTER_TURN_RAMP_MM);
                 Route_MinStep(ROUTE_RESCUE_AFTER_TURN_MM);
-                Heading_AlignTo(RESCUE_HEADING_DEG);
+                Heading_AlignTight(RESCUE_HEADING_DEG);
                 break;
             /* ③ ⭐ 2026-10-07 新增: 校准【到位】之后原地停车再等
              *    RESCUE_ALIGN_SETTLE_MS(3s) 才允许右移进救援区。
@@ -7919,7 +7911,7 @@ void Mission_Update(void)
                 MLOG("救援③': 右移前再校一次航向(挪步 %+dmm, 目标 %.1f°)",
                      (int)ROUTE_RESCUE_PRE_RIGHT_STEP_MM, (double)RESCUE_HEADING_DEG);
                 Route_MinStep(ROUTE_RESCUE_PRE_RIGHT_STEP_MM);
-                Heading_AlignTo(RESCUE_HEADING_DEG);
+                Heading_AlignTight(RESCUE_HEADING_DEG);
                 break;
             /* ④ 右移进救援区【第一段】(原来这里是“后退 ROUTE_14_TO_HOSTAGE_MM”,
              *    现在整段拆成两段: 这一段走完先在中途校一次航向, 见下面 ④') */
@@ -7929,14 +7921,14 @@ void Mission_Update(void)
              *      ① Route_MinStep(ROUTE_RESCUE_MID_STEP_MM = -15): 负值 = 车头【后退】,
              *         而此刻车头是 -90° ⇒ 实际是往【场地左】走 15mm(与右移反向,
              *         等于让这段右移距离少走一点), 顺带让轮子滚起来好转;
-             *      ② Heading_AlignTo(RESCUE_HEADING_DEG): 按绝对角校准回 -90°
+             *      ② Heading_AlignTight(RESCUE_HEADING_DEG): 按绝对角校准回 -90°
              *         (顺带重新同步航向基准, 后面第二段右移继续按 -90° 走直线)。
              *    ⚠️ Route_MinStep 内部【阻塞等到位】, 所以这里紧接着发转向是安全的。 */
             case STATE_15B2_RESCUE_MID_CORRECT:
                 MLOG("救援④: 右移中途航向校准(Route_MinStep %+dmm + 校准到 %.1f°)",
                      (int)ROUTE_RESCUE_MID_STEP_MM, (double)RESCUE_HEADING_DEG);
                 Route_MinStep(ROUTE_RESCUE_MID_STEP_MM);
-                Heading_AlignTo(RESCUE_HEADING_DEG);
+                Heading_AlignTight(RESCUE_HEADING_DEG);
                 break;
             /* ④' 右移【第二段】: 校准完接着走剩下的路, 走完就进救援区(→ ⑤ 停等) */
             case STATE_15B3_RESCUE_APPROACH_RIGHT2: Chassis_Move_Right(ROUTE_14_MID2_MM); break;
@@ -8013,7 +8005,7 @@ void Mission_Update(void)
                 MLOG("救援: 抓完人质 -> 先原地校一次航向(挪步 %+dmm, 目标 %.1f°)",
                      (int)ROUTE_RESCUE_FWD_MM, (double)RESCUE_HEADING_DEG);
                 Route_MinStep(ROUTE_RESCUE_FWD_MM);
-                Heading_AlignTo(RESCUE_HEADING_DEG);
+                Heading_AlignTight(RESCUE_HEADING_DEG);
                 break;
 #else
             case STATE_17_RESCUE_RIGHT_B:
@@ -8026,7 +8018,7 @@ void Mission_Update(void)
 #endif
             case STATE_17A_RESCUE_HEADING_CORRECT:
                 Route_MinStep(ROUTE_RESCUE_FWD_MM);   /* ⭐ 转正前先挪一步(+6 = 车头前进) */
-                Heading_AlignTo(RESCUE_HEADING_DEG);
+                Heading_AlignTight(RESCUE_HEADING_DEG);
                 break;
 #if RESCUE_TAIL_ONESHOT
             /* ⭐ 校准完 → 走最后一整段(⑧+⑩ 合并)。
@@ -8093,7 +8085,7 @@ void Mission_Update(void)
                         /* ① 校航向(顺带重新同步航向基准, 后半段按新基准走直线)。
                          *    ⚠️ 偏差 ≤ TURN_SKIP_DEG(2°) 时 Heading_AlignTo 会自动跳过转向、
                          *       只同步基准; Chassis_WaitTurnDone 此时立即返回。 */
-                        Heading_AlignTo(RESCUE_HEADING_DEG);
+                        Heading_AlignTight(RESCUE_HEADING_DEG);
                         Chassis_WaitTurnDone(RESCUE_TAIL_MID_ALIGN_TIMEOUT_MS);
                         /* ② 往前进 RESCUE_TAIL_MID_STEP_MM(=+12mm, 车头前进; 此刻车头 -90°
                          *    ⇒ 走的是【场地右方】)。Route_MinStep 内部阻塞到位, 自带日志。 */
@@ -8126,7 +8118,7 @@ void Mission_Update(void)
             case STATE_18A_RESCUE_HEADING_CORRECT:
                 /* ⭐ 2026-10-08: 统一成 +6 最小一步(原来这里是 -8 = 车头后退) */
                 Route_MinStep(ROUTE_RESCUE_LAST_STEP_MM);
-                Heading_AlignTo(RESCUE_HEADING_DEG);
+                Heading_AlignTight(RESCUE_HEADING_DEG);
                 break;
             /* ⑫ 停下 → 结束(转移里置 MISSION_STATE_COMPLETE) */
             case STATE_19_RESCUE_RIGHT_D:
