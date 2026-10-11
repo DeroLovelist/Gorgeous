@@ -90,7 +90,7 @@
  * ⚠️ 只想整体回到方案①: GYRO_BIAS_SCHEME 置 0(一行)。
  * ⚠️ 想让打靶走位段也用方案②: SCHEME=1 + SCOPE_TARGET=1。
  * ===================================================================== */
-#define GYRO_BIAS_SCHEME            0     /* 0 = 方案①本地现有(★默认); 1 = 方案②陀螺仪零偏 */
+#define GYRO_BIAS_SCHEME            1     /* 0 = 方案①本地现有(★默认); 1 = 方案②陀螺仪零偏 */
 #define GYRO_BIAS_SCOPE_TAIL        1     /* 方案②下: 抓取人质后→终点 是否启用 */
 #define GYRO_BIAS_SCOPE_TARGET      0     /* 方案②下: 打靶走位段 是否启用 */
 
